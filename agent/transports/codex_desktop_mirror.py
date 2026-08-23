@@ -1,0 +1,557 @@
+"""Incremental reader for persisted Codex desktop turn activity.
+
+Codex app-server clients and the desktop app append to the same rollout JSONL.
+This reader extracts the user prompt, public progress summaries/commentary, and
+durable completion. The gateway separately registers the exact turn IDs it
+starts through Hermes and excludes only those IDs, avoiding unreliable
+client-origin heuristics.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+_GOAL_CONTEXT_RE = re.compile(
+    r"<codex_internal_context\b[^>]*\bsource\s*=\s*"
+    r"(?:\"goal\"|'goal')[^>]*>",
+    re.IGNORECASE,
+)
+_GOAL_OBJECTIVE_RE = re.compile(
+    r"<objective>\s*(?P<objective>.*?)\s*</objective>",
+    re.IGNORECASE | re.DOTALL,
+)
+_RUNTIME_CONTEXT_PREFIXES = (
+    "<recommended_plugins>",
+    "# agents.md instructions",
+    "<environment_context>",
+    "<permissions instructions>",
+    "<collaboration_mode>",
+    "<apps_instructions>",
+    "<plugins_instructions>",
+)
+
+
+@dataclass(frozen=True)
+class CodexDesktopProgress:
+    kind: str
+    text: str
+
+
+@dataclass(frozen=True)
+class CodexDesktopCompletion:
+    turn_id: str
+    final_text: str
+    client_id: Optional[str]
+    user_text: str = ""
+    progress: tuple[CodexDesktopProgress, ...] = ()
+    error_text: str = ""
+
+    @property
+    def is_desktop_originated(self) -> bool:
+        return not self.client_id
+
+
+@dataclass(frozen=True)
+class CodexDesktopTurnUpdate:
+    turn_id: str
+    user_text: str
+    progress: tuple[CodexDesktopProgress, ...]
+    final_text: str
+    client_id: Optional[str]
+    completed: bool
+    error_text: str = ""
+
+
+def resolve_codex_rollout_path(
+    thread_id: str,
+    *,
+    hinted_path: Optional[str] = None,
+    codex_home: Optional[str] = None,
+) -> Optional[Path]:
+    """Resolve a thread's rollout under ``CODEX_HOME/sessions`` safely."""
+    cleaned_thread_id = str(thread_id or "").strip()
+    if not _THREAD_ID_RE.fullmatch(cleaned_thread_id):
+        return None
+
+    home = Path(
+        codex_home
+        or os.environ.get("CODEX_HOME")
+        or Path.home() / ".codex"
+    ).expanduser()
+    sessions_root = (home / "sessions").resolve()
+
+    def _accepted(candidate: Path) -> Optional[Path]:
+        try:
+            resolved = candidate.expanduser().resolve()
+            resolved.relative_to(sessions_root)
+        except (OSError, ValueError):
+            return None
+        if (
+            resolved.suffix != ".jsonl"
+            or cleaned_thread_id not in resolved.name
+            or not resolved.is_file()
+        ):
+            return None
+        return resolved
+
+    if hinted_path:
+        accepted = _accepted(Path(hinted_path))
+        if accepted is not None:
+            return accepted
+
+    try:
+        matches = [
+            accepted
+            for candidate in sessions_root.rglob(
+                f"*{cleaned_thread_id}*.jsonl"
+            )
+            if (accepted := _accepted(candidate)) is not None
+        ]
+    except OSError:
+        return None
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime_ns)
+
+
+class CodexDesktopRolloutTail:
+    """Stateful, partial-line-safe tailer for one Codex rollout JSONL."""
+
+    def __init__(self, thread_id: str, path: Path):
+        self.thread_id = str(thread_id)
+        self.path = Path(path)
+        self.offset = 0
+        self._active_turn_id: Optional[str] = None
+        self._turn_origins: dict[str, tuple[bool, Optional[str]]] = {}
+        self._turn_details: dict[str, dict] = {}
+
+    @classmethod
+    def open(
+        cls,
+        thread_id: str,
+        *,
+        hinted_path: Optional[str] = None,
+        codex_home: Optional[str] = None,
+    ) -> Optional["CodexDesktopRolloutTail"]:
+        path = resolve_codex_rollout_path(
+            thread_id,
+            hinted_path=hinted_path,
+            codex_home=codex_home,
+        )
+        return cls(thread_id, path) if path is not None else None
+
+    def scan(self) -> list[CodexDesktopCompletion]:
+        """Read newly completed records without consuming partial JSONL lines."""
+        completions, _updates = self._scan_new_records()
+        return completions
+
+    def scan_with_updates(
+        self,
+    ) -> tuple[list[CodexDesktopCompletion], list[CodexDesktopTurnUpdate]]:
+        """Read new records and return completions plus live turn snapshots."""
+        return self._scan_new_records()
+
+    def _scan_new_records(
+        self,
+    ) -> tuple[list[CodexDesktopCompletion], list[CodexDesktopTurnUpdate]]:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return [], []
+        if self.offset > size:
+            self.offset = 0
+            self._active_turn_id = None
+            self._turn_origins.clear()
+            self._turn_details.clear()
+
+        completions: list[CodexDesktopCompletion] = []
+        updates: list[CodexDesktopTurnUpdate] = []
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                while True:
+                    line_start = handle.tell()
+                    raw = handle.readline()
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        handle.seek(line_start)
+                        break
+                    self.offset = handle.tell()
+                    try:
+                        record = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    self._consume_record(record, completions, updates)
+        except OSError:
+            return [], []
+        return completions, updates
+
+    def _consume_record(
+        self,
+        record: object,
+        completions: list[CodexDesktopCompletion],
+        updates: list[CodexDesktopTurnUpdate],
+    ) -> None:
+        if not isinstance(record, dict):
+            return
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return
+
+        # Recent Codex versions persist normal user/assistant messages as
+        # ``response_item`` records rather than ``event_msg.user_message`` /
+        # ``event_msg.agent_message``.  Keep the legacy event path below for
+        # older rollouts, but process the durable response-item form first.
+        if record.get("type") == "response_item":
+            self._consume_response_item(payload, updates)
+            return
+        if record.get("type") != "event_msg":
+            return
+        event_type = payload.get("type")
+
+        if event_type == "task_started":
+            turn_id = str(payload.get("turn_id") or "").strip()
+            if turn_id:
+                self._active_turn_id = turn_id
+                self._turn_origins[turn_id] = (False, None)
+                self._turn_details[turn_id] = {
+                    "user_text": "",
+                    "progress": [],
+                    "final_text": "",
+                }
+            return
+
+        if event_type == "user_message":
+            turn_id = self._active_turn_id
+            if turn_id:
+                message = payload.get("message")
+                self._record_user_message(
+                    turn_id,
+                    message if isinstance(message, str) else "",
+                    self._client_id_from_payload(payload),
+                    updates,
+                )
+            return
+
+        if event_type == "agent_reasoning":
+            # Codex emits terse internal status summaries here, typically in
+            # English ("Planning...", "Inspecting..."). The Telegram mirror
+            # intentionally shows only user-facing Korean commentary.
+            return
+
+        if event_type == "agent_message":
+            turn_id = self._active_turn_id
+            if not turn_id:
+                return
+            text = payload.get("message")
+            self._record_agent_message(
+                turn_id,
+                text if isinstance(text, str) else "",
+                str(payload.get("phase") or "").strip(),
+                updates,
+            )
+            return
+
+        if event_type != "task_complete":
+            return
+        turn_id = str(payload.get("turn_id") or "").strip()
+        if not turn_id:
+            return
+        user_seen, client_id = self._turn_origins.pop(
+            turn_id, (False, None)
+        )
+        if self._active_turn_id == turn_id:
+            self._active_turn_id = None
+        details = self._turn_details.pop(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
+        final_text = payload.get("last_agent_message")
+        final_text = (
+            final_text.strip() if isinstance(final_text, str) else ""
+        )
+        error_text = self._task_error_text(payload.get("error"))
+        if user_seen and (final_text or error_text):
+            details["final_text"] = final_text
+            details["error_text"] = error_text
+            completion = CodexDesktopCompletion(
+                turn_id=turn_id,
+                final_text=details["final_text"],
+                client_id=client_id,
+                user_text=str(details["user_text"]),
+                progress=tuple(details["progress"]),
+                error_text=error_text,
+            )
+            completions.append(completion)
+            updates.append(
+                CodexDesktopTurnUpdate(
+                    turn_id=completion.turn_id,
+                    user_text=completion.user_text,
+                    progress=completion.progress,
+                    final_text=completion.final_text,
+                    client_id=completion.client_id,
+                    completed=True,
+                    error_text=completion.error_text,
+                )
+            )
+
+    def _consume_response_item(
+        self,
+        payload: dict,
+        updates: list[CodexDesktopTurnUpdate],
+    ) -> None:
+        """Project modern persisted Codex message items into a live turn."""
+        if payload.get("type") != "message":
+            return
+        turn_id = self._response_item_turn_id(payload)
+        if not turn_id:
+            return
+
+        role = str(payload.get("role") or "").strip().lower()
+        if role == "user":
+            # Goal continuations are stored as a private user-role message.
+            # They must use the objective-only projection below rather than
+            # exposing Codex's internal continuation contract to Telegram.
+            if self._consume_goal_user_item(payload, updates, turn_id):
+                return
+            content = self._message_content(payload, "input_text")
+            if self._is_runtime_context_message(payload):
+                return
+            self._record_user_message(
+                turn_id,
+                content,
+                self._client_id_from_payload(payload),
+                updates,
+            )
+            return
+
+        if role == "assistant":
+            self._record_agent_message(
+                turn_id,
+                self._message_content(payload, "output_text"),
+                str(payload.get("phase") or "").strip(),
+                updates,
+            )
+
+    def _response_item_turn_id(self, payload: dict) -> Optional[str]:
+        """Resolve a response item to its persisted or currently active turn."""
+        metadata = payload.get("internal_chat_message_metadata_passthrough")
+        candidate = ""
+        if isinstance(metadata, dict):
+            candidate = str(
+                metadata.get("turn_id") or metadata.get("turnId") or ""
+            ).strip()
+        if not candidate:
+            candidate = str(
+                payload.get("turn_id") or payload.get("turnId") or ""
+            ).strip()
+        if candidate:
+            return candidate if candidate in self._turn_origins else None
+        return self._active_turn_id
+
+    @staticmethod
+    def _message_content(payload: dict, content_type: str) -> str:
+        return "\n".join(
+            CodexDesktopRolloutTail._message_content_parts(
+                payload, content_type
+            )
+        ).strip()
+
+    @staticmethod
+    def _message_content_parts(payload: dict, content_type: str) -> list[str]:
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return []
+        return [
+            str(item.get("text") or "").strip()
+            for item in content
+            if isinstance(item, dict)
+            and item.get("type") == content_type
+            and str(item.get("text") or "").strip()
+        ]
+
+    @staticmethod
+    def _client_id_from_payload(payload: dict) -> Optional[str]:
+        metadata = payload.get("internal_chat_message_metadata_passthrough")
+        candidate = payload.get("client_id") or payload.get("clientId")
+        if not candidate and isinstance(metadata, dict):
+            candidate = metadata.get("client_id") or metadata.get("clientId")
+        cleaned = str(candidate or "").strip()
+        return cleaned or None
+
+    @staticmethod
+    def _is_runtime_context_message(payload: dict) -> bool:
+        """Ignore Codex desktop's injected runtime context as a user prompt."""
+        parts = [
+            part.lower()
+            for part in CodexDesktopRolloutTail._message_content_parts(
+                payload, "input_text"
+            )
+        ]
+        return bool(parts) and all(
+            part.startswith(_RUNTIME_CONTEXT_PREFIXES) for part in parts
+        )
+
+    def _record_user_message(
+        self,
+        turn_id: str,
+        message: str,
+        client_id: Optional[str],
+        updates: list[CodexDesktopTurnUpdate],
+    ) -> None:
+        """Record the visible user instruction and emit an active-turn update."""
+        self._turn_origins[turn_id] = (True, client_id)
+        details = self._turn_details.setdefault(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
+        details["user_text"] = message.strip()
+        # Emit an immediate live snapshot even before the first commentary.
+        # This lets a client that attaches mid-turn reconstruct the request.
+        updates.append(
+            self._turn_update(turn_id, details, client_id, completed=False)
+        )
+
+    def _record_agent_message(
+        self,
+        turn_id: str,
+        text: str,
+        phase: str,
+        updates: list[CodexDesktopTurnUpdate],
+    ) -> None:
+        """Record durable public commentary or a final answer for one turn."""
+        user_seen, client_id = self._turn_origins.get(turn_id, (False, None))
+        if not user_seen:
+            return
+        details = self._turn_details.setdefault(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
+        cleaned = text.strip()
+        if phase == "final_answer":
+            if cleaned:
+                details["final_text"] = cleaned
+            updates.append(
+                self._turn_update(turn_id, details, client_id, completed=False)
+            )
+            return
+        if cleaned and re.search(r"[가-힣]", cleaned):
+            item = CodexDesktopProgress(kind="commentary", text=cleaned)
+            progress = details["progress"]
+            if not progress or progress[-1] != item:
+                progress.append(item)
+            updates.append(
+                self._turn_update(turn_id, details, client_id, completed=False)
+            )
+
+    def _consume_goal_user_item(
+        self,
+        payload: dict,
+        updates: list[CodexDesktopTurnUpdate],
+        turn_id: str,
+    ) -> bool:
+        """Recognize the private prompt that starts an automatic goal turn."""
+        if (
+            not turn_id
+            or payload.get("type") != "message"
+            or payload.get("role") != "user"
+        ):
+            return False
+        user_seen, _client_id = self._turn_origins.get(
+            turn_id, (False, None)
+        )
+        raw_text = self._message_content(payload, "input_text")
+        if not _GOAL_CONTEXT_RE.search(raw_text):
+            return False
+        if user_seen:
+            return True
+
+        objective_match = _GOAL_OBJECTIVE_RE.search(raw_text)
+        objective = (
+            objective_match.group("objective").strip()
+            if objective_match is not None
+            else "활성 목표 계속 진행"
+        )
+        details = self._turn_details.setdefault(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
+        details["user_text"] = objective or "활성 목표 계속 진행"
+        self._turn_origins[turn_id] = (True, None)
+        updates.append(
+            self._turn_update(
+                turn_id,
+                details,
+                None,
+                completed=False,
+            )
+        )
+        return True
+
+    @staticmethod
+    def _task_error_text(error: object) -> str:
+        if isinstance(error, str):
+            return error.strip()
+        if not isinstance(error, dict):
+            return ""
+        message = error.get("message")
+        return message.strip() if isinstance(message, str) else ""
+
+    @staticmethod
+    def _turn_update(
+        turn_id: str,
+        details: dict,
+        client_id: Optional[str],
+        *,
+        completed: bool,
+    ) -> CodexDesktopTurnUpdate:
+        return CodexDesktopTurnUpdate(
+            turn_id=turn_id,
+            user_text=str(details.get("user_text") or ""),
+            progress=tuple(details.get("progress") or ()),
+            final_text=str(details.get("final_text") or ""),
+            client_id=client_id,
+            completed=completed,
+            error_text=str(details.get("error_text") or ""),
+        )
+
+
+def snapshot_codex_rollout_latest(
+    thread_id: str,
+    *,
+    hinted_path: Optional[str] = None,
+    codex_home: Optional[str] = None,
+) -> tuple[Optional[str], Optional[CodexDesktopCompletion]]:
+    """Return the rollout path and latest completed answer at attach time."""
+    tail = CodexDesktopRolloutTail.open(
+        thread_id,
+        hinted_path=hinted_path,
+        codex_home=codex_home,
+    )
+    if tail is None:
+        return None, None
+    completions = tail.scan()
+    return str(tail.path), completions[-1] if completions else None
+
+
+def snapshot_codex_rollout(
+    thread_id: str,
+    *,
+    hinted_path: Optional[str] = None,
+    codex_home: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(rollout_path, latest_completed_turn_id)`` at attach time."""
+    rollout_path, latest = snapshot_codex_rollout_latest(
+        thread_id,
+        hinted_path=hinted_path,
+        codex_home=codex_home,
+    )
+    return rollout_path, latest.turn_id if latest is not None else None
