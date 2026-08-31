@@ -2474,6 +2474,18 @@ class BasePlatformAdapter(ABC):
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
+        # Optional async control-plane resolver that can add an internal
+        # session lane before the adapter derives its active-session key.
+        # Unlike thread_id, a session lane never affects outbound routing.
+        self._session_source_resolver: Optional[
+            Callable[[MessageEvent], Awaitable[Optional[SessionSource]]]
+        ] = None
+        # Final-delivery authorization is separate from execution/session
+        # activity. A control-plane binding can revoke one lane's output while
+        # allowing its underlying agent work to finish and persist.
+        self._delivery_authorizer: Optional[
+            Callable[[MessageEvent], bool]
+        ] = None
         self._running = False
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -2990,6 +3002,47 @@ class BasePlatformAdapter(ABC):
         # Guard against subclasses that initialize via ``object.__new__`` in
         # tests and never run ``BasePlatformAdapter.__init__``.
         self._topic_recovery_fn = fn  # type: ignore[attr-defined]
+
+    def set_session_source_resolver(
+        self,
+        resolver: Optional[
+            Callable[[MessageEvent], Awaitable[Optional[SessionSource]]]
+        ],
+    ) -> None:
+        """Install an async resolver that may select an internal session lane."""
+        self._session_source_resolver = resolver
+
+    def set_delivery_authorizer(
+        self,
+        authorizer: Optional[Callable[[MessageEvent], bool]],
+    ) -> None:
+        """Install a synchronous guard for late final/error delivery."""
+        self._delivery_authorizer = authorizer
+
+    def _is_delivery_authorized(self, event: MessageEvent) -> bool:
+        authorizer = getattr(self, "_delivery_authorizer", None)
+        if authorizer is None:
+            return True
+        try:
+            return bool(authorizer(event))
+        except Exception:
+            logger.warning("delivery authorizer failed closed", exc_info=True)
+            return False
+
+    async def _apply_session_source_resolver(
+        self,
+        event: MessageEvent,
+    ) -> None:
+        resolver = getattr(self, "_session_source_resolver", None)
+        if resolver is None:
+            return
+        try:
+            resolved = await resolver(event)
+        except Exception:
+            logger.warning("session source resolver failed", exc_info=True)
+            return
+        if resolved is not None:
+            event.source = resolved
 
     def _apply_topic_recovery(self, event: MessageEvent) -> None:
         """Rewrite ``event.source.thread_id`` in place if the hook returns one."""
@@ -4031,6 +4084,7 @@ class BasePlatformAdapter(ABC):
         interval: float = 2.0,
         metadata=None,
         stop_event: asyncio.Event | None = None,
+        continue_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         """
         Continuously send typing indicator until cancelled.
@@ -4059,6 +4113,8 @@ class BasePlatformAdapter(ABC):
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
+                    return
+                if continue_check is not None and not continue_check():
                     return
                 if chat_id not in self._typing_paused:
                     try:
@@ -4879,6 +4935,10 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
+        # Resolve any internal execution lane before deriving the adapter
+        # guard key. This is what lets two Codex desktop threads attached to
+        # one Telegram DM own independent active-session locks.
+        await self._apply_session_source_resolver(event)
 
         session_key = build_session_key(
             event.source,
@@ -5118,6 +5178,21 @@ class BasePlatformAdapter(ABC):
                 _keep_typing_sig = None
             if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
                 _keep_typing_kwargs["stop_event"] = interrupt_event
+            _keep_typing_accepts_kwargs = bool(
+                _keep_typing_sig is not None
+                and any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in _keep_typing_sig.parameters.values()
+                )
+            )
+            if (
+                _keep_typing_sig is None
+                or "continue_check" in _keep_typing_sig.parameters
+                or _keep_typing_accepts_kwargs
+            ):
+                _keep_typing_kwargs["continue_check"] = (
+                    lambda: self._is_delivery_authorized(event)
+                )
             typing_task = asyncio.create_task(
                 self._keep_typing(
                     event.source.chat_id,
@@ -5137,6 +5212,14 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            if response and not self._is_delivery_authorized(event):
+                logger.info(
+                    "[%s] Suppressing response whose delivery authority was "
+                    "revoked for session %s",
+                    self.name,
+                    session_key,
+                )
+                response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5559,6 +5642,13 @@ class BasePlatformAdapter(ABC):
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
+                if not self._is_delivery_authorized(event):
+                    logger.info(
+                        "[%s] Suppressing stale error notification for %s",
+                        self.name,
+                        session_key,
+                    )
+                    return
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))

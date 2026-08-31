@@ -271,6 +271,64 @@ def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     assert resolved.get("credential_pool") is None
 
 
+def test_resolve_runtime_provider_codex_auth_store_honors_app_server(monkeypatch):
+    """The singleton Hermes OAuth path must not bypass openai_runtime."""
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-sol",
+            "openai_runtime": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "source": "hermes-auth-store",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["source"] == "hermes-auth-store"
+
+
+def test_resolve_runtime_provider_explicit_codex_honors_app_server(monkeypatch):
+    """Explicit Codex credentials follow the same runtime gate."""
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-sol",
+            "openai_runtime": "codex_app_server",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-codex",
+        explicit_api_key="codex-token",
+    )
+
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["source"] == "explicit"
+
+
 def test_resolve_runtime_provider_codex(monkeypatch):
     monkeypatch.setattr(
         rp,

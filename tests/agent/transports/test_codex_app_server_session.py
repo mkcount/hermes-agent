@@ -16,6 +16,7 @@ import pytest
 import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    list_recent_codex_desktop_threads,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
@@ -53,6 +54,8 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {}).get("threadId"), "turns": []}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -162,6 +165,20 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
+    def test_waiting_resumed_turn_is_not_directly_streamed(self):
+        client = FakeClient()
+        session = make_session(client)
+        with session._active_turn_lock:
+            session._active_turn_id = "turn-existing"
+            session._waiting_for_resumed_turn_id = "turn-existing"
+
+        assert session.is_directly_streaming_turn("turn-existing") is False
+
+        with session._active_turn_lock:
+            session._waiting_for_resumed_turn_id = None
+
+        assert session.is_directly_streaming_turn("turn-existing") is True
+
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching
@@ -173,6 +190,111 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_resume_uses_existing_thread_without_overriding_cwd(self):
+        client = FakeClient()
+        session = make_session(client, resume_thread_id="desktop-thread-1")
+
+        assert session.ensure_started() == "desktop-thread-1"
+        method, params = next(r for r in client.requests if r[0] == "thread/resume")
+        assert method == "thread/resume"
+        assert params == {"threadId": "desktop-thread-1"}
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_new_thread_prefers_live_desktop_control_socket(self, monkeypatch):
+        client = FakeClient()
+        factory_calls = []
+        monkeypatch.setattr(
+            session_mod,
+            "_control_socket_path",
+            lambda *_: "/tmp/codex-control.sock",
+        )
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **kwargs: (
+                factory_calls.append(kwargs) or client
+            ),
+        )
+
+        assert session.ensure_started() == "thread-fake-001"
+        assert factory_calls == [{
+            "codex_bin": "codex",
+            "codex_home": None,
+            "control_socket_path": "/tmp/codex-control.sock",
+        }]
+
+    def test_archived_thread_is_unarchived_then_resumed(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+        resume_attempts = 0
+
+        def handle(method, params):
+            nonlocal resume_attempts
+            if method == "thread/resume":
+                resume_attempts += 1
+                if resume_attempts == 1:
+                    raise CodexAppServerError(
+                        code=-32602,
+                        message="Session desktop-thread-1 is archived.",
+                    )
+                return {
+                    "thread": {
+                        "id": params["threadId"],
+                        "turns": [],
+                    }
+                }
+            if method == "thread/unarchive":
+                return {}
+            return {}
+
+        client._request_handler = handle
+        session = make_session(client, resume_thread_id="desktop-thread-1")
+
+        assert session.ensure_started() == "desktop-thread-1"
+        assert [method for method, _params in client.requests] == [
+            "thread/resume",
+            "thread/unarchive",
+            "thread/resume",
+        ]
+
+    def test_recent_desktop_threads_are_sorted_by_server_recency(self, monkeypatch):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/list":
+                return {
+                    "data": [
+                        {
+                            "id": "desktop-1",
+                            "name": "Current work",
+                            "cwd": "/work/one",
+                            "recencyAt": 20,
+                            "status": {"type": "active"},
+                        },
+                        {
+                            "id": "desktop-2",
+                            "preview": "Earlier work",
+                            "cwd": "/work/two",
+                            "recencyAt": 10,
+                            "status": {"type": "notLoaded"},
+                        },
+                    ]
+                }
+            return {}
+
+        client._request_handler = handle
+        monkeypatch.setattr(session_mod, "_control_socket_path", lambda *_: None)
+
+        result = list_recent_codex_desktop_threads(
+            limit=2, client_factory=lambda **_: client
+        )
+
+        assert [item.thread_id for item in result] == ["desktop-1", "desktop-2"]
+        assert result[0].status == "active"
+        _, list_params = next(r for r in client.requests if r[0] == "thread/list")
+        assert list_params["sourceKinds"] == ["vscode"]
+        assert list_params["sortKey"] == "recency_at"
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -186,6 +308,131 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_turn_started_callback_receives_exact_thread_and_turn_ids(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        started: list[tuple[str, str]] = []
+
+        result = make_session(
+            client,
+            on_turn_started=lambda thread_id, turn_id: started.append(
+                (thread_id, turn_id)
+            ),
+        ).run_turn("from telegram", turn_timeout=2.0)
+
+        assert result.turn_id == "turn-fake-001"
+        assert started == [("thread-fake-001", "turn-fake-001")]
+
+    def test_active_desktop_turn_is_steered_instead_of_restarted(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                return {
+                    "thread": {
+                        "id": "desktop-thread-1",
+                        "turns": [{"id": "desktop-turn-1", "status": "inProgress"}],
+                    }
+                }
+            if method == "turn/steer":
+                return {"turnId": (params or {}).get("expectedTurnId")}
+            return {}
+
+        client._request_handler = handle
+        client.queue_notification(
+            "item/completed",
+            threadId="desktop-thread-1",
+            turnId="desktop-turn-1",
+            item={"type": "agentMessage", "id": "m1", "text": "steered reply"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="desktop-thread-1",
+            turn={"id": "desktop-turn-1", "status": "completed", "error": None},
+        )
+
+        result = make_session(
+            client, resume_thread_id="desktop-thread-1"
+        ).run_turn("mobile follow-up", turn_timeout=2.0)
+
+        assert result.final_text == "steered reply"
+        steer = next(params for method, params in client.requests if method == "turn/steer")
+        assert steer["expectedTurnId"] == "desktop-turn-1"
+        assert steer["input"] == [{"type": "text", "text": "mobile follow-up"}]
+        assert not any(method == "turn/start" for method, _ in client.requests)
+
+    def test_queue_mode_waits_for_active_desktop_turn_then_starts_new_turn(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                return {
+                    "thread": {
+                        "id": "desktop-thread-1",
+                        "turns": [
+                            {"id": "desktop-turn-1", "status": "inProgress"}
+                        ],
+                    }
+                }
+            if method == "turn/start":
+                return {"turn": {"id": "telegram-turn-2"}}
+            return {}
+
+        client._request_handler = handle
+        client.queue_notification(
+            "turn/completed",
+            threadId="desktop-thread-1",
+            turn={
+                "id": "desktop-turn-1",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="desktop-thread-1",
+            turnId="telegram-turn-2",
+            item={"type": "agentMessage", "id": "m2", "text": "queued reply"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="desktop-thread-1",
+            turn={
+                "id": "telegram-turn-2",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        started: list[tuple[str, str]] = []
+
+        result = make_session(
+            client,
+            resume_thread_id="desktop-thread-1",
+            resume_active_turn_mode="queue",
+            on_turn_started=lambda thread_id, turn_id: started.append(
+                (thread_id, turn_id)
+            ),
+        ).run_turn("next turn please", turn_timeout=2.0)
+
+        assert result.final_text == "queued reply"
+        assert started == [("desktop-thread-1", "telegram-turn-2")]
+        assert not any(method == "turn/steer" for method, _ in client.requests)
+        turn_start = next(
+            params for method, params in client.requests
+            if method == "turn/start"
+        )
+        assert turn_start["input"] == [
+            {"type": "text", "text": "next turn please"}
+        ]
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -540,6 +787,49 @@ class TestRunTurn:
         assert "sk-stalled-secret-abc123" not in r.error
         assert r.should_retire is True
 
+    def test_broken_control_socket_reconnects_and_reuses_message_id(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        stale = FakeClient()
+        fresh = FakeClient()
+
+        def stale_handler(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                raise CodexAppServerError(code=-32603, message="broken pipe")
+            return {}
+
+        stale._request_handler = stale_handler
+        fresh.queue_notification(
+            "item/completed", threadId="t", turnId="tu1",
+            item={"type": "agentMessage", "id": "m1",
+                  "phase": "final_answer", "text": "done"},
+        )
+        fresh.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        clients = iter([stale, fresh])
+        s = CodexAppServerSession(
+            cwd="/tmp",
+            prefer_desktop_control_socket=False,
+            client_factory=lambda **kw: next(clients),
+        )
+
+        r = s.run_turn("hi", turn_timeout=2.0)
+
+        assert r.final_text == "done"
+        assert stale._closed is True
+        assert any(method == "thread/resume" for method, _ in fresh.requests)
+        stale_start = next(params for method, params in stale.requests
+                           if method == "turn/start")
+        fresh_start = next(params for method, params in fresh.requests
+                           if method == "turn/start")
+        assert stale_start["clientUserMessageId"]
+        assert (stale_start["clientUserMessageId"]
+                == fresh_start["clientUserMessageId"])
+
     def test_startup_failure_returns_error_with_stderr(self):
         """Codex thread/start failures during ensure_started() used to bubble
         up as uncaught exceptions. Now they return a TurnResult.error so
@@ -595,6 +885,20 @@ class TestRunTurn:
             for (method, params) in client.requests
         )
 
+    def test_request_interrupt_sends_rpc_immediately_for_active_turn(self):
+        client = FakeClient()
+        s = make_session(client)
+        s.ensure_started()
+        with s._active_turn_lock:
+            s._active_turn_id = "turn-live-123"
+
+        s.request_interrupt()
+
+        assert client.requests[-1] == (
+            "turn/interrupt",
+            {"threadId": "thread-fake-001", "turnId": "turn-live-123"},
+        )
+
     def test_steer_appends_input_to_active_turn(self):
         client = FakeClient()
         s = make_session(client)
@@ -647,6 +951,24 @@ class TestRunTurn:
         s = make_session(client)
         r = s.run_turn("x", turn_timeout=1.0)
         assert r.error and "model error" in r.error
+
+    def test_external_interruption_is_not_reported_as_completed(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed", threadId="t", turnId="tu1",
+            item={"type": "agentMessage", "id": "m1",
+                  "phase": "commentary", "text": "still working"},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "interrupted", "error": None},
+        )
+
+        r = make_session(client).run_turn("x", turn_timeout=1.0)
+
+        assert r.interrupted is True
+        assert r.final_text == ""
+        assert r.error and "완료되지 않았습니다" in r.error
 
     def test_run_turn_records_native_compaction_item(self):
         client = FakeClient()
@@ -1208,6 +1530,62 @@ class TestSessionRetirement:
             "respawns codex instead of riding a wedged subprocess."
         )
 
+    def test_turn_timeout_is_extended_by_scoped_activity(self):
+        """A healthy active turn may outlive the nominal inactivity window."""
+
+        class DelayedNotificationClient(FakeClient):
+            def take_notification(self, timeout: float = 0.0):
+                if not self._notifications:
+                    return super().take_notification(timeout)
+                delay, note = self._notifications.pop(0)
+                if delay:
+                    time.sleep(delay)
+                return note
+
+        client = DelayedNotificationClient()
+        client._notifications.extend(
+            [
+                (
+                    0.03,
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread-fake-001",
+                            "turnId": "turn-fake-001",
+                            "tokenUsage": {"last": {"totalTokens": value}},
+                        },
+                    },
+                )
+                for value in (1, 2, 3)
+            ]
+            + [
+                (
+                    0.03,
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-fake-001",
+                            "turn": {
+                                "id": "turn-fake-001",
+                                "status": "completed",
+                                "error": None,
+                            },
+                        },
+                    },
+                )
+            ]
+        )
+
+        r = make_session(client).run_turn(
+            "active longer than one window",
+            turn_timeout=0.08,
+            notification_poll_timeout=0.005,
+        )
+
+        assert r.interrupted is False
+        assert r.error is None
+        assert r.should_retire is False
+
     def test_completed_turn_does_not_retire(self):
         client = FakeClient()
         client.queue_notification(
@@ -1250,6 +1628,25 @@ class TestSessionRetirement:
         )
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
+    def test_commentary_without_turn_completed_is_not_a_final_response(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1",
+                  "phase": "commentary", "text": "still working"},
+            threadId="t",
+            turnId="tu1",
+        )
+        r = make_session(client).run_turn(
+            "hi",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+
+        assert r.final_text == ""
+        assert r.interrupted is True
+        assert r.error and "timed out" in r.error
+
     def test_post_tool_quiet_watchdog_trips_and_retires(self):
         client = FakeClient()
         # One tool completion, then total silence — no further events,
@@ -1291,7 +1688,9 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        monotonic_values = iter(
+            [1000.0, 999.0, 999.0, 999.0, 999.0, 1000.2]
+        )
         with patch.object(
             session_mod.time,
             "monotonic",
@@ -1343,6 +1742,46 @@ class TestSessionRetirement:
         assert r.final_text == "tool finished"
         assert r.should_retire is False
         assert r.interrupted is False
+
+    def test_post_tool_watchdog_treats_usage_updates_as_liveness(self):
+        class DelayedNotificationClient(FakeClient):
+            def take_notification(self, timeout: float = 0.0):
+                if not self._notifications:
+                    return super().take_notification(timeout)
+                delay, note = self._notifications.pop(0)
+                if delay:
+                    time.sleep(delay)
+                return note
+
+        client = DelayedNotificationClient()
+        client._notifications.extend([
+            (0.0, {"method": "item/completed", "params": {
+                "item": {"type": "commandExecution", "id": "ex1",
+                         "command": "echo hi", "cwd": "/tmp",
+                         "status": "completed", "aggregatedOutput": "hi",
+                         "exitCode": 0, "commandActions": []},
+                "threadId": "thread-fake-001", "turnId": "turn-fake-001",
+            }}),
+            (0.03, {"method": "thread/tokenUsage/updated", "params": {
+                "threadId": "thread-fake-001", "turnId": "turn-fake-001",
+                "tokenUsage": {"last": {"totalTokens": 1}},
+            }}),
+            (0.03, {"method": "turn/completed", "params": {
+                "threadId": "thread-fake-001",
+                "turn": {"id": "turn-fake-001", "status": "completed",
+                         "error": None},
+            }}),
+        ])
+
+        r = make_session(client).run_turn(
+            "long reasoning",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+            post_tool_quiet_timeout=0.05,
+        )
+
+        assert r.interrupted is False
+        assert r.should_retire is False
 
     def test_turn_aborted_marker_in_text_is_terminal(self):
         """If codex emits `<turn_aborted>` in agent text and never sends

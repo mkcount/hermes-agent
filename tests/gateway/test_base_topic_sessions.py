@@ -1,6 +1,7 @@
 """Tests for BasePlatformAdapter topic-aware session handling."""
 
 import asyncio
+import dataclasses
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -68,6 +69,118 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 
 class TestBasePlatformTopicSessions:
+    @pytest.mark.asyncio
+    async def test_revoked_delivery_authority_stops_typing_refresh(self):
+        adapter = DummyTelegramAdapter()
+        first_typing = asyncio.Event()
+        authorized = True
+
+        async def send_typing(chat_id, metadata=None):
+            adapter.typing.append({"chat_id": chat_id, "metadata": metadata})
+            first_typing.set()
+
+        adapter.send_typing = send_typing
+        task = asyncio.create_task(
+            adapter._keep_typing(
+                "456",
+                interval=0.05,
+                continue_check=lambda: authorized,
+            )
+        )
+        await first_typing.wait()
+        authorized = False
+        await asyncio.wait_for(task, timeout=0.5)
+
+        assert len(
+            [item for item in adapter.typing if not item.get("stopped")]
+        ) == 1
+
+    @pytest.mark.asyncio
+    async def test_revoked_delivery_authority_suppresses_late_final_response(
+        self,
+    ):
+        adapter = DummyTelegramAdapter()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        authorized = True
+
+        async def handler(_event):
+            started.set()
+            await release.wait()
+            return "late response from old lane"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter.set_delivery_authorizer(lambda _event: authorized)
+        adapter._keep_typing = hold_typing
+        event = MessageEvent(
+            text="old lane work",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="456",
+                chat_type="dm",
+                user_id="123",
+                session_lane="desktop-thread-a",
+            ),
+        )
+        session_key = build_session_key(event.source)
+
+        task = asyncio.create_task(
+            adapter._process_message_background(event, session_key)
+        )
+        await started.wait()
+        authorized = False
+        release.set()
+        await task
+
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_source_resolver_separates_internal_codex_lanes(
+        self, monkeypatch
+    ):
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="456",
+            chat_type="dm",
+            user_id="123",
+            session_lane="desktop-thread-a",
+        )
+        adapter._active_sessions[build_session_key(source)] = asyncio.Event()
+
+        async def resolve_lane(event):
+            return dataclasses.replace(
+                event.source,
+                session_lane="desktop-thread-b",
+            )
+
+        adapter.set_session_source_resolver(resolve_lane)
+        scheduled = []
+
+        def fake_create_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return SimpleNamespace()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+        event = MessageEvent(
+            text="work in B",
+            source=dataclasses.replace(source, session_lane=None),
+        )
+
+        await adapter.handle_message(event)
+
+        assert event.source.session_lane == "desktop-thread-b"
+        assert len(scheduled) == 1
+        assert build_session_key(event.source) not in {
+            build_session_key(source)
+        }
+        assert adapter._pending_messages == {}
+
     @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()

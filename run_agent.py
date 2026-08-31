@@ -3779,6 +3779,22 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_session(self) -> None:
+        """Close and detach the owned Codex app-server session once."""
+        codex_session = getattr(self, "_codex_session", None)
+        if codex_session is None:
+            return
+        # Clear first so repeated cleanup, or cleanup re-entered from an
+        # exception path, cannot close the same proxy/subprocess twice.
+        self._codex_session = None
+        try:
+            codex_session.close()
+        except Exception:
+            logger.debug(
+                "Failed to close Codex app-server session",
+                exc_info=True,
+            )
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3794,6 +3810,7 @@ class AIAgent:
         We DO close:
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
+          - Codex app-server client/proxy owned by this cached agent
           - Active child subagents (per-turn artefacts; safe to drop)
 
         Safe to call multiple times.  Distinct from close() — which is the
@@ -3816,6 +3833,11 @@ class AIAgent:
                         pass
         except Exception:
             pass
+
+        # A cache eviction must retire the Codex transport as well. Leaving
+        # this reference alive leaks one proxy/app-server process per rebuilt
+        # agent even though the durable Codex thread itself is resumable.
+        self._close_codex_session()
 
         # Retire the OpenAI/httpx client to release sockets immediately.
         # #70773: eviction runs on the gateway's memory-manager thread — a
@@ -3878,7 +3900,10 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Close the Codex app-server client/proxy, when present.
+        self._close_codex_session()
+
+        # 6. Close the OpenAI/httpx client.
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3887,7 +3912,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3898,7 +3923,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Finalize the owned SQLite session row unless this agent is only a
+        # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
         # or background-review forks that share the live parent's session_id and

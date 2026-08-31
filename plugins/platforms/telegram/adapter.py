@@ -5550,9 +5550,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             if not buttons:
                 return SendResult(success=False, error="No choices")
-            # Two buttons per row keeps labels readable on mobile.
+            # Two buttons per row keeps short finite choices compact. Commands
+            # with descriptive labels (for example recent Codex sessions) can
+            # request full-width rows per choice.
+            columns = 1 if any(choice.get("full_width") for choice in choices) else 2
             keyboard = InlineKeyboardMarkup(
-                [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                [buttons[i:i + columns] for i in range(0, len(buttons), columns)]
             )
 
             thread_id = metadata.get("thread_id") if metadata else None

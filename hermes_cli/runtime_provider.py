@@ -1513,7 +1513,11 @@ def _resolve_explicit_runtime(
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
         return {
             "provider": "openai-codex",
-            "api_mode": "codex_responses",
+            "api_mode": _maybe_apply_codex_app_server_runtime(
+                provider="openai-codex",
+                api_mode="codex_responses",
+                model_cfg=model_cfg,
+            ),
             "base_url": base_url,
             "api_key": api_key,
             "source": "explicit",
@@ -1607,6 +1611,11 @@ def _resolve_explicit_runtime(
                 detected = _detect_api_mode_for_url(base_url)
                 if detected:
                     api_mode = detected
+        api_mode = _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode=api_mode,
+            model_cfg=model_cfg,
+        )
 
         return {
             "provider": provider,
@@ -1916,7 +1925,11 @@ def resolve_runtime_provider(
             creds = resolve_codex_runtime_credentials()
             return {
                 "provider": "openai-codex",
-                "api_mode": "codex_responses",
+                "api_mode": _maybe_apply_codex_app_server_runtime(
+                    provider="openai-codex",
+                    api_mode="codex_responses",
+                    model_cfg=model_cfg,
+                ),
                 "base_url": creds.get("base_url", "").rstrip("/"),
                 "api_key": creds.get("api_key", ""),
                 "source": creds.get("source", "hermes-auth-store"),
@@ -2205,6 +2218,11 @@ def resolve_runtime_provider(
         if provider in {"opencode-zen", "opencode-go"}:
             from hermes_cli.models import normalize_opencode_base_url
             base_url = normalize_opencode_base_url(provider, api_mode, base_url)
+        api_mode = _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode=api_mode,
+            model_cfg=model_cfg,
+        )
         if provider == "lmstudio":
             base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
         return {

@@ -9,6 +9,7 @@ Handles:
 """
 
 import asyncio
+import copy
 import hashlib
 import logging
 import os
@@ -182,6 +183,12 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+    # Internal execution-lane discriminator.  This separates concurrency,
+    # transcript, and agent-cache state without changing the platform routing
+    # address (chat_id/thread_id).  The Codex desktop-session bridge uses one
+    # lane per attached Codex thread so multiple desktop threads can run in
+    # parallel from the same Telegram DM.
+    session_lane: Optional[str] = None
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -264,6 +271,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.session_lane:
+            d["session_lane"] = self.session_lane
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -289,6 +298,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            session_lane=data.get("session_lane"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
@@ -1066,6 +1076,14 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+
+    def _finish(parts: List[Any]) -> str:
+        if source.session_lane:
+            # Hash the opaque external thread id so it cannot inject key
+            # separators or path-shaped content into persisted routing keys.
+            parts.extend(("lane", _hash_id(str(source.session_lane))))
+        return ":".join(str(part) for part in parts)
+
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -1083,7 +1101,7 @@ def build_session_key(
             dm_parts.append(dm_chat_id)
             if source.thread_id:
                 dm_parts.append(source.thread_id)
-            return ":".join(str(part) for part in dm_parts)
+            return _finish(dm_parts)
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -1100,10 +1118,10 @@ def build_session_key(
             dm_parts.append(str(dm_participant_id))
             if source.thread_id:
                 dm_parts.append(source.thread_id)
-            return ":".join(str(part) for part in dm_parts)
+            return _finish(dm_parts)
         if source.thread_id:
             dm_parts.append(source.thread_id)
-        return ":".join(str(part) for part in dm_parts)
+        return _finish(dm_parts)
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -1130,7 +1148,7 @@ def build_session_key(
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
-    return ":".join(str(part) for part in key_parts)
+    return _finish(key_parts)
 
 
 class _SessionFlight:
@@ -1717,7 +1735,11 @@ class SessionStore:
         recovered = self._find_gateway_session_row(
             session_key=session_key,
             source=source,
-            allow_peer_fallback=legacy_key is None,
+            # A session lane is an explicit conversation boundary (for
+            # example, one Codex desktop thread). Falling back to the bare
+            # platform/chat/user tuple would make every lane recover the same
+            # transcript after a restart.
+            allow_peer_fallback=legacy_key is None and not source.session_lane,
             raise_on_lookup_error=raise_on_lookup_error,
         )
         migrated_legacy = False
@@ -1779,7 +1801,10 @@ class SessionStore:
         recovered = self._find_gateway_session_row(
             session_key=session_key,
             source=source,
-            allow_peer_fallback=legacy_key is None,
+            # Lane-scoped routes must only recover their exact durable key.
+            # Peer fallback intentionally remains available for legacy,
+            # non-lane messaging sessions.
+            allow_peer_fallback=legacy_key is None and not source.session_lane,
         )
         migrated_legacy = False
         if (
@@ -2516,6 +2541,169 @@ class SessionStore:
             if entry is None:
                 return False
             entry.metadata[key] = value
+            entry.updated_at = _now()
+            self._save()
+            return True
+
+    def promote_session_lane_and_set_metadata(
+        self,
+        control_session_key: str,
+        metadata_key: str,
+        *,
+        expected: Dict[str, Any],
+        value: Dict[str, Any],
+        old_session_key: str,
+        new_source: SessionSource,
+    ) -> bool:
+        """Atomically promote a placeholder lane and its control binding.
+
+        A newly-created external conversation first runs on a durable
+        placeholder lane. Once the external runtime returns the real thread
+        id, both the control-plane metadata and the execution route must move
+        together. Publishing only one half can either split the transcript or
+        make the next message start another external thread.
+
+        If a pre-fix routing index has the same Hermes session id aliased by
+        another key, the placeholder route is removed instead of moving that
+        shared entry. The next message creates an isolated lane transcript;
+        the external Codex thread still carries the authoritative context.
+        """
+        new_session_key = self._generate_session_key(new_source)
+        moved_entry: Optional[SessionEntry] = None
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            control_entry = self._entries.get(control_session_key)
+            if control_entry is None:
+                return False
+            current = control_entry.metadata.get(metadata_key)
+            if not isinstance(current, dict):
+                return False
+            if any(current.get(name) != item for name, item in expected.items()):
+                return False
+
+            old_entry = self._entries.get(old_session_key)
+            existing_new = self._entries.get(new_session_key)
+            if (
+                old_entry is not None
+                and existing_new is not None
+                and existing_new.session_id != old_entry.session_id
+            ):
+                logger.error(
+                    "Refusing session lane promotion %s -> %s because the "
+                    "destination already owns a different session",
+                    old_session_key,
+                    new_session_key,
+                )
+                return False
+
+            control_entry.metadata[metadata_key] = copy.deepcopy(value)
+            control_entry.updated_at = _now()
+
+            if old_session_key != new_session_key and old_entry is not None:
+                self._entries.pop(old_session_key, None)
+                shared_elsewhere = any(
+                    entry.session_id == old_entry.session_id
+                    for key, entry in self._entries.items()
+                    if key != new_session_key
+                )
+                if not shared_elsewhere:
+                    old_entry.session_key = new_session_key
+                    old_entry.origin = copy.deepcopy(new_source)
+                    old_entry.platform = new_source.platform
+                    old_entry.chat_type = new_source.chat_type
+                    old_entry.updated_at = _now()
+                    self._entries[new_session_key] = old_entry
+                    moved_entry = old_entry
+
+            data, generation = self._snapshot_routing_locked()
+
+        self._persist_routing_data(data, generation)
+        if moved_entry is not None:
+            self._record_gateway_session_peer(
+                moved_entry.session_id,
+                new_session_key,
+                moved_entry.origin,
+                display_name=moved_entry.display_name,
+            )
+        return True
+
+    def list_sessions_with_metadata(
+        self,
+        key: str,
+    ) -> List[tuple[str, Optional[SessionSource], Any]]:
+        """Snapshot live routes carrying a metadata key.
+
+        Background delivery watchers use this instead of reaching into
+        ``_entries`` without the store lock. Returned values are deep copies so
+        an async caller cannot mutate the routing index behind the lock.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            return [
+                (
+                    session_key,
+                    copy.deepcopy(entry.origin),
+                    copy.deepcopy(entry.metadata[key]),
+                )
+                for session_key, entry in self._entries.items()
+                if key in entry.metadata and entry.metadata[key] is not None
+            ]
+
+    def update_session_metadata_dict_if_matches(
+        self,
+        session_key: str,
+        key: str,
+        *,
+        expected: Dict[str, Any],
+        updates: Dict[str, Any],
+    ) -> bool:
+        """Atomically merge a metadata dict when identifying fields match."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            current = entry.metadata.get(key)
+            if not isinstance(current, dict):
+                return False
+            if any(current.get(name) != value for name, value in expected.items()):
+                return False
+            merged = dict(current)
+            merged.update(copy.deepcopy(updates))
+            entry.metadata[key] = merged
+            entry.updated_at = _now()
+            self._save()
+            return True
+
+    def append_session_metadata_list_if_matches(
+        self,
+        session_key: str,
+        key: str,
+        *,
+        expected: Dict[str, Any],
+        list_key: str,
+        value: Any,
+        max_items: int = 64,
+    ) -> bool:
+        """Atomically append a unique value to a bounded nested metadata list."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            current = entry.metadata.get(key)
+            if not isinstance(current, dict):
+                return False
+            if any(current.get(name) != item for name, item in expected.items()):
+                return False
+            merged = dict(current)
+            values = list(merged.get(list_key) or [])
+            if value not in values:
+                values.append(copy.deepcopy(value))
+            limit = max(1, int(max_items))
+            merged[list_key] = values[-limit:]
+            entry.metadata[key] = merged
             entry.updated_at = _now()
             self._save()
             return True

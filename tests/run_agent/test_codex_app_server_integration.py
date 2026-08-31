@@ -410,6 +410,12 @@ class TestRunConversationCodexPath:
         requests should not fail closed just because no interactive callback is
         wired (the typical gateway path). Codex's own sandbox permission
         profile remains the filesystem boundary."""
+        import tools.approval as _approval
+
+        monkeypatch.setattr(_approval, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            _approval, "is_current_session_yolo_enabled", lambda: False
+        )
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
@@ -429,6 +435,12 @@ class TestRunConversationCodexPath:
     ):
         """YAML 1.1 parses unquoted `off` as False; match the normal approval
         subsystem's compatibility behavior for codex app-server routing too."""
+        import tools.approval as _approval
+
+        monkeypatch.setattr(_approval, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            _approval, "is_current_session_yolo_enabled", lambda: False
+        )
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
@@ -448,6 +460,12 @@ class TestRunConversationCodexPath:
     ):
         """Default (manual) approvals must preserve the fail-closed behavior —
         this fix is a no-op for users who haven't opted out."""
+        import tools.approval as _approval
+
+        monkeypatch.setattr(_approval, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            _approval, "is_current_session_yolo_enabled", lambda: False
+        )
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
@@ -786,4 +804,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

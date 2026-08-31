@@ -58,6 +58,7 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent._session_db = session_db
     agent._session_db_created = True
     agent.session_id = session_id
+    agent._interim_text_was_delivered.return_value = False
     return agent
 
 
@@ -74,6 +75,39 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["completed"] is True
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+
+
+def test_codex_exact_final_preview_suppresses_duplicate_gateway_send():
+    """A completed app-server agentMessage that equals the final text was
+    already delivered by the event bridge and must not be sent again."""
+    agent = _make_agent(session_db=None)
+    agent._interim_text_was_delivered.return_value = True
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["response_previewed"] is True
+    agent._interim_text_was_delivered.assert_called_once_with("CODEX_ASSISTANT")
+
+
+def test_codex_different_interim_does_not_suppress_final_gateway_send():
+    """Different mid-turn commentary must not hide the final response."""
+    agent = _make_agent(session_db=None)
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["response_previewed"] is False
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():

@@ -16,9 +16,13 @@ runtime is not selected.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import queue
+import secrets
+import select
 import subprocess
 import threading
 import time
@@ -74,6 +78,7 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        control_socket_path: Optional[str] = None,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -123,7 +128,17 @@ class CodexAppServerClient:
                 ]
             )
 
-        cmd = [codex_bin, "app-server"] + app_server_args
+        self._control_socket_path = control_socket_path
+        if control_socket_path:
+            cmd = [
+                codex_bin,
+                "app-server",
+                "proxy",
+                "--sock",
+                control_socket_path,
+            ]
+        else:
+            cmd = [codex_bin, "app-server"] + app_server_args
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
@@ -149,8 +164,33 @@ class CodexAppServerClient:
         self._stderr_lock = threading.Lock()
         self._closed = False
         self._initialized = False
+        self._send_lock = threading.Lock()
 
-        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        # The control socket uses WebSocket frames over a Unix-domain stream.
+        # `codex app-server proxy` exposes that raw byte stream on stdio; do the
+        # HTTP Upgrade before the reader thread starts so it cannot consume the
+        # handshake response as JSON.  The normal spawned app-server remains
+        # newline-delimited JSONL and follows the unchanged path below.
+        if self._control_socket_path:
+            try:
+                self._websocket_upgrade()
+            except Exception:
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        self._proc.kill()
+                    except Exception:
+                        pass
+                raise
+
+        reader_target = (
+            self._read_websocket_stdout
+            if self._control_socket_path
+            else self._read_stdout
+        )
+        self._reader = threading.Thread(target=reader_target, daemon=True)
         self._reader.start()
         self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._stderr_reader.start()
@@ -304,12 +344,157 @@ class CodexAppServerClient:
         if self._proc.stdin is None:
             raise RuntimeError("codex app-server stdin not available")
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            payload = json.dumps(obj).encode("utf-8")
+            with self._send_lock:
+                if self._control_socket_path:
+                    self._write_websocket_frame(payload, opcode=0x1)
+                else:
+                    self._proc.stdin.write(payload + b"\n")
+                    self._proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise RuntimeError(
                 f"codex app-server stdin closed unexpectedly: {exc}"
             ) from exc
+
+    def _websocket_upgrade(self) -> None:
+        """Upgrade a proxied Unix-domain byte stream to WebSocket."""
+        if self._proc.stdin is None or self._proc.stdout is None:
+            raise RuntimeError("codex app-server proxy stdio not available")
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        request = (
+            "GET /rpc HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        self._proc.stdin.write(request)
+        self._proc.stdin.flush()
+
+        response = bytearray()
+        deadline = time.monotonic() + 10.0
+        while b"\r\n\r\n" not in response:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select(
+                [self._proc.stdout], [], [], remaining
+            )[0]:
+                raise TimeoutError(
+                    "timed out connecting to Codex desktop control socket"
+                )
+            chunk = self._proc.stdout.read(1)
+            if not chunk:
+                stderr = b""
+                if self._proc.stderr is not None:
+                    try:
+                        stderr = self._proc.stderr.read(4096)
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    "codex app-server control socket closed during WebSocket "
+                    f"upgrade: {stderr.decode('utf-8', 'replace').strip()}"
+                )
+            response.extend(chunk)
+            if len(response) > 16 * 1024:
+                raise RuntimeError("oversized WebSocket upgrade response")
+
+        header = bytes(response)
+        status_line = header.split(b"\r\n", 1)[0]
+        expected_accept = base64.b64encode(
+            hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()
+        )
+        if b" 101 " not in status_line or expected_accept.lower() not in header.lower():
+            raise RuntimeError(
+                "codex app-server control socket rejected WebSocket upgrade: "
+                + status_line.decode("utf-8", "replace")
+            )
+
+    def _read_exact(self, size: int) -> bytes:
+        if self._proc.stdout is None:
+            raise EOFError("codex app-server stdout not available")
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = self._proc.stdout.read(size - len(chunks))
+            if not chunk:
+                raise EOFError("codex app-server WebSocket closed")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def _write_websocket_frame(self, payload: bytes, *, opcode: int) -> None:
+        """Write one masked client WebSocket frame to the proxy process."""
+        if self._proc.stdin is None:
+            raise RuntimeError("codex app-server stdin not available")
+        length = len(payload)
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length <= 0xFFFF:
+            header.append(0x80 | 126)
+            header.extend(length.to_bytes(2, "big"))
+        else:
+            header.append(0x80 | 127)
+            header.extend(length.to_bytes(8, "big"))
+        mask = secrets.token_bytes(4)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self._proc.stdin.write(bytes(header) + mask + masked)
+        self._proc.stdin.flush()
+
+    def _read_websocket_stdout(self) -> None:
+        """Decode WebSocket text frames and feed the existing dispatcher."""
+        fragmented = bytearray()
+        try:
+            while not self._closed:
+                first, second = self._read_exact(2)
+                final = bool(first & 0x80)
+                opcode = first & 0x0F
+                masked = bool(second & 0x80)
+                length = second & 0x7F
+                if length == 126:
+                    length = int.from_bytes(self._read_exact(2), "big")
+                elif length == 127:
+                    length = int.from_bytes(self._read_exact(8), "big")
+                mask = self._read_exact(4) if masked else None
+                payload = self._read_exact(length)
+                if mask is not None:
+                    payload = bytes(
+                        byte ^ mask[i % 4] for i, byte in enumerate(payload)
+                    )
+
+                if opcode == 0x8:  # close
+                    break
+                if opcode == 0x9:  # ping
+                    with self._send_lock:
+                        self._write_websocket_frame(payload, opcode=0xA)
+                    continue
+                if opcode == 0xA:  # pong
+                    continue
+                if opcode == 0x1:
+                    fragmented = bytearray(payload)
+                elif opcode == 0x0:
+                    fragmented.extend(payload)
+                else:
+                    continue
+                if not final:
+                    continue
+
+                try:
+                    msg = json.loads(bytes(fragmented).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    with self._stderr_lock:
+                        self._stderr_lines.append(
+                            f"<non-json websocket message> {bytes(fragmented)[:200]!r}"
+                        )
+                    fragmented.clear()
+                    continue
+                fragmented.clear()
+                self._dispatch(msg)
+        except EOFError:
+            pass
+        except Exception as exc:
+            with self._stderr_lock:
+                self._stderr_lines.append(f"<websocket reader error> {exc}")
 
     def _read_stdout(self) -> None:
         if self._proc.stdout is None:

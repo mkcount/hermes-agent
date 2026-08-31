@@ -2757,6 +2757,14 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
 
     path_entries = _build_service_path_dirs()
+    common_bin_paths = [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ]
     resolved_node = shutil.which("node")
     if resolved_node:
         # Use the directory where ``node`` is *found on PATH*, NOT the
@@ -2768,17 +2776,11 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         # so each gateway rewrites its unit + daemon-reload on every boot. Using
         # the symlink's own parent keeps the generated unit profile-agnostic.
         resolved_node_dir = str(Path(resolved_node).parent)
-        if resolved_node_dir not in path_entries:
+        if (
+            resolved_node_dir not in path_entries
+            and resolved_node_dir not in common_bin_paths
+        ):
             path_entries.append(resolved_node_dir)
-
-    common_bin_paths = [
-        "/usr/local/sbin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/usr/bin",
-        "/sbin",
-        "/bin",
-    ]
     # Preserve 30s for post-drain cleanup before systemd escalates, with a
     # 60s minimum for installs that use the default immediate drain. Positive
     # drain values extend the deadline directly instead of inheriting a second

@@ -3,8 +3,8 @@
 ``GatewayRunner._deliver_media_from_response`` runs AFTER streaming has sent
 the visible reply. At that point a bare local filesystem path in the response
 text is either text the user already saw, or stale inspected/tool content —
-it is NOT an attachment request. Only explicit ``MEDIA:`` directives may
-trigger post-stream uploads.
+it is NOT an attachment request. Only explicit ``MEDIA:`` directives or local
+Markdown image embeds may trigger post-stream uploads.
 
 The non-streaming path (``gateway/platforms/base.py``) keeps its bare-path
 auto-detect (``extract_local_files``) — that path controls what text is sent
@@ -106,6 +106,35 @@ async def test_bare_document_path_in_streamed_reply_is_not_uploaded(tmp_path, mo
 
     adapter.send_document.assert_not_awaited()
     adapter.send_video.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_markdown_image_delivers_post_stream(
+    tmp_path,
+    monkeypatch,
+):
+    media_file = _allowed_media_path(
+        tmp_path, monkeypatch, "current screen.png"
+    )
+    adapter = _adapter()
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"![현재 화면](<{media_file}>)",
+        _event(),
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once()
+    images_kwargs = adapter.send_multiple_images.await_args.kwargs
+    assert images_kwargs["chat_id"] == "C123CHAN"
+    assert images_kwargs["images"] == [
+        (
+            "file://" + str(media_file).replace(" ", "%20"),
+            "현재 화면",
+        )
+    ]
+    adapter.send_document.assert_not_awaited()
 
 
 @pytest.mark.asyncio

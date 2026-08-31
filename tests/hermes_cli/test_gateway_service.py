@@ -463,6 +463,25 @@ class TestGeneratedSystemdUnits:
 
         assert "/home/test/.nvm/versions/node/v24.14.0/bin" in unit
 
+    def test_user_unit_does_not_duplicate_standard_node_directory_in_path(self, monkeypatch):
+        # A non-login/service shell commonly resolves node from /usr/bin while
+        # an interactive restart resolves ~/.local/bin/node. Standard bin
+        # directories are appended below in a fixed order, so inserting the
+        # resolved /usr/bin early makes an unchanged unit look stale forever.
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda cmd: "/usr/bin/node" if cmd == "node" else None,
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        path_line = next(
+            line for line in unit.splitlines() if line.startswith('Environment="PATH=')
+        )
+        path_entries = path_line.removeprefix('Environment="PATH=').removesuffix('"').split(":")
+
+        assert path_entries.count("/usr/bin") == 1
+
     def test_user_unit_does_not_leak_profile_node_symlink_target(self, tmp_path, monkeypatch):
         # Regression for the multi-profile gateway restart-loop flap (#48700):
         # ~/.local/bin/node is often a symlink into a *specific* profile's node

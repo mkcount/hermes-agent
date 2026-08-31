@@ -2183,6 +2183,50 @@ class TestSessionMetadata:
             == "123.456"
         )
 
+    def test_append_matching_metadata_list_is_unique_bounded_and_guarded(
+        self, tmp_path
+    ):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            metadata={
+                "codex_desktop_thread": {
+                    "thread_id": "thread-1",
+                    "mirror_hermes_turn_ids": ["turn-1"],
+                }
+            },
+        )
+        store._entries = {"k1": entry}
+
+        for turn_id in ("turn-1", "turn-2", "turn-3"):
+            assert store.append_session_metadata_list_if_matches(
+                "k1",
+                "codex_desktop_thread",
+                expected={"thread_id": "thread-1"},
+                list_key="mirror_hermes_turn_ids",
+                value=turn_id,
+                max_items=2,
+            )
+
+        assert entry.metadata["codex_desktop_thread"][
+            "mirror_hermes_turn_ids"
+        ] == ["turn-2", "turn-3"]
+        assert not store.append_session_metadata_list_if_matches(
+            "k1",
+            "codex_desktop_thread",
+            expected={"thread_id": "other-thread"},
+            list_key="mirror_hermes_turn_ids",
+            value="turn-4",
+        )
+
 
 class TestRewriteTranscriptPreservesReasoning:
     """rewrite_transcript must not drop reasoning fields from SQLite."""
@@ -2729,4 +2773,125 @@ class TestGatewayRoutingTable:
             scope=restarted._routing_scope()
         )
         assert entry.session_key not in rows
+        restarted._db.close()
+
+
+class TestExplicitSessionLaneIsolation:
+    @staticmethod
+    def _base_source() -> SessionSource:
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="codex-control-chat",
+            chat_type="dm",
+            user_id="codex-user",
+        )
+
+    def test_each_lane_gets_and_recovers_its_own_transcript(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(
+            hermes_state,
+            "DEFAULT_DB_PATH",
+            tmp_path / "state.db",
+        )
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        base = self._base_source()
+        lane_a = replace(base, session_lane="codex-thread-a")
+        lane_b = replace(base, session_lane="codex-thread-b")
+
+        control_entry = store.get_or_create_session(base)
+        entry_a = store.get_or_create_session(lane_a)
+        entry_b = store.get_or_create_session(lane_b)
+        store.append_to_transcript(
+            entry_a.session_id,
+            {"role": "user", "content": "only thread a"},
+        )
+
+        assert len({
+            control_entry.session_id,
+            entry_a.session_id,
+            entry_b.session_id,
+        }) == 3
+
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        recovered_a = restarted.get_or_create_session(lane_a)
+        recovered_b = restarted.get_or_create_session(lane_b)
+
+        assert recovered_a.session_id == entry_a.session_id
+        assert recovered_b.session_id == entry_b.session_id
+        transcript_a = restarted.load_transcript(recovered_a.session_id)
+        assert [
+            (message["role"], message["content"])
+            for message in transcript_a
+        ] == [("user", "only thread a")]
+        assert restarted.load_transcript(recovered_b.session_id) == []
+        restarted._db.close()
+
+    def test_placeholder_promotion_moves_route_without_splitting_transcript(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(
+            hermes_state,
+            "DEFAULT_DB_PATH",
+            tmp_path / "state.db",
+        )
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        base = self._base_source()
+        placeholder = replace(base, session_lane="pending_ns_123")
+        actual = replace(base, session_lane="codex-thread-real")
+        control_entry = store.get_or_create_session(base)
+        placeholder_entry = store.get_or_create_session(placeholder)
+        placeholder_key = placeholder_entry.session_key
+        placeholder_session_id = placeholder_entry.session_id
+        store.append_to_transcript(
+            placeholder_session_id,
+            {"role": "user", "content": "first turn"},
+        )
+        assert store.set_session_metadata(
+            control_entry.session_key,
+            "codex_desktop_thread",
+            {"thread_id": "pending_ns_123", "pending_new": True},
+        )
+
+        promoted = store.promote_session_lane_and_set_metadata(
+            control_entry.session_key,
+            "codex_desktop_thread",
+            expected={
+                "thread_id": "pending_ns_123",
+                "pending_new": True,
+            },
+            value={"thread_id": "codex-thread-real"},
+            old_session_key=placeholder_key,
+            new_source=actual,
+        )
+
+        assert promoted is True
+        assert placeholder_key not in store._entries
+        actual_key = build_session_key(actual)
+        assert store._entries[actual_key].session_id == placeholder_session_id
+        assert store.get_session_metadata(
+            control_entry.session_key,
+            "codex_desktop_thread",
+        ) == {"thread_id": "codex-thread-real"}
+        transcript = store.load_transcript(placeholder_session_id)
+        assert [
+            (message["role"], message["content"])
+            for message in transcript
+        ] == [("user", "first turn")]
+
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        recovered = restarted.get_or_create_session(actual)
+        assert recovered.session_id == placeholder_session_id
         restarted._db.close()

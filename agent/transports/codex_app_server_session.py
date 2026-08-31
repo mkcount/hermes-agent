@@ -28,6 +28,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -59,6 +60,206 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+
+@dataclass(frozen=True)
+class CodexThreadSummary:
+    """Small, UI-safe projection of a Codex desktop thread."""
+
+    thread_id: str
+    title: str
+    cwd: str
+    updated_at: int
+    status: str
+    path: str = ""
+
+
+@dataclass(frozen=True)
+class CodexProjectSummary:
+    """One local project inferred from the desktop thread index."""
+
+    cwd: str
+    name: str
+    updated_at: int
+
+
+def _control_socket_path(codex_home: Optional[str] = None) -> Optional[str]:
+    """Return the live Codex desktop control socket, when available."""
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    path = os.path.join(home, "app-server-control", "app-server-control.sock")
+    try:
+        import stat
+
+        return path if stat.S_ISSOCK(os.stat(path).st_mode) else None
+    except OSError:
+        return None
+
+
+def list_recent_codex_desktop_threads(
+    *,
+    limit: int = 5,
+    codex_bin: str = "codex",
+    codex_home: Optional[str] = None,
+    client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+) -> list[CodexThreadSummary]:
+    """List recently-active desktop threads without loading their turns.
+
+    Prefer the already-running desktop app-server so live status is accurate.
+    If the desktop isn't running, a short-lived app-server reads the same
+    persisted CODEX_HOME index, which keeps the mobile picker useful offline.
+    """
+    factory = client_factory or CodexAppServerClient
+    socket_path = _control_socket_path(codex_home)
+    client: Optional[CodexAppServerClient] = None
+    try:
+        kwargs: dict[str, Any] = {
+            "codex_bin": codex_bin,
+            "codex_home": codex_home,
+        }
+        if socket_path:
+            kwargs["control_socket_path"] = socket_path
+        try:
+            client = factory(**kwargs)
+        except Exception:
+            if not socket_path:
+                raise
+            logger.info(
+                "Codex desktop control socket unavailable; falling back to "
+                "persisted thread index",
+                exc_info=True,
+            )
+            kwargs.pop("control_socket_path", None)
+            client = factory(**kwargs)
+
+        client.initialize(
+            client_name="hermes-session-picker",
+            client_title="Hermes Session Picker",
+            client_version=_get_hermes_version(),
+        )
+        result = client.request(
+            "thread/list",
+            {
+                "limit": max(1, min(int(limit), 100)),
+                "sourceKinds": ["vscode"],
+                "archived": False,
+                "sortKey": "recency_at",
+                "sortDirection": "desc",
+                "useStateDbOnly": True,
+            },
+            timeout=15,
+        )
+        summaries: list[CodexThreadSummary] = []
+        for thread in result.get("data") or []:
+            if not isinstance(thread, dict) or not thread.get("id"):
+                continue
+            title = str(thread.get("name") or thread.get("preview") or "Untitled")
+            title = " ".join(title.split())
+            status_obj = thread.get("status") or {}
+            status = (
+                str(status_obj.get("type") or "unknown")
+                if isinstance(status_obj, dict)
+                else str(status_obj)
+            )
+            summaries.append(
+                CodexThreadSummary(
+                    thread_id=str(thread["id"]),
+                    title=title,
+                    cwd=str(thread.get("cwd") or ""),
+                    updated_at=int(
+                        thread.get("recencyAt")
+                        or thread.get("updatedAt")
+                        or 0
+                    ),
+                    status=status,
+                    path=str(thread.get("path") or ""),
+                )
+            )
+        return summaries[:limit]
+    finally:
+        if client is not None:
+            client.close()
+
+
+def list_recent_codex_desktop_projects(
+    *,
+    limit: int = 10,
+    codex_bin: str = "codex",
+    codex_home: Optional[str] = None,
+    client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+) -> list[CodexProjectSummary]:
+    """List distinct, locally reachable projects from the desktop index.
+
+    App-server does not expose a separate project-list method.  The persisted
+    thread index is the authoritative cross-client source that carries each
+    conversation's cwd, so collapse its newest entries by normalized path.
+    """
+    threads = list_recent_codex_desktop_threads(
+        limit=100,
+        codex_bin=codex_bin,
+        codex_home=codex_home,
+        client_factory=client_factory,
+    )
+    projects: list[CodexProjectSummary] = []
+    seen: set[str] = set()
+    for thread in threads:
+        cwd = os.path.abspath(os.path.expanduser(str(thread.cwd or "")))
+        if not thread.cwd or not os.path.isdir(cwd):
+            continue
+        identity = os.path.normcase(os.path.normpath(cwd))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        projects.append(
+            CodexProjectSummary(
+                cwd=cwd,
+                name=os.path.basename(cwd.rstrip(os.sep)) or cwd,
+                updated_at=thread.updated_at,
+            )
+        )
+        if len(projects) >= max(1, int(limit)):
+            break
+    return projects
+
+
+def list_codex_model_reasoning_efforts(
+    model: str,
+    *,
+    codex_bin: str = "codex",
+    codex_home: Optional[str] = None,
+    client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+) -> list[str]:
+    """Return effort values advertised for ``model`` by this Codex account."""
+    model = str(model or "").strip()
+    if not model:
+        return []
+    factory = client_factory or CodexAppServerClient
+    client: Optional[CodexAppServerClient] = None
+    try:
+        client = factory(codex_bin=codex_bin, codex_home=codex_home)
+        client.initialize(
+            client_name="hermes-model-picker",
+            client_title="Hermes Model Picker",
+            client_version=_get_hermes_version(),
+        )
+        result = client.request("model/list", {}, timeout=15)
+        for item in result.get("data") or []:
+            if not isinstance(item, dict) or str(item.get("id") or "") != model:
+                continue
+            efforts: list[str] = []
+            for option in item.get("supportedReasoningEfforts") or []:
+                value = (
+                    option.get("reasoningEffort")
+                    if isinstance(option, dict)
+                    else option
+                )
+                value = str(value or "").strip().lower()
+                if value and value not in efforts:
+                    efforts.append(value)
+            return efforts
+        return []
+    finally:
+        if client is not None:
+            client.close()
 
 
 @dataclass
@@ -280,8 +481,14 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_turn_started: Optional[Callable[[str, str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        resume_thread_id: Optional[str] = None,
+        prefer_desktop_control_socket: bool = True,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        resume_active_turn_mode: str = "steer",
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -294,13 +501,31 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_turn_started = on_turn_started
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        self._resume_thread_id = str(resume_thread_id or "").strip() or None
+        self._prefer_desktop_control_socket = prefer_desktop_control_socket
+        # App-server configuration overrides must travel on the protocol
+        # request. Merely setting AIAgent.model/reasoning_config changes
+        # Hermes' bookkeeping but does not change the Codex thread.
+        self._model = str(model or "").strip() or None
+        self._reasoning_effort = (
+            str(reasoning_effort or "").strip().lower() or None
+        )
+        normalized_resume_mode = str(
+            resume_active_turn_mode or "steer"
+        ).strip().lower()
+        self._resume_active_turn_mode = (
+            "queue" if normalized_resume_mode == "queue" else "steer"
+        )
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
+        self._resumed_active_turn_id: Optional[str] = None
+        self._waiting_for_resumed_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
@@ -319,9 +544,30 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
-            )
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            if self._prefer_desktop_control_socket:
+                socket_path = _control_socket_path(self._codex_home)
+                if socket_path:
+                    client_kwargs["control_socket_path"] = socket_path
+            try:
+                self._client = self._client_factory(**client_kwargs)
+            except Exception:
+                # The desktop may close between routing and the next Telegram
+                # message. Retry against a short-lived app-server, which can
+                # either resume the persisted thread or start the requested
+                # new one.
+                if "control_socket_path" not in client_kwargs:
+                    raise
+                logger.info(
+                    "Codex desktop control socket disappeared; falling back "
+                    "to a short-lived app-server",
+                    exc_info=True,
+                )
+                client_kwargs.pop("control_socket_path", None)
+                self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
@@ -342,8 +588,31 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        if self._resume_thread_id:
+            method = "thread/resume"
+            params: dict[str, Any] = {"threadId": self._resume_thread_id}
+        else:
+            method = "thread/start"
+            params = {"cwd": self._cwd}
+            if self._model:
+                params["model"] = self._model
+        try:
+            result = self._client.request(method, params, timeout=15)
+        except CodexAppServerError as exc:
+            # Archived threads are still durable and can be resumed after the
+            # documented thread/unarchive transition. Do this in place instead
+            # of silently starting a replacement thread.
+            if (
+                method != "thread/resume"
+                or "archived" not in str(exc.message or "").lower()
+            ):
+                raise
+            self._client.request(
+                "thread/unarchive",
+                {"threadId": self._resume_thread_id},
+                timeout=15,
+            )
+            result = self._client.request(method, params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -359,13 +628,19 @@ class CodexAppServerSession:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
         self._thread_id = thread_id
+        if self._resume_thread_id:
+            for turn in reversed(thread_obj.get("turns") or []):
+                if isinstance(turn, dict) and turn.get("status") == "inProgress":
+                    self._resumed_active_turn_id = str(turn.get("id") or "") or None
+                    break
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if self._resume_thread_id else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
@@ -378,6 +653,7 @@ class CodexAppServerSession:
         self._closed = True
         with self._active_turn_lock:
             self._active_turn_id = None
+            self._waiting_for_resumed_turn_id = None
         if self._client is not None:
             try:
                 self._client.close()
@@ -385,6 +661,7 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
+        self._resumed_active_turn_id = None
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -398,6 +675,14 @@ class CodexAppServerSession:
         """Idempotent: signal the active turn loop to issue turn/interrupt
         and unwind. Called by AIAgent's _interrupt_requested path."""
         self._interrupt_event.set()
+        # /stop is invoked from the gateway thread while run_turn is blocked on
+        # its notification queue. Send the protocol interrupt immediately so
+        # releasing the gateway's per-session lock cannot leave the underlying
+        # Codex turn running for another poll cycle (or through a reconnect).
+        with self._active_turn_lock:
+            turn_id = self._active_turn_id
+        if turn_id is not None:
+            self._issue_interrupt(turn_id)
 
     def request_steer(self, text: str) -> bool:
         """Append user guidance to the active Codex turn via ``turn/steer``."""
@@ -425,6 +710,22 @@ class CodexAppServerSession:
             return False
         accepted_turn_id = response.get("turnId") if isinstance(response, dict) else None
         return accepted_turn_id in {None, turn_id}
+
+    def is_directly_streaming_turn(self, turn_id: str) -> bool:
+        """Return whether this session owns live delivery for ``turn_id``.
+
+        A queue-mode resume temporarily tracks the pre-existing Codex turn as
+        active so ``/stop`` can interrupt it, but intentionally does not
+        forward its events: the rollout mirror owns that delivery path.
+        """
+        cleaned = str(turn_id or "").strip()
+        if not cleaned:
+            return False
+        with self._active_turn_lock:
+            return (
+                self._active_turn_id == cleaned
+                and self._waiting_for_resumed_turn_id != cleaned
+            )
 
     # ---------- diagnostics ----------
 
@@ -467,17 +768,188 @@ class CodexAppServerSession:
 
     # ---------- per-turn ----------
 
+    def _turn_start_params(
+        self,
+        input_items: list[dict],
+        *,
+        client_message_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build one turn/start payload with durable Codex overrides.
+
+        Codex documents model and effort on ``turn/start`` as applying to the
+        current and subsequent turns. Sending both here makes Telegram's
+        session-scoped /model and /reasoning selections authoritative even
+        when the thread was originally created by the desktop app.
+        """
+        assert self._thread_id is not None
+        params: dict[str, Any] = {
+            "threadId": self._thread_id,
+            "input": input_items,
+        }
+        if client_message_id:
+            # Reuse this id if a broken control-socket proxy makes the first
+            # turn/start response ambiguous. Codex can then deduplicate the
+            # retry instead of creating the user's Telegram instruction twice.
+            params["clientUserMessageId"] = client_message_id
+        if self._model:
+            params["model"] = self._model
+        if self._reasoning_effort:
+            params["effort"] = self._reasoning_effort
+        return params
+
+    @staticmethod
+    def _is_retryable_transport_failure(exc: BaseException) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        if not isinstance(exc, CodexAppServerError):
+            return False
+        message = str(exc.message or "").lower()
+        return any(
+            marker in message
+            for marker in (
+                "broken pipe",
+                "connection",
+                "control socket",
+                "relay",
+                "socket closed",
+                "unexpected eof",
+            )
+        )
+
+    def _reconnect_to_thread(self, thread_id: str) -> None:
+        """Replace a stale proxy client and resume the durable thread."""
+        stale_client = self._client
+        self._client = None
+        self._thread_id = None
+        self._resumed_active_turn_id = None
+        self._resume_thread_id = thread_id
+        if stale_client is not None:
+            try:
+                stale_client.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        self.ensure_started()
+
+    def _start_turn_with_reconnect(
+        self,
+        input_items: list[dict],
+        *,
+        client_message_id: str,
+    ) -> dict[str, Any]:
+        """Start once, reconnecting to a replaced desktop socket if needed."""
+        assert self._client is not None and self._thread_id is not None
+        params = self._turn_start_params(
+            input_items,
+            client_message_id=client_message_id,
+        )
+        try:
+            return self._client.request("turn/start", params, timeout=30)
+        except (CodexAppServerError, TimeoutError) as exc:
+            if not self._is_retryable_transport_failure(exc):
+                raise
+            thread_id = self._thread_id
+            logger.warning(
+                "turn/start lost its Codex control-socket connection; "
+                "reconnecting to thread %s and retrying once",
+                thread_id,
+            )
+            self._reconnect_to_thread(thread_id)
+            assert self._client is not None
+            return self._client.request(
+                "turn/start",
+                self._turn_start_params(
+                    input_items,
+                    client_message_id=client_message_id,
+                ),
+                timeout=30,
+            )
+
+    def _wait_for_resumed_turn_boundary(
+        self,
+        turn_id: str,
+        *,
+        timeout: float,
+        notification_poll_timeout: float,
+    ) -> Optional[str]:
+        """Wait for a desktop-owned active turn without steering into it.
+
+        The rollout mirror remains the sole delivery owner for this pre-existing
+        desktop turn. In particular, events consumed here must not be forwarded
+        through ``_on_event`` and the turn must not be reported through
+        ``_on_turn_started``: either action would incorrectly mark the desktop
+        turn as Hermes-originated and suppress its Telegram mirror.
+
+        Returns an error string on failure, otherwise ``None`` after the turn
+        reaches its boundary.
+        """
+        assert self._client is not None and self._thread_id is not None
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._active_turn_lock:
+            self._active_turn_id = turn_id
+            self._waiting_for_resumed_turn_id = turn_id
+
+        def _release_wait_ownership() -> None:
+            with self._active_turn_lock:
+                if self._active_turn_id == turn_id:
+                    self._active_turn_id = None
+                if self._waiting_for_resumed_turn_id == turn_id:
+                    self._waiting_for_resumed_turn_id = None
+
+        while time.monotonic() < deadline:
+            if self._interrupt_event.is_set():
+                self._issue_interrupt(turn_id)
+                _release_wait_ownership()
+                return "queued turn cancelled while waiting for desktop turn"
+
+            if not self._client.is_alive():
+                _release_wait_ownership()
+                return self._format_error_with_stderr(
+                    "codex app-server subprocess exited while waiting for "
+                    "the active desktop turn",
+                    tail_lines=20,
+                )
+
+            note = self._client.take_notification(
+                timeout=notification_poll_timeout
+            )
+            if note is None:
+                continue
+            if not _notification_belongs_to_turn(
+                note,
+                thread_id=self._thread_id,
+                turn_id=turn_id,
+            ):
+                logger.debug(
+                    "ignoring foreign codex notification while waiting for "
+                    "desktop turn boundary: method=%s",
+                    note.get("method"),
+                )
+                continue
+            if note.get("method") == "turn/completed":
+                _release_wait_ownership()
+                return None
+
+        _release_wait_ownership()
+        return (
+            "timed out waiting for the active desktop turn to finish before "
+            "starting the queued Telegram turn"
+        )
+
     def run_turn(
         self,
         user_input: Any,
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
-        post_tool_quiet_timeout: float = 90.0,
+        post_tool_quiet_timeout: float = 300.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
+
+        turn_timeout: maximum seconds without a notification or approval
+        request belonging to this turn. Active long-running turns extend this
+        deadline whenever Codex emits liveness.
 
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
@@ -516,17 +988,70 @@ class CodexAppServerSession:
 
         user_input_text = _coerce_turn_input_text(user_input)
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Send turn/start with the user input. In queue mode, a desktop-owned
+        # active turn remains untouched and keeps reporting through the rollout
+        # mirror; the Telegram input starts as a separate turn only after that
+        # boundary. In steer mode, retain the protocol-native append behavior.
+        input_items = [{"type": "text", "text": user_input_text}]
+        client_message_id = str(uuid.uuid4())
         try:
-            ts = self._client.request(
-                "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
-                timeout=10,
-            )
+            if (
+                self._resumed_active_turn_id
+                and self._resume_active_turn_mode == "queue"
+            ):
+                resumed_turn_id = self._resumed_active_turn_id
+                logger.info(
+                    "queueing Telegram input behind active desktop Codex turn %s",
+                    resumed_turn_id,
+                )
+                wait_error = self._wait_for_resumed_turn_boundary(
+                    resumed_turn_id,
+                    timeout=turn_timeout,
+                    notification_poll_timeout=notification_poll_timeout,
+                )
+                if wait_error is not None:
+                    result.error = wait_error
+                    result.interrupted = self._interrupt_event.is_set()
+                    result.should_retire = not result.interrupted
+                    self._resumed_active_turn_id = None
+                    self._interrupt_event.clear()
+                    return result
+                self._resumed_active_turn_id = None
+                ts = self._start_turn_with_reconnect(
+                    input_items,
+                    client_message_id=client_message_id,
+                )
+            elif self._resumed_active_turn_id:
+                result.turn_id = self._resumed_active_turn_id
+                try:
+                    self._client.request(
+                        "turn/steer",
+                        {
+                            "threadId": self._thread_id,
+                            "expectedTurnId": result.turn_id,
+                            "input": input_items,
+                        },
+                        timeout=10,
+                    )
+                    ts = {"turn": {"id": result.turn_id}}
+                except CodexAppServerError:
+                    # The desktop turn can finish in the small gap between
+                    # thread/resume and this request. Start a normal new turn
+                    # instead of making the user resend their message.
+                    logger.info(
+                        "active desktop turn ended before steer; starting a "
+                        "new turn on the resumed thread"
+                    )
+                    self._resumed_active_turn_id = None
+                    ts = self._start_turn_with_reconnect(
+                        input_items,
+                        client_message_id=client_message_id,
+                    )
+            else:
+                ts = self._start_turn_with_reconnect(
+                    input_items,
+                    client_message_id=client_message_id,
+                )
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
@@ -557,9 +1082,36 @@ class CodexAppServerSession:
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
+        notified_turn_id: Optional[str] = None
+
+        def _notify_turn_started() -> None:
+            nonlocal notified_turn_id
+            if (
+                self._on_turn_started is None
+                or self._thread_id is None
+                or result.turn_id is None
+                or notified_turn_id == str(result.turn_id)
+            ):
+                return
+            try:
+                self._on_turn_started(
+                    str(self._thread_id),
+                    str(result.turn_id),
+                )
+                notified_turn_id = str(result.turn_id)
+            except Exception:
+                logger.debug("on_turn_started callback raised", exc_info=True)
+
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+            self._waiting_for_resumed_turn_id = None
+        _notify_turn_started()
+        # ``turn_timeout`` is an inactivity deadline, not a wall-clock cap.
+        # Long Codex turns may legitimately run for hours while tool, reasoning,
+        # and usage events continue to arrive. A fixed 600-second deadline used
+        # to abort healthy work at exactly ten minutes even when the last event
+        # was only seconds old.
+        activity_deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -567,7 +1119,7 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while time.monotonic() < activity_deadline and not turn_complete:
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -631,6 +1183,11 @@ class CodexAppServerSession:
                             pending.get("method"),
                         )
                         continue
+                    activity_deadline = time.monotonic() + turn_timeout
+                    if last_tool_completion_at is not None:
+                        # Token-usage, reasoning, and other non-projecting
+                        # notifications are still proof that Codex is alive.
+                        last_tool_completion_at = time.monotonic()
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -665,8 +1222,10 @@ class CodexAppServerSession:
                             )
                 self._handle_server_request(sreq)
                 # Activity counts as live signal — reset the post-tool
-                # quiet timer so an approval round-trip doesn't trip it.
+                # quiet timer and the overall inactivity deadline so an
+                # approval round-trip doesn't trip either watchdog.
                 last_tool_completion_at = None
+                activity_deadline = time.monotonic() + turn_timeout
                 continue
 
             note = self._client.take_notification(
@@ -676,6 +1235,16 @@ class CodexAppServerSession:
                 continue
 
             method = note.get("method", "")
+            if result.turn_id is None and method == "turn/started":
+                observed_thread_id, observed_turn_id = (
+                    _notification_scope_ids(note)
+                )
+                if (
+                    observed_thread_id is None
+                    or str(observed_thread_id) == str(self._thread_id)
+                ):
+                    result.turn_id = observed_turn_id
+                    _notify_turn_started()
             if not _notification_belongs_to_turn(
                 note,
                 thread_id=self._thread_id,
@@ -685,6 +1254,17 @@ class CodexAppServerSession:
                     "ignoring foreign codex notification: method=%s", method
                 )
                 continue
+
+            # Any notification scoped to this turn proves Codex is still
+            # making progress, including reasoning/token-usage events that do
+            # not project into a visible Telegram message.
+            activity_deadline = time.monotonic() + turn_timeout
+
+            if last_tool_completion_at is not None:
+                # The previous implementation only noticed projected messages.
+                # Long reasoning phases often emit usage/status events instead,
+                # so they were incorrectly killed after 90 seconds.
+                last_tool_completion_at = time.monotonic()
 
             if self._on_event is not None:
                 try:
@@ -736,7 +1316,13 @@ class CodexAppServerSession:
                 turn_status = (
                     (note.get("params") or {}).get("turn") or {}
                 ).get("status")
-                if turn_status and turn_status not in {"completed", "interrupted"}:
+                if turn_status == "interrupted":
+                    result.interrupted = True
+                    if not self._interrupt_event.is_set():
+                        result.error = (
+                            "Codex 작업이 외부 요인으로 중단되어 완료되지 않았습니다."
+                        )
+                elif turn_status and turn_status != "completed":
                     err_obj = (
                         (note.get("params") or {}).get("turn") or {}
                     ).get("error")
@@ -764,14 +1350,14 @@ class CodexAppServerSession:
             and result.error is None
         ):
             logger.warning(
-                "codex app-server turn reached deadline after a completed "
+                "codex app-server turn reached inactivity deadline after a completed "
                 "assistant message but before turn/completed; accepting "
                 "the assistant text as the terminal response"
             )
             turn_complete = True
 
         if not turn_complete and not result.interrupted:
-            # Hit the deadline. Issue interrupt to stop wasted compute, and
+            # Hit the inactivity deadline. Issue interrupt to stop wasted compute, and
             # tell the caller to retire the session — a turn that never
             # finished is a strong sign codex is wedged in a way the next
             # turn shouldn't inherit.
@@ -779,12 +1365,13 @@ class CodexAppServerSession:
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s"
+                    f"turn timed out after {turn_timeout}s without activity"
                 )
             result.should_retire = True
 
         with self._active_turn_lock:
             self._active_turn_id = None
+        self._resumed_active_turn_id = None
         self._interrupt_event.clear()
         return result
 
@@ -980,20 +1567,22 @@ class CodexAppServerSession:
 
     # ---------- internals ----------
 
-    def _issue_interrupt(self, turn_id: Optional[str]) -> None:
+    def _issue_interrupt(self, turn_id: Optional[str]) -> bool:
         if self._client is None or self._thread_id is None or turn_id is None:
-            return
+            return False
         try:
             self._client.request(
                 "turn/interrupt",
                 {"threadId": self._thread_id, "turnId": turn_id},
                 timeout=5,
             )
+            return True
         except CodexAppServerError as exc:
             # "no active turn to interrupt" is fine — already done.
             logger.debug("turn/interrupt non-fatal: %s", exc)
         except TimeoutError:
             logger.warning("turn/interrupt timed out")
+        return False
 
     def _handle_server_request(self, req: dict) -> None:
         """Translate a codex server request (approval) into Hermes' approval

@@ -589,6 +589,7 @@ class TestBridgeWiredInRuntime:
         agent = SimpleNamespace(
             session_cwd=None,
             _codex_session=None,
+            _codex_turn_started_callback=MagicMock(),
             tool_progress_callback=MagicMock(),
             _fire_stream_delta=MagicMock(),
             _fire_reasoning_delta=MagicMock(),
@@ -624,6 +625,10 @@ class TestBridgeWiredInRuntime:
         )
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
+        )
+        assert (
+            captured["on_turn_started"]
+            is agent._codex_turn_started_callback
         )
 
         # And the bridge must actually drive the agent's callbacks when

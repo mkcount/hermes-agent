@@ -679,12 +679,31 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            resume_thread_id=getattr(agent, "_codex_resume_thread_id", None),
+            # Preserve a desktop thread's own model/effort until the user
+            # explicitly changes it from Hermes. GatewayRunner records that
+            # provenance on these fields; passing the global Hermes defaults
+            # here would silently overwrite the desktop app's selection.
+            model=getattr(agent, "_codex_model_override", None),
+            reasoning_effort=getattr(
+                agent,
+                "_codex_reasoning_effort_override",
+                None,
+            ),
+            resume_active_turn_mode=getattr(
+                agent,
+                "_codex_resume_active_turn_mode",
+                "steer",
+            ),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            on_turn_started=getattr(
+                agent, "_codex_turn_started_callback", None
+            ),
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
@@ -841,6 +860,24 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    # The app-server emits every completed ``agentMessage`` through the live
+    # event bridge before ``turn/completed`` arrives. For a simple no-tool
+    # answer that completed item is also the final response. Tell the gateway
+    # when that exact text was already delivered so it does not send the same
+    # answer a second time. Exact normalized matching is important: ordinary
+    # mid-turn commentary must never suppress a different final summary.
+    response_previewed = False
+    if turn.final_text:
+        try:
+            response_previewed = bool(
+                agent._interim_text_was_delivered(turn.final_text)
+            )
+        except Exception:
+            logger.debug(
+                "codex app-server final preview comparison failed",
+                exc_info=True,
+            )
+
     return {
         "final_response": turn.final_text,
         "messages": messages,
@@ -866,6 +903,7 @@ def run_codex_app_server_turn(
         # would re-INSERT the already-flushed user turn (append_message has no
         # dedup), reintroducing the #860 / #42039 duplicate-write bug.
         "agent_persisted": True,
+        "response_previewed": response_previewed,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
         **usage_result,

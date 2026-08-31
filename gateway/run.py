@@ -85,6 +85,12 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_KOREAN_COMMENTARY_RE = re.compile(r"[가-힣]")
+
+
+def _telegram_interim_commentary_visible(text: Any) -> bool:
+    """Telegram shows natural Korean commentary, not English status prose."""
+    return bool(_KOREAN_COMMENTARY_RE.search(str(text or "")))
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -3257,6 +3263,39 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def _gateway_hygiene_delegates_to_codex(
+    api_mode: Optional[str],
+    auto_mode: Optional[str],
+) -> bool:
+    """Whether Codex, rather than a temporary Hermes agent, owns compaction."""
+    normalized = str(auto_mode or "native").strip().lower()
+    if normalized not in {"native", "hermes", "off"}:
+        normalized = "native"
+    return api_mode == "codex_app_server" and normalized in {"native", "off"}
+
+
+def _codex_result_identity(result: Any) -> Dict[str, Optional[str]]:
+    """Preserve the external thread/turn identity across gateway envelopes."""
+    if not isinstance(result, dict):
+        result = {}
+    return {
+        "codex_thread_id": result.get("codex_thread_id"),
+        "codex_turn_id": result.get("codex_turn_id"),
+    }
+
+
+def _codex_result_is_successful_completion(result: Any) -> bool:
+    """Return whether Hermes received a real successful Codex completion."""
+    return bool(
+        isinstance(result, dict)
+        and result.get("completed") is True
+        and not result.get("partial")
+        and not result.get("failed")
+        and not result.get("interrupted")
+        and not result.get("error")
+    )
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -3675,6 +3714,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Per-routing-lane cursors for desktop→Telegram Codex answer mirroring.
+        # Durable turn cursors live inside the session binding metadata; these
+        # objects only hold open-file offsets and incomplete turn state.
+        self._codex_desktop_mirror_states: Dict[str, Dict[str, Any]] = {}
+        # Execution lanes may outlive the currently selected desktop thread.
+        # This independent control-plane authority rotates a monotonic binding
+        # generation on every /세션 transition so late lane output can be
+        # suppressed without cancelling or corrupting the underlying work.
+        from gateway.codex_delivery import CodexDeliveryAuthority
+
+        self._codex_delivery_authority = CodexDeliveryAuthority()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -4370,6 +4420,581 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if recovered is None:
             return source
         return dataclasses.replace(source, thread_id=recovered)
+
+    def _get_codex_delivery_authority(self):
+        """Return the process-local Codex delivery authority.
+
+        Some behavior tests construct ``GatewayRunner`` with ``object.__new__``
+        and intentionally skip the full constructor, so initialize lazily as
+        well as in ``__init__``.
+        """
+        authority = getattr(self, "_codex_delivery_authority", None)
+        if authority is None:
+            from gateway.codex_delivery import CodexDeliveryAuthority
+
+            authority = CodexDeliveryAuthority()
+            self._codex_delivery_authority = authority
+        return authority
+
+    def _codex_control_session_key(self, source: SessionSource) -> str:
+        control_source = (
+            dataclasses.replace(source, session_lane=None)
+            if source.session_lane
+            else source
+        )
+        return self._session_key_for_source(control_source)
+
+    @staticmethod
+    def _promoted_codex_pending_binding(
+        binding: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Convert a durable /ns reservation into its real thread binding."""
+        if not bool(binding.get("pending_new")):
+            return None
+        thread_id = str(binding.get("created_thread_id") or "").strip()
+        if not thread_id:
+            return None
+        promoted = dict(binding)
+        promoted["thread_id"] = thread_id
+        promoted.pop("pending_new", None)
+        promoted.pop("created_thread_id", None)
+        turn_id = str(promoted.pop("created_turn_id", "") or "").strip()
+        rollout_path = str(
+            promoted.pop("created_rollout_path", "") or ""
+        ).strip()
+        if turn_id:
+            promoted["mirror_cursor_turn_id"] = turn_id
+            existing = [
+                str(item)
+                for item in (promoted.get("mirror_hermes_turn_ids") or [])
+            ]
+            if turn_id not in existing:
+                existing.append(turn_id)
+            promoted["mirror_hermes_turn_ids"] = existing[-64:]
+        if rollout_path:
+            promoted["rollout_path"] = rollout_path
+        promoted["updated_at"] = int(time.time())
+        return promoted
+
+    async def _promote_codex_pending_binding_and_lane(
+        self,
+        source: SessionSource,
+        *,
+        control_session_key: str,
+        current_binding: Dict[str, Any],
+        promoted_binding: Dict[str, Any],
+    ) -> bool:
+        """Publish a real Codex thread id and move its Hermes lane together."""
+        old_thread_id = str(current_binding.get("thread_id") or "").strip()
+        new_thread_id = str(promoted_binding.get("thread_id") or "").strip()
+        if not old_thread_id or not new_thread_id:
+            return False
+
+        base_source = (
+            dataclasses.replace(source, session_lane=None)
+            if source.session_lane
+            else source
+        )
+        old_source = dataclasses.replace(
+            base_source,
+            session_lane=old_thread_id,
+        )
+        new_source = dataclasses.replace(
+            base_source,
+            session_lane=new_thread_id,
+        )
+        return await self.async_session_store.promote_session_lane_and_set_metadata(
+            control_session_key,
+            "codex_desktop_thread",
+            expected={
+                "thread_id": old_thread_id,
+                "pending_new": True,
+            },
+            value=promoted_binding,
+            old_session_key=self._session_key_for_source(old_source),
+            new_source=new_source,
+        )
+
+    async def _migrate_codex_execution_overrides(
+        self,
+        source: SessionSource,
+        *,
+        old_thread_id: str,
+        new_thread_id: str,
+    ) -> None:
+        """Move /ns lane-scoped model/reasoning choices to the real thread.
+
+        A new Codex conversation runs its first turn on a durable placeholder
+        lane, then switches to the app-server thread id after delivery. Without
+        this migration, /model or /reasoning chosen between /ns and the first
+        prompt would apply only to that first prompt and the second prompt
+        would fall back to Hermes defaults.
+        """
+        old_thread_id = str(old_thread_id or "").strip()
+        new_thread_id = str(new_thread_id or "").strip()
+        if not old_thread_id or not new_thread_id or old_thread_id == new_thread_id:
+            return
+
+        base_source = (
+            dataclasses.replace(source, session_lane=None)
+            if source.session_lane
+            else source
+        )
+        old_source = dataclasses.replace(
+            base_source,
+            session_lane=old_thread_id,
+        )
+        new_source = dataclasses.replace(
+            base_source,
+            session_lane=new_thread_id,
+        )
+        old_key = self._session_key_for_source(old_source)
+        new_key = self._session_key_for_source(new_source)
+        await self.async_session_store.get_or_create_session(new_source)
+
+        self._rehydrate_session_model_override(old_key)
+        model_overrides = getattr(self, "_session_model_overrides", None)
+        if isinstance(model_overrides, dict):
+            model_override = model_overrides.get(old_key)
+            if isinstance(model_override, dict) and model_override:
+                model_overrides[new_key] = dict(model_override)
+                await self.async_session_store.set_model_override(
+                    new_key,
+                    model_override,
+                )
+
+        reasoning_overrides = getattr(
+            self,
+            "_session_reasoning_overrides",
+            None,
+        )
+        if isinstance(reasoning_overrides, dict):
+            reasoning_override = reasoning_overrides.get(old_key)
+            if isinstance(reasoning_override, dict):
+                reasoning_overrides[new_key] = dict(reasoning_override)
+
+    async def _attach_codex_delivery_grant(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> tuple[SessionSource, Optional[Dict[str, Any]]]:
+        """Resolve persisted selection and attach one immutable delivery grant."""
+        from gateway.codex_delivery import CODEX_DELIVERY_GRANT_METADATA_KEY
+
+        metadata = getattr(event, "metadata", None)
+        if metadata is None:
+            metadata = {}
+            event.metadata = metadata
+
+        # A queued or draining turn keeps the grant issued when it entered the
+        # adapter. Never refresh it after a switch: refreshing would grant an
+        # old execution lane the new binding generation.
+        control_key = self._codex_control_session_key(source)
+        authority = self._get_codex_delivery_authority()
+        existing_grant = metadata.get(CODEX_DELIVERY_GRANT_METADATA_KEY)
+        if (
+            source.session_lane
+            and isinstance(existing_grant, dict)
+            and authority.state_for(control_key) is not None
+        ):
+            return source, metadata.get("codex_desktop_binding_snapshot")
+
+        async with authority.transition_lock(control_key):
+            binding = await self.async_session_store.get_session_metadata(
+                control_key,
+                "codex_desktop_thread",
+                None,
+            )
+            # Crash/restart recovery for /ns: the first turn records the real
+            # thread id before its post-delivery callback promotes the binding.
+            # If that callback never fired, the next inbound message completes
+            # the transition here before a delivery grant is issued.
+            promoted = (
+                self._promoted_codex_pending_binding(binding)
+                if isinstance(binding, dict)
+                else None
+            )
+            if promoted is not None:
+                old_thread_id = str(binding.get("thread_id") or "").strip()
+                generation = authority.begin_transition(control_key)
+                saved = await self._promote_codex_pending_binding_and_lane(
+                    source,
+                    control_session_key=control_key,
+                    current_binding=binding,
+                    promoted_binding=promoted,
+                )
+                if saved and authority.commit_transition(
+                    control_key,
+                    generation,
+                    str(promoted.get("thread_id") or ""),
+                ):
+                    binding = promoted
+                    try:
+                        await self._migrate_codex_execution_overrides(
+                            source,
+                            old_thread_id=old_thread_id,
+                            new_thread_id=str(
+                                promoted.get("thread_id") or ""
+                            ),
+                        )
+                        old_source = dataclasses.replace(
+                            source,
+                            session_lane=old_thread_id,
+                        )
+                        self._evict_cached_agent(
+                            self._session_key_for_source(old_source)
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not evict recovered /ns reservation lane",
+                            exc_info=True,
+                        )
+            selected_thread_id = (
+                str(binding.get("thread_id") or "").strip()
+                if isinstance(binding, dict)
+                else ""
+            )
+            authority.observe_binding(control_key, selected_thread_id)
+
+            execution_thread_id = (
+                str(source.session_lane or "").strip()
+                if source.session_lane
+                else selected_thread_id
+            )
+            grant = authority.issue_grant(control_key, execution_thread_id)
+            if grant is not None:
+                metadata[CODEX_DELIVERY_GRANT_METADATA_KEY] = grant.to_metadata()
+            else:
+                metadata.pop(CODEX_DELIVERY_GRANT_METADATA_KEY, None)
+
+            if not source.session_lane and selected_thread_id:
+                source = dataclasses.replace(
+                    source,
+                    session_lane=selected_thread_id,
+                )
+                if isinstance(binding, dict):
+                    metadata["codex_desktop_binding_snapshot"] = dict(binding)
+
+        return source, binding if isinstance(binding, dict) else None
+
+    def _is_codex_delivery_current(
+        self,
+        source: Optional[SessionSource],
+        grant_metadata: Any,
+    ) -> bool:
+        """Authorize outbound delivery without affecting execution lifetime."""
+        if (
+            source is None
+            or source.platform != Platform.TELEGRAM
+            or source.chat_type != "dm"
+            or not source.session_lane
+        ):
+            return True
+        from gateway.codex_delivery import CodexDeliveryGrant
+
+        grant = CodexDeliveryGrant.from_metadata(grant_metadata)
+        if grant is None:
+            return False
+        if grant.thread_id != str(source.session_lane):
+            return False
+        if grant.control_session_key != self._codex_control_session_key(source):
+            return False
+        return self._get_codex_delivery_authority().allows(grant_metadata)
+
+    async def _stage_codex_pending_thread_promotion(
+        self,
+        *,
+        source: SessionSource,
+        execution_session_key: str,
+        pending_binding: Dict[str, Any],
+        actual_thread_id: str,
+        actual_turn_id: str,
+        run_generation: Optional[int],
+    ) -> None:
+        """Persist and defer the /ns reservation→real-thread transition.
+
+        The placeholder delivery grant must remain valid until Telegram sends
+        the first answer.  Therefore the real id is first staged without
+        rotating delivery authority, then promoted by a post-delivery hook.
+        """
+        placeholder_id = str(pending_binding.get("thread_id") or "").strip()
+        actual_thread_id = str(actual_thread_id or "").strip()
+        actual_turn_id = str(actual_turn_id or "").strip()
+        if (
+            not bool(pending_binding.get("pending_new"))
+            or not placeholder_id
+            or not actual_thread_id
+            or actual_thread_id == placeholder_id
+        ):
+            return
+
+        control_source = (
+            dataclasses.replace(source, session_lane=None)
+            if source.session_lane
+            else source
+        )
+        control_key = self._session_key_for_source(control_source)
+        rollout_path = ""
+        try:
+            from agent.transports.codex_desktop_mirror import (
+                resolve_codex_rollout_path,
+            )
+
+            resolved_path = await asyncio.to_thread(
+                resolve_codex_rollout_path,
+                actual_thread_id,
+            )
+            rollout_path = str(resolved_path or "")
+        except Exception:
+            logger.debug(
+                "Could not resolve first /ns rollout for %s",
+                actual_thread_id,
+                exc_info=True,
+            )
+
+        staged_updates: Dict[str, Any] = {
+            "created_thread_id": actual_thread_id,
+            "created_turn_id": actual_turn_id,
+        }
+        # The app-server thread id is the durable resume identity. A rollout
+        # path is useful for desktop mirroring but is not required for
+        # thread/resume, so failure to index the file must never strand /ns on
+        # its placeholder and create a fresh thread on every message.
+        if rollout_path:
+            staged_updates["created_rollout_path"] = rollout_path
+
+        staged = await self.async_session_store.update_session_metadata_dict_if_matches(
+            control_key,
+            "codex_desktop_thread",
+            expected={
+                "thread_id": placeholder_id,
+                "pending_new": True,
+            },
+            updates=staged_updates,
+        )
+        if not staged:
+            return
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None or not hasattr(
+            adapter, "register_post_delivery_callback"
+        ):
+            return
+
+        async def _promote_after_delivery() -> None:
+            current = await self.async_session_store.get_session_metadata(
+                control_key,
+                "codex_desktop_thread",
+                None,
+            )
+            if (
+                not isinstance(current, dict)
+                or str(current.get("thread_id") or "") != placeholder_id
+            ):
+                return
+            promoted = self._promoted_codex_pending_binding(current)
+            if promoted is None:
+                return
+            authority = self._get_codex_delivery_authority()
+            async with authority.transition_lock(control_key):
+                generation = authority.begin_transition(control_key)
+                saved = await self._promote_codex_pending_binding_and_lane(
+                    source,
+                    control_session_key=control_key,
+                    current_binding=current,
+                    promoted_binding=promoted,
+                )
+                if not saved:
+                    return
+                if not authority.commit_transition(
+                    control_key,
+                    generation,
+                    str(promoted.get("thread_id") or ""),
+                ):
+                    logger.error(
+                        "Codex /ns promotion lost ownership for %s "
+                        "generation=%s",
+                        control_key,
+                        generation,
+                    )
+                    return
+            await self._migrate_codex_execution_overrides(
+                source,
+                old_thread_id=placeholder_id,
+                new_thread_id=str(promoted.get("thread_id") or ""),
+            )
+            self._evict_cached_agent(execution_session_key)
+            self._reset_codex_desktop_mirror_state(control_key)
+
+        adapter.register_post_delivery_callback(
+            execution_session_key,
+            _promote_after_delivery,
+            generation=run_generation,
+        )
+
+    def _codex_delivery_authorized_for_event(self, event: MessageEvent) -> bool:
+        from gateway.codex_delivery import CODEX_DELIVERY_GRANT_METADATA_KEY
+
+        metadata = getattr(event, "metadata", None) or {}
+        return self._is_codex_delivery_current(
+            getattr(event, "source", None),
+            metadata.get(CODEX_DELIVERY_GRANT_METADATA_KEY),
+        )
+
+    async def _store_codex_control_binding(
+        self,
+        control_session_key: str,
+        binding: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Persist and publish one linearized /세션 binding transition.
+
+        Revocation happens before the store await, so old progress stops as
+        soon as the selection callback owns the per-chat transition lock.
+        A failed write stays fail-closed; the next inbound resolution observes
+        the durable old binding under a fresh generation instead of ever
+        re-authorizing an old turn.
+        """
+        authority = self._get_codex_delivery_authority()
+        selected_thread_id = (
+            str(binding.get("thread_id") or "").strip()
+            if isinstance(binding, dict)
+            else ""
+        )
+        async with authority.transition_lock(control_session_key):
+            generation = authority.begin_transition(control_session_key)
+            saved = await self.async_session_store.set_session_metadata(
+                control_session_key,
+                "codex_desktop_thread",
+                binding,
+            )
+            if not saved:
+                return False
+            if not authority.commit_transition(
+                control_session_key,
+                generation,
+                selected_thread_id,
+            ):
+                logger.error(
+                    "Codex binding transition lost ownership for %s generation=%s",
+                    control_session_key,
+                    generation,
+                )
+                return False
+            return True
+
+    async def _resolve_codex_execution_source(
+        self,
+        event: MessageEvent,
+    ) -> Optional[SessionSource]:
+        """Resolve a Telegram DM onto the selected Codex thread's run lane.
+
+        The base Telegram chat session remains the control plane that stores
+        the currently selected desktop thread. Ordinary messages receive a
+        stable internal ``session_lane`` derived from that thread id before
+        the adapter computes its busy key. Consequently separate Codex threads
+        have separate adapter locks, Hermes transcripts, pending queues, and
+        cached agents even though replies still go to the same Telegram chat.
+        """
+        source = getattr(event, "source", None)
+        if (
+            source is None
+            or source.platform != Platform.TELEGRAM
+            or source.chat_type != "dm"
+        ):
+            return source
+
+        command = event.get_command()
+        canonical = command
+        if command:
+            try:
+                from hermes_cli.commands import resolve_command
+
+                command_def = resolve_command(command)
+                canonical = command_def.name if command_def else command
+            except Exception:
+                pass
+
+        # Session selection/creation commands are control-plane work. They
+        # must never inherit the current run lane, otherwise opening a picker
+        # while that lane is active would hit the busy guard it bypasses.
+        if canonical in {"codex-session", "ns"}:
+            event.metadata.pop("codex_desktop_binding_snapshot", None)
+            from gateway.codex_delivery import CODEX_DELIVERY_GRANT_METADATA_KEY
+
+            event.metadata.pop(CODEX_DELIVERY_GRANT_METADATA_KEY, None)
+            return (
+                dataclasses.replace(source, session_lane=None)
+                if source.session_lane
+                else source
+            )
+
+        resolved_source, _binding = await self._attach_codex_delivery_grant(
+            event,
+            source,
+        )
+        return resolved_source
+
+    @staticmethod
+    def _is_windows_screen_off_request(event: MessageEvent) -> bool:
+        """Return True for the owner-only Telegram DM screen-off shortcut."""
+        source = getattr(event, "source", None)
+        return bool(
+            source is not None
+            and source.platform == Platform.TELEGRAM
+            and source.chat_type == "dm"
+            and (getattr(event, "text", "") or "").strip().lower() == "/sc"
+        )
+
+    async def _run_windows_screen_off_command(self) -> str:
+        """Trigger the interactive Windows console's monitor-off task."""
+        command = (
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "windows-local",
+            "schtasks.exe",
+            "/Run",
+            "/TN",
+            "HermesScreenOff",
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            logger.warning("Windows screen-off command timed out")
+            return "⚠️ Windows 화면 끄기 요청이 시간 초과됐습니다."
+        except Exception as exc:
+            logger.warning(
+                "Windows screen-off command could not start: %s",
+                exc,
+            )
+            return "⚠️ Windows 화면 끄기 요청을 실행하지 못했습니다."
+
+        if process.returncode != 0:
+            detail_bytes = stderr or stdout or b""
+            detail = detail_bytes.decode("utf-8", errors="replace").strip()
+            logger.warning(
+                "Windows screen-off task failed (exit=%s): %s",
+                process.returncode,
+                detail[:500],
+            )
+            return "⚠️ Windows 화면 끄기 작업을 시작하지 못했습니다."
+
+        logger.info("Windows screen-off task triggered from Telegram")
+        return "🖥️ 두 모니터를 절전 모드로 전환했습니다."
 
     def _resolve_session_agent_runtime(
         self,
@@ -6098,6 +6723,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        # The screen-off shortcut is control-plane work and must remain
+        # available while the selected Codex session is busy. Execute it
+        # directly instead of steering, interrupting, or queueing the agent.
+        if self._is_windows_screen_off_request(event):
+            adapter = self._adapter_for_source(event.source)
+            if adapter is None:
+                return True
+            message = await self._run_windows_screen_off_command()
+            reply_anchor = self._reply_anchor_for_event(event)
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=message,
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(
+                    event.source,
+                    reply_anchor,
+                ),
+            )
+            return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -8214,6 +8859,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            _set_source_resolver = getattr(
+                adapter, "set_session_source_resolver", None
+            )
+            if callable(_set_source_resolver):
+                _set_source_resolver(self._resolve_codex_execution_source)
+            _set_delivery_authorizer = getattr(
+                adapter, "set_delivery_authorizer", None
+            )
+            if callable(_set_delivery_authorizer):
+                _set_delivery_authorizer(
+                    self._codex_delivery_authorized_for_event
+                )
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
             
@@ -8599,6 +9256,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
+        # Mirror final answers from desktop-originated turns into Telegram
+        # while a /codex desktop-thread binding is active. The persisted turn
+        # cursor prevents history replay across gateway restarts.
+        self._spawn_supervised(
+            self._codex_desktop_mirror_watcher,
+            "codex_desktop_mirror_watcher",
+        )
+
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
@@ -8635,7 +9300,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
         logger.info("Press Ctrl+C to stop")
-        
+
         return True
 
     _MAX_SUPERVISED_RESTARTS = 5
@@ -8725,6 +9390,912 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         task.add_done_callback(_done)
         return task
+
+    def _reset_codex_desktop_mirror_state(self, session_key: str) -> None:
+        states = getattr(self, "_codex_desktop_mirror_states", None)
+        if isinstance(states, dict):
+            states.pop(session_key, None)
+
+    async def _codex_desktop_mirror_watcher(
+        self,
+        interval: float = 1.0,
+    ) -> None:
+        """Mirror desktop Codex turns into one evolving Telegram message."""
+        await asyncio.sleep(1.0)
+        while self._running:
+            try:
+                bindings = await self.async_session_store.list_sessions_with_metadata(
+                    "codex_desktop_thread"
+                )
+                active_keys: set[str] = set()
+                for session_key, source, binding in bindings:
+                    if (
+                        source is None
+                        or source.platform != Platform.TELEGRAM
+                        or not isinstance(binding, dict)
+                        or not str(binding.get("thread_id") or "").strip()
+                    ):
+                        continue
+                    active_keys.add(session_key)
+                    await self._poll_codex_desktop_mirror_binding(
+                        session_key,
+                        source,
+                        binding,
+                    )
+                states = getattr(
+                    self, "_codex_desktop_mirror_states", {}
+                )
+                for stale_key in set(states) - active_keys:
+                    states.pop(stale_key, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Codex desktop mirror watcher iteration failed",
+                    exc_info=True,
+                )
+            await asyncio.sleep(max(0.25, float(interval)))
+
+    async def _poll_codex_desktop_mirror_binding(
+        self,
+        session_key: str,
+        source: SessionSource,
+        binding: Dict[str, Any],
+    ) -> None:
+        """Poll one binding and deliver its unseen desktop turn activity."""
+        from agent.transports.codex_desktop_mirror import (
+            CodexDesktopRolloutTail,
+        )
+
+        thread_id = str(binding.get("thread_id") or "").strip()
+        authority = self._get_codex_delivery_authority()
+        async with authority.transition_lock(session_key):
+            current_binding = await self.async_session_store.get_session_metadata(
+                session_key,
+                "codex_desktop_thread",
+                None,
+            )
+            current_thread_id = (
+                str(current_binding.get("thread_id") or "").strip()
+                if isinstance(current_binding, dict)
+                else ""
+            )
+            authority.observe_binding(session_key, current_thread_id)
+            mirror_grant = authority.issue_grant(session_key, thread_id)
+        if (
+            mirror_grant is None
+            or current_thread_id != thread_id
+            or not authority.allows(mirror_grant.to_metadata())
+        ):
+            self._reset_codex_desktop_mirror_state(session_key)
+            return
+        mirror_grant_metadata = mirror_grant.to_metadata()
+        hinted_path = str(binding.get("rollout_path") or "").strip() or None
+        states = getattr(self, "_codex_desktop_mirror_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._codex_desktop_mirror_states = states
+        state = states.get(session_key)
+        pending_before_scan: set[str] = set()
+        if (
+            not isinstance(state, dict)
+            or state.get("thread_id") != thread_id
+            or state.get("binding_generation") != mirror_grant.generation
+            or not getattr(state.get("tail"), "path", None)
+            or not state["tail"].path.is_file()
+        ):
+            tail = await asyncio.to_thread(
+                CodexDesktopRolloutTail.open,
+                thread_id,
+                hinted_path=hinted_path,
+            )
+            if tail is None:
+                states.pop(session_key, None)
+                return
+            initial_completions, initial_updates = await asyncio.to_thread(
+                tail.scan_with_updates
+            )
+            cursor = str(
+                binding.get("mirror_cursor_turn_id") or ""
+            ).strip()
+            pending = []
+            if cursor:
+                cursor_index = next(
+                    (
+                        index
+                        for index, item in enumerate(initial_completions)
+                        if item.turn_id == cursor
+                    ),
+                    None,
+                )
+                if cursor_index is not None:
+                    pending = initial_completions[cursor_index + 1 :]
+                elif initial_completions:
+                    # The rollout was replaced/compacted and no longer
+                    # contains the persisted cursor. Baseline the new file
+                    # instead of replaying an unknown amount of history.
+                    if not authority.allows(mirror_grant_metadata):
+                        states.pop(session_key, None)
+                        return
+                    await self._advance_codex_desktop_mirror_cursor(
+                        session_key,
+                        thread_id,
+                        initial_completions[-1].turn_id,
+                        str(tail.path),
+                    )
+            elif initial_completions:
+                # Backward-compatible first startup for bindings created
+                # before mirroring existed: do not replay historical answers.
+                if not authority.allows(mirror_grant_metadata):
+                    states.pop(session_key, None)
+                    return
+                await self._advance_codex_desktop_mirror_cursor(
+                    session_key,
+                    thread_id,
+                    initial_completions[-1].turn_id,
+                    str(tail.path),
+                )
+            state = {
+                "thread_id": thread_id,
+                "binding_generation": mirror_grant.generation,
+                "tail": tail,
+                "pending": list(pending),
+                # Rehydrate the latest still-running turn immediately. Full
+                # rollout scans also contain transient snapshots for every
+                # historical completed turn, so collapse by id, remove ids
+                # whose completed update was observed, and retain only the
+                # newest genuinely incomplete turn.
+                "pending_updates": {},
+                "live_messages": {},
+                # Turns whose direct Hermes response path ended while Codex
+                # was still running.  The mirror owns these through completion.
+                "handoff_turn_ids": set(),
+            }
+            initial_live_updates: Dict[str, Any] = {}
+            for update in initial_updates:
+                if bool(getattr(update, "completed", False)):
+                    initial_live_updates.pop(update.turn_id, None)
+                else:
+                    initial_live_updates[update.turn_id] = update
+            if initial_live_updates:
+                latest_active = next(
+                    reversed(initial_live_updates.values())
+                )
+                state["pending_updates"][latest_active.turn_id] = (
+                    latest_active
+                )
+            states[session_key] = state
+        else:
+            pending_before_scan = set(
+                state.setdefault("pending_updates", {})
+            )
+            new_completions, new_updates = await asyncio.to_thread(
+                state["tail"].scan_with_updates
+            )
+            state["pending"].extend(new_completions)
+            # A single filesystem poll can contain many progress events.
+            # Collapse them so Telegram receives at most one edit per turn per
+            # second, avoiding flood limits while preserving the full snapshot.
+            pending_updates = state.setdefault("pending_updates", {})
+            for update in new_updates:
+                if bool(getattr(update, "completed", False)):
+                    pending_updates.pop(update.turn_id, None)
+                else:
+                    pending_updates[update.turn_id] = update
+
+        # Initial attach snapshots and live updates share one retryable queue.
+        # This makes "attach mid-turn" visible immediately, while a transient
+        # Telegram failure is retried even when Codex emits no further event.
+        pending_updates = state.setdefault("pending_updates", {})
+        for turn_id, update in list(pending_updates.items()):
+            if not authority.allows(mirror_grant_metadata):
+                states.pop(session_key, None)
+                return
+            current = await self.async_session_store.get_session_metadata(
+                session_key,
+                "codex_desktop_thread",
+                None,
+            )
+            if (
+                not isinstance(current, dict)
+                or current.get("thread_id") != thread_id
+            ):
+                states.pop(session_key, None)
+                return
+            (
+                hermes_turn_ids,
+                hermes_completed_turn_ids,
+            ) = await self._codex_mirror_hermes_turn_state(
+                session_key,
+                source,
+                thread_id,
+                current,
+            )
+            if turn_id in hermes_completed_turn_ids:
+                # Hermes already received this successful Codex completion and
+                # owns its normal/streamed platform delivery. Drop the queued
+                # rollout snapshot instead of converting a released execution
+                # lane into a false mirror handoff.
+                pending_updates.pop(turn_id, None)
+                state.setdefault("handoff_turn_ids", set()).discard(turn_id)
+                continue
+            if turn_id in hermes_turn_ids:
+                if self._codex_mirror_direct_execution_active(
+                    source,
+                    thread_id,
+                    turn_id,
+                    mirror_grant_metadata,
+                ):
+                    # Keep the newest snapshot queued. If the direct request
+                    # later times out without another Codex event, the next
+                    # poll can still hand this exact turn to the mirror.
+                    continue
+                # Direct ownership is released only after the durable success
+                # marker is written. Re-read after observing no owner so a
+                # mirror poll that began during that release cannot act on its
+                # earlier, stale marker snapshot.
+                if await self._codex_mirror_hermes_turn_completed(
+                    session_key,
+                    source,
+                    thread_id,
+                    turn_id,
+                ):
+                    pending_updates.pop(turn_id, None)
+                    state.setdefault("handoff_turn_ids", set()).discard(
+                        turn_id
+                    )
+                    continue
+                state.setdefault("handoff_turn_ids", set()).add(turn_id)
+            delivered = await self._upsert_codex_desktop_mirror_message(
+                state,
+                source,
+                update,
+                mirror_grant_metadata,
+            )
+            if not delivered:
+                if not authority.allows(mirror_grant_metadata):
+                    states.pop(session_key, None)
+                return
+            pending_updates.pop(turn_id, None)
+
+        pending = state["pending"]
+        while pending:
+            if not authority.allows(mirror_grant_metadata):
+                states.pop(session_key, None)
+                return
+            completion = pending[0]
+            current = await self.async_session_store.get_session_metadata(
+                session_key,
+                "codex_desktop_thread",
+                None,
+            )
+            if (
+                not isinstance(current, dict)
+                or current.get("thread_id") != thread_id
+            ):
+                states.pop(session_key, None)
+                return
+
+            (
+                hermes_turn_ids,
+                hermes_completed_turn_ids,
+            ) = await self._codex_mirror_hermes_turn_state(
+                session_key,
+                source,
+                thread_id,
+                current,
+            )
+            if (
+                completion.turn_id in hermes_turn_ids
+                and completion.turn_id not in hermes_completed_turn_ids
+            ):
+                if self._codex_mirror_direct_execution_active(
+                    source,
+                    thread_id,
+                    completion.turn_id,
+                    mirror_grant_metadata,
+                ):
+                    # task_complete reaches the rollout before the gateway has
+                    # necessarily finished delivering the final response. Keep
+                    # this completion queued until direct ownership resolves.
+                    state.setdefault("handoff_turn_ids", set()).add(
+                        completion.turn_id
+                    )
+                    return
+                if await self._codex_mirror_hermes_turn_completed(
+                    session_key,
+                    source,
+                    thread_id,
+                    completion.turn_id,
+                ):
+                    hermes_completed_turn_ids.add(completion.turn_id)
+            error_text = str(
+                getattr(completion, "error_text", "") or ""
+            ).strip()
+            should_deliver = (
+                bool(error_text)
+                or (
+                    completion.turn_id not in hermes_completed_turn_ids
+                    and (
+                        completion.turn_id not in hermes_turn_ids
+                        or completion.turn_id
+                        in state.setdefault("handoff_turn_ids", set())
+                        or (
+                            completion.turn_id in pending_before_scan
+                            and not self._codex_mirror_direct_execution_active(
+                                source,
+                                thread_id,
+                                completion.turn_id,
+                                mirror_grant_metadata,
+                            )
+                        )
+                    )
+                )
+            )
+            if should_deliver:
+                if completion.turn_id in hermes_turn_ids:
+                    state.setdefault("handoff_turn_ids", set()).add(
+                        completion.turn_id
+                    )
+                live = state["live_messages"].get(completion.turn_id)
+                if not (isinstance(live, dict) and live.get("completed")):
+                    delivered = await self._upsert_codex_desktop_mirror_message(
+                        state,
+                        source,
+                        completion,
+                        mirror_grant_metadata,
+                    )
+                    if not delivered:
+                        if not authority.allows(mirror_grant_metadata):
+                            states.pop(session_key, None)
+                        return
+
+            if not authority.allows(mirror_grant_metadata):
+                states.pop(session_key, None)
+                return
+            advanced = await self._advance_codex_desktop_mirror_cursor(
+                session_key,
+                thread_id,
+                completion.turn_id,
+                str(state["tail"].path),
+            )
+            if not advanced:
+                states.pop(session_key, None)
+                return
+            pending.pop(0)
+            state["live_messages"].pop(completion.turn_id, None)
+            state.setdefault("handoff_turn_ids", set()).discard(
+                completion.turn_id
+            )
+
+    async def _codex_mirror_hermes_turn_state(
+        self,
+        control_session_key: str,
+        source: SessionSource,
+        thread_id: str,
+        control_binding: Dict[str, Any],
+    ) -> tuple[set[str], set[str]]:
+        """Return Hermes-originated and Hermes-completed turn ids.
+
+        The control binding is replaced whenever /세션 selects a thread. The
+        execution lane is stable, so it is the durable source of truth across
+        A -> B -> A transitions. Without this union, a Hermes turn started in A
+        could finish while B is selected and later be echoed by the desktop
+        mirror after A is selected again.
+        """
+        turn_ids = {
+            str(item)
+            for item in (control_binding.get("mirror_hermes_turn_ids") or [])
+        }
+        completed_turn_ids = {
+            str(item)
+            for item in (
+                control_binding.get("mirror_hermes_completed_turn_ids") or []
+            )
+        }
+        try:
+            lane_source = dataclasses.replace(
+                source,
+                session_lane=thread_id,
+            )
+            lane_session_key = self._session_key_for_source(lane_source)
+            if lane_session_key == control_session_key:
+                return turn_ids, completed_turn_ids
+            lane_binding = await self.async_session_store.get_session_metadata(
+                lane_session_key,
+                "codex_execution_thread",
+                None,
+            )
+            if (
+                isinstance(lane_binding, dict)
+                and str(lane_binding.get("thread_id") or "") == thread_id
+            ):
+                turn_ids.update(
+                    str(item)
+                    for item in (
+                        lane_binding.get("mirror_hermes_turn_ids") or []
+                    )
+                )
+                completed_turn_ids.update(
+                    str(item)
+                    for item in (
+                        lane_binding.get("mirror_hermes_completed_turn_ids")
+                        or []
+                    )
+                )
+        except Exception:
+            logger.debug(
+                "Could not load Codex execution-lane mirror turn state",
+                exc_info=True,
+            )
+        return turn_ids, completed_turn_ids
+
+    async def _codex_mirror_hermes_turn_completed(
+        self,
+        control_session_key: str,
+        source: SessionSource,
+        thread_id: str,
+        turn_id: str,
+    ) -> bool:
+        """Re-read the durable success marker after direct ownership ends."""
+        current = await self.async_session_store.get_session_metadata(
+            control_session_key,
+            "codex_desktop_thread",
+            None,
+        )
+        if (
+            not isinstance(current, dict)
+            or str(current.get("thread_id") or "") != thread_id
+        ):
+            return False
+        _origin_turn_ids, completed_turn_ids = (
+            await self._codex_mirror_hermes_turn_state(
+                control_session_key,
+                source,
+                thread_id,
+                current,
+            )
+        )
+        return turn_id in completed_turn_ids
+
+    def _record_codex_mirror_turn_marker(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        thread_id: str,
+        turn_id: str,
+        list_key: str,
+    ) -> None:
+        """Persist one mirror ownership marker on execution and control lanes."""
+        thread_id = str(thread_id or "").strip()
+        turn_id = str(turn_id or "").strip()
+        if not session_key or not thread_id or not turn_id:
+            return
+        binding_key = (
+            "codex_execution_thread"
+            if source.session_lane
+            else "codex_desktop_thread"
+        )
+        control_session_key = (
+            self._session_key_for_source(
+                dataclasses.replace(source, session_lane=None)
+            )
+            if source.session_lane
+            else session_key
+        )
+        try:
+            self.session_store.append_session_metadata_list_if_matches(
+                session_key,
+                binding_key,
+                expected={"thread_id": thread_id},
+                list_key=list_key,
+                value=turn_id,
+                max_items=64,
+            )
+            if control_session_key != session_key:
+                self.session_store.append_session_metadata_list_if_matches(
+                    control_session_key,
+                    "codex_desktop_thread",
+                    expected={"thread_id": thread_id},
+                    list_key=list_key,
+                    value=turn_id,
+                    max_items=64,
+                )
+        except Exception:
+            logger.debug(
+                "Failed to register Codex mirror marker %s for turn %s",
+                list_key,
+                turn_id,
+                exc_info=True,
+            )
+
+    def _codex_mirror_direct_execution_active(
+        self,
+        source: SessionSource,
+        thread_id: str,
+        turn_id: str,
+        delivery_grant: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Return whether Hermes directly streams this exact Codex turn.
+
+        A Telegram-originated Codex turn is normally delivered directly by the
+        gateway and excluded from the rollout mirror to avoid duplicates.  The
+        execution lane alone is not sufficient proof of ownership: after a
+        gateway restart, queue-mode recovery creates a lane that waits behind
+        the already-active turn without forwarding its events. In that state
+        the rollout watcher must own delivery even though the lane exists.
+        """
+        authority = self._get_codex_delivery_authority()
+        if authority.owns_direct_turn(delivery_grant, turn_id):
+            # App-server clears its active-turn id at task_complete, before
+            # gateway final delivery and success-marker persistence finish.
+            return True
+        running = getattr(self, "_running_agents", None)
+        if not isinstance(running, dict):
+            return False
+        try:
+            lane_source = dataclasses.replace(
+                source,
+                session_lane=thread_id,
+            )
+            lane_session_key = self._session_key_for_source(lane_source)
+        except Exception:
+            logger.debug(
+                "Could not resolve Codex execution lane for mirror handoff",
+                exc_info=True,
+            )
+            return False
+        running_agent = running.get(lane_session_key)
+        if running_agent is None:
+            return False
+        # During the very short agent-construction window there is no session
+        # object to inspect yet. Preserve the old conservative suppression and
+        # retry the queued mirror snapshot on the next poll.
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            return True
+        codex_session = getattr(running_agent, "_codex_session", None)
+        ownership_probe = getattr(
+            codex_session,
+            "is_directly_streaming_turn",
+            None,
+        )
+        if callable(ownership_probe):
+            try:
+                return bool(ownership_probe(turn_id))
+            except Exception:
+                logger.debug(
+                    "Could not inspect direct Codex turn delivery ownership",
+                    exc_info=True,
+                )
+                return True
+        # Compatibility for non-standard/test agents without the new probe.
+        return True
+
+    async def _upsert_codex_desktop_mirror_message(
+        self,
+        state: Dict[str, Any],
+        source: SessionSource,
+        turn: Any,
+        delivery_grant: Dict[str, Any],
+    ) -> bool:
+        """Upsert the full transcript across as many Telegram messages as needed."""
+        authority = self._get_codex_delivery_authority()
+        if not authority.allows(delivery_grant):
+            return False
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+        content = self._render_codex_desktop_mirror_turn(turn)
+        content_chunks = self._split_codex_desktop_mirror_content(content)
+        _cleaned_answer, local_images = (
+            self._extract_local_markdown_images(
+                str(getattr(turn, "final_text", "") or "")
+            )
+        )
+        metadata = self._thread_metadata_for_target(
+            source.platform,
+            source.chat_id,
+            source.thread_id,
+            chat_type=source.chat_type,
+            adapter=adapter,
+        )
+        live_messages = state.setdefault("live_messages", {})
+        live = live_messages.get(turn.turn_id)
+
+        # Migrate the former single-message state lazily. Keeping both the
+        # aggregate and per-chunk fields makes rolling restarts safe while old
+        # watcher state is still resident.
+        if isinstance(live, dict):
+            message_ids = [
+                str(message_id)
+                for message_id in (live.get("message_ids") or ())
+                if message_id
+            ]
+            if not message_ids and live.get("message_id"):
+                message_ids = [str(live["message_id"])]
+            previous_chunks = list(live.get("contents") or ())
+            if not previous_chunks and live.get("content") is not None:
+                previous_chunks = [str(live.get("content") or "")]
+            sent_image_paths = set(live.get("sent_image_paths") or ())
+        else:
+            message_ids = []
+            previous_chunks = []
+            sent_image_paths = set()
+
+        def _save_live(*, completed: bool) -> None:
+            live_messages[turn.turn_id] = {
+                "message_id": message_ids[-1] if message_ids else None,
+                "message_ids": list(message_ids),
+                "content": content,
+                "contents": list(previous_chunks),
+                "completed": completed,
+                "sent_image_paths": sorted(sent_image_paths),
+            }
+
+        for chunk_index, chunk in enumerate(content_chunks):
+            if not authority.allows(delivery_grant):
+                return False
+            if chunk_index < len(message_ids):
+                previous = (
+                    previous_chunks[chunk_index]
+                    if chunk_index < len(previous_chunks)
+                    else None
+                )
+                if previous == chunk:
+                    continue
+                result = await adapter.edit_message(
+                    source.chat_id,
+                    message_ids[chunk_index],
+                    chunk,
+                    finalize=False,
+                    metadata=metadata,
+                )
+            else:
+                result = await adapter.send(
+                    source.chat_id,
+                    chunk,
+                    reply_to=message_ids[-1] if message_ids else None,
+                    metadata=metadata,
+                )
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "Codex desktop mirror chunk %d delivery failed for turn %s: %s",
+                    chunk_index + 1,
+                    turn.turn_id,
+                    getattr(result, "error", "unknown error"),
+                )
+                _save_live(completed=False)
+                return False
+            if chunk_index >= len(message_ids):
+                message_id = getattr(result, "message_id", None)
+                if not message_id:
+                    logger.warning(
+                        "Codex desktop mirror chunk %d for turn %s returned "
+                        "without a message id",
+                        chunk_index + 1,
+                        turn.turn_id,
+                    )
+                    _save_live(completed=False)
+                    return False
+                message_ids.append(str(message_id))
+            while len(previous_chunks) <= chunk_index:
+                previous_chunks.append("")
+            previous_chunks[chunk_index] = chunk
+            _save_live(completed=False)
+
+        # Transcript snapshots normally only grow, but a corrected/replayed
+        # rollout can become shorter. Remove stale tail bubbles so Telegram
+        # still shows exactly the current transcript.
+        if len(message_ids) > len(content_chunks):
+            stale_ids = message_ids[len(content_chunks):]
+            for stale_id in stale_ids:
+                try:
+                    await adapter.delete_message(source.chat_id, stale_id)
+                except Exception:
+                    logger.debug(
+                        "Could not delete stale Codex desktop mirror message %s",
+                        stale_id,
+                        exc_info=True,
+                    )
+            del message_ids[len(content_chunks):]
+        del previous_chunks[len(content_chunks):]
+
+        message_id = message_ids[-1] if message_ids else None
+        completed = bool(getattr(turn, "completed", True))
+        if completed:
+            from agent.redact import redact_sensitive_text
+
+            for image_path, alt_text in local_images:
+                if image_path in sent_image_paths:
+                    continue
+                if not authority.allows(delivery_grant):
+                    return False
+                image_result = await adapter.send_image_file(
+                    chat_id=source.chat_id,
+                    image_path=image_path,
+                    caption=(
+                        redact_sensitive_text(alt_text).strip()[:1024]
+                        or "Codex 데스크톱 이미지"
+                    ),
+                    reply_to=str(message_id) if message_id else None,
+                    metadata=metadata,
+                )
+                if not getattr(image_result, "success", False):
+                    logger.warning(
+                        "Codex desktop image delivery failed for turn %s: %s",
+                        turn.turn_id,
+                        getattr(image_result, "error", "unknown error"),
+                    )
+                    _save_live(completed=False)
+                    return False
+                sent_image_paths.add(image_path)
+
+        _save_live(completed=completed)
+        logger.info(
+            "%s Codex desktop turn %s in Telegram across %d message(s)",
+            "Completed" if getattr(turn, "completed", True) else "Updated",
+            turn.turn_id,
+            len(content_chunks),
+        )
+        return True
+
+    @staticmethod
+    def _split_codex_desktop_mirror_content(
+        content: str,
+        max_utf16_units: int = 1800,
+    ) -> list[str]:
+        """Split a mirror snapshot without dropping or duplicating any text.
+
+        Telegram's hard ceiling is 4,096 UTF-16 units. The deliberately
+        conservative raw-text ceiling leaves enough room even when Telegram
+        MarkdownV2 escaping nearly doubles the physical payload.
+        Natural breakpoints are preferred, but every input codepoint is
+        preserved exactly across the returned chunks.
+        """
+        from gateway.platforms.base import utf16_len
+
+        if not content:
+            return [""]
+        chunks: list[str] = []
+        remaining = content
+        while utf16_len(remaining) > max_utf16_units:
+            lo, hi = 1, len(remaining)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if utf16_len(remaining[:mid]) <= max_utf16_units:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            safe_end = lo
+            region = remaining[:safe_end]
+            split_at = region.rfind("\n")
+            if split_at < safe_end // 2:
+                split_at = region.rfind(" ")
+            if split_at < 1:
+                split_at = safe_end
+            else:
+                # Preserve the separator itself so concatenating all chunks
+                # reproduces the original transcript byte-for-byte.
+                split_at += 1
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    @staticmethod
+    def _render_codex_desktop_mirror_turn(turn: Any) -> str:
+        """Render the complete question, public progress, and answer."""
+        from agent.redact import redact_sensitive_text
+
+        def _clean(value: Any) -> str:
+            return redact_sensitive_text(str(value or "")).strip()
+
+        question = _clean(getattr(turn, "user_text", ""))
+        answer_text, _images = (
+            GatewayRunner._extract_local_markdown_images(
+                str(getattr(turn, "final_text", "") or "")
+            )
+        )
+        error = _clean(getattr(turn, "error_text", ""))
+        answer = _clean(answer_text)
+        progress_lines: list[str] = []
+        for item in getattr(turn, "progress", ()) or ():
+            text = _clean(getattr(item, "text", ""))
+            if not text:
+                continue
+            prefix = "• " if getattr(item, "kind", "") == "status" else ""
+            progress_lines.append(prefix + text)
+        progress = "\n\n".join(progress_lines)
+
+        sections = ["💻 Codex 데스크톱"]
+        if question:
+            sections.append("👤 질문\n" + question)
+        if progress:
+            sections.append("⚙️ 중간 과정\n" + progress)
+        if answer:
+            sections.append("🤖 답변\n" + answer)
+        if error:
+            sections.append("⚠️ 오류\n" + error)
+        elif not getattr(turn, "completed", True):
+            sections.append("⏳ 작업 중…")
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _extract_local_markdown_images(
+        text: str,
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """Extract safe local Markdown images for native platform upload."""
+        from urllib.parse import unquote
+        from gateway.platforms.base import BasePlatformAdapter
+
+        image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        pattern = re.compile(
+            r"!\[([^\]\n]*)\]\((<[^>\n]+>|[^)\n]+)\)"
+        )
+        images: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def _replace(match: re.Match) -> str:
+            alt_text = match.group(1).strip()
+            target = match.group(2).strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].strip()
+            if target.lower().startswith("file://"):
+                raw_path = unquote(target[7:])
+            else:
+                raw_path = unquote(target)
+            try:
+                is_local = Path(raw_path).expanduser().is_absolute()
+            except (OSError, RuntimeError, ValueError):
+                is_local = False
+            if not is_local:
+                return match.group(0)
+            try:
+                is_image = Path(raw_path).suffix.lower() in image_exts
+            except (OSError, RuntimeError, ValueError):
+                is_image = False
+            if not is_image:
+                return match.group(0)
+
+            safe_path = BasePlatformAdapter.validate_media_delivery_path(
+                raw_path
+            )
+            if safe_path and safe_path not in seen:
+                seen.add(safe_path)
+                images.append((safe_path, alt_text))
+            # Never leak a host-local image path into Telegram. A rejected or
+            # vanished image simply remains absent from the attachment list.
+            return ""
+
+        cleaned = pattern.sub(_replace, str(text or ""))
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned, images
+
+    @staticmethod
+    def _extract_codex_desktop_local_images(
+        text: str,
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """Backward-compatible alias for desktop mirror callers/tests."""
+        return GatewayRunner._extract_local_markdown_images(text)
+
+    async def _advance_codex_desktop_mirror_cursor(
+        self,
+        session_key: str,
+        thread_id: str,
+        turn_id: str,
+        rollout_path: str,
+    ) -> bool:
+        return await self.async_session_store.update_session_metadata_dict_if_matches(
+            session_key,
+            "codex_desktop_thread",
+            expected={"thread_id": thread_id},
+            updates={
+                "mirror_cursor_turn_id": turn_id,
+                "rollout_path": rollout_path,
+            },
+        )
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -9255,6 +10826,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    _set_source_resolver = getattr(
+                        adapter, "set_session_source_resolver", None
+                    )
+                    if callable(_set_source_resolver):
+                        _set_source_resolver(
+                            self._resolve_codex_execution_source
+                        )
+                    _set_delivery_authorizer = getattr(
+                        adapter, "set_delivery_authorizer", None
+                    )
+                    if callable(_set_delivery_authorizer):
+                        _set_delivery_authorizer(
+                            self._codex_delivery_authorized_for_event
+                        )
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
 
@@ -10137,6 +11722,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        _set_source_resolver = getattr(
+            adapter, "set_session_source_resolver", None
+        )
+        if callable(_set_source_resolver):
+            _set_source_resolver(self._resolve_codex_execution_source)
+        _set_delivery_authorizer = getattr(
+            adapter, "set_delivery_authorizer", None
+        )
+        if callable(_set_delivery_authorizer):
+            _set_delivery_authorizer(
+                self._codex_delivery_authorized_for_event
+            )
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
@@ -10907,6 +12504,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Owner-authorized Telegram DM shortcut. Handle it before session
+        # prompts, busy-agent routing, or model dispatch so turning the
+        # monitors off is deterministic and does not consume a Codex turn.
+        if (
+            not is_internal
+            and self._is_windows_screen_off_request(event)
+        ):
+            return await self._run_windows_screen_off_command()
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -11165,12 +12771,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _denied is not None:
                     return _denied
 
-            # Telegram sends /start for bot launches/deep-links. Treat it as a
-            # platform ping, not a user command: no help dump, no agent
-            # interrupt, no queued text.
+            # Telegram sends /start for bot launches/deep-links. Keep it out of
+            # the active agent lane, but acknowledge it with the one useful
+            # entry point instead of making a healthy bot appear unresponsive.
             if _cmd_def_inner and _cmd_def_inner.name == "start":
-                logger.info("Ignoring /start platform ping for active session %s", _quick_key)
-                return ""
+                logger.info("Acknowledging /start platform ping for active session %s", _quick_key)
+                return (
+                    "✅ Hermes가 준비됐습니다.\n\n"
+                    "기존 데스크톱 Codex 대화를 연결하려면 "
+                    "/세션 을 보내세요."
+                )
 
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
@@ -11701,8 +13311,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_help_command(event)
 
         if canonical == "start":
-            logger.info("Ignoring /start platform ping for session %s", _quick_key)
-            return ""
+            logger.info("Acknowledging /start platform ping for session %s", _quick_key)
+            return (
+                "✅ Hermes가 준비됐습니다.\n\n"
+                "기존 데스크톱 Codex 대화를 연결하려면 "
+                "/세션 을 보내세요."
+            )
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
@@ -11787,6 +13401,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
+
+        if canonical == "codex-session":
+            return await self._handle_codex_session_command(event)
+
+        if canonical == "ns":
+            return await self._handle_codex_new_session_command(event)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -12864,8 +14484,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
+        # Normal adapter ingress attaches this before the lane busy-key is
+        # claimed. Synthetic restart/drain events can enter the runner
+        # directly, so hydrate a grant here as a fail-safe. Existing grants
+        # are immutable and are never refreshed after a /세션 transition.
+        if source.session_lane:
+            source, _ = await self._attach_codex_delivery_grant(event, source)
+            try:
+                event.source = source
+            except Exception:
+                pass
+
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        _codex_binding_snapshot = (
+            (getattr(event, "metadata", None) or {}).get(
+                "codex_desktop_binding_snapshot"
+            )
+        )
+        from gateway.codex_delivery import CODEX_DELIVERY_GRANT_METADATA_KEY
+
+        _codex_delivery_grant = (
+            (getattr(event, "metadata", None) or {}).get(
+                CODEX_DELIVERY_GRANT_METADATA_KEY
+            )
+        )
+        if (
+            source.session_lane
+            and isinstance(_codex_binding_snapshot, dict)
+            and str(_codex_binding_snapshot.get("thread_id") or "")
+            == str(source.session_lane)
+        ):
+            # Persist the immutable selection snapshot on the lane under a
+            # non-watched key. The base chat's codex_desktop_thread metadata
+            # remains the picker/mirror control pointer and may change while
+            # this lane is still running.
+            await self.async_session_store.set_session_metadata(
+                session_key,
+                "codex_execution_thread",
+                dict(_codex_binding_snapshot),
+            )
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -13200,6 +14858,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_configured_model = None
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
+            _hyg_runtime: Dict[str, Any] = {}
+            _hyg_codex_app_server_auto = "native"
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -13230,6 +14890,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        _hyg_codex_app_server_auto = str(
+                            _comp_cfg.get("codex_app_server_auto", "native")
+                            or "native"
+                        ).strip().lower()
+                        if _hyg_codex_app_server_auto not in {
+                            "native",
+                            "hermes",
+                            "off",
+                        }:
+                            _hyg_codex_app_server_auto = "native"
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
@@ -13376,6 +15046,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+
+                if (
+                    _needs_compress
+                    and _gateway_hygiene_delegates_to_codex(
+                        _hyg_runtime.get("api_mode"),
+                        _hyg_codex_app_server_auto,
+                    )
+                ):
+                    # Codex owns the authoritative thread context in these
+                    # modes. A temporary Hermes hygiene agent has no live
+                    # CodexAppServerSession to compact, so running it merely
+                    # returns the unchanged transcript and then evicts the
+                    # real cached session. That eviction used to make the next
+                    # message start a new Codex thread and leak another
+                    # app-server process.
+                    logger.info(
+                        "Session hygiene: leaving Codex app-server context "
+                        "management to mode=%s for session %s",
+                        _hyg_codex_app_server_auto,
+                        session_entry.session_id,
+                    )
+                    _needs_compress = False
 
                 if _needs_compress:
                     _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
@@ -13950,6 +15642,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _codex_binding_key = (
+                "codex_execution_thread"
+                if source.session_lane
+                else "codex_desktop_thread"
+            )
+            _codex_binding = _codex_binding_snapshot
+            if not isinstance(_codex_binding, dict):
+                _codex_binding = (
+                    getattr(session_entry, "metadata", {}) or {}
+                ).get(_codex_binding_key)
+            _codex_pending_new = bool(
+                isinstance(_codex_binding, dict)
+                and _codex_binding.get("pending_new")
+            )
+            _codex_resume_thread_id = (
+                None
+                if _codex_pending_new
+                else (
+                    str(_codex_binding.get("thread_id") or "") or None
+                    if isinstance(_codex_binding, dict)
+                    else None
+                )
+            )
+            _codex_new_thread_cwd = (
+                str(_codex_binding.get("cwd") or "").strip() or None
+                if _codex_pending_new
+                else None
+            )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -13963,6 +15683,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                codex_resume_thread_id=_codex_resume_thread_id,
+                codex_new_thread_cwd=_codex_new_thread_cwd,
+                codex_delivery_grant=_codex_delivery_grant,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -14001,6 +15724,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
+
+            if _codex_pending_new and isinstance(_codex_binding, dict):
+                await self._stage_codex_pending_thread_promotion(
+                    source=source,
+                    execution_session_key=session_key,
+                    pending_binding=_codex_binding,
+                    actual_thread_id=str(
+                        agent_result.get("codex_thread_id") or ""
+                    ),
+                    actual_turn_id=str(
+                        agent_result.get("codex_turn_id") or ""
+                    ),
+                    run_generation=run_generation,
+                )
 
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
@@ -14514,6 +16251,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            # Execution completion and transcript persistence are independent
+            # from Telegram delivery authority. A /세션 switch rotates the
+            # control binding generation while this lane is still working;
+            # keep the completed work, but suppress every remaining outbound
+            # surface (final text, voice, media, and trailing footer).
+            if not self._is_codex_delivery_current(
+                source,
+                _codex_delivery_grant,
+            ):
+                logger.info(
+                    "Suppressing completed Codex lane output after binding "
+                    "transition: session=%s lane=%s",
+                    session_key or "?",
+                    source.session_lane or "?",
+                )
+                return None
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -14633,6 +16387,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception:
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+            if not self._is_codex_delivery_current(
+                source,
+                _codex_delivery_grant,
+            ):
+                logger.info(
+                    "Suppressing stale Codex lane error after binding "
+                    "transition: session=%s lane=%s",
+                    session_key or "?",
+                    source.session_lane or "?",
+                )
+                return None
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
             status_hint = ""
@@ -15617,7 +17382,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         adapter,
     ) -> None:
-        """Extract explicit MEDIA: tags from a response and deliver them.
+        """Extract explicit attachment requests from a streamed response.
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
@@ -15625,13 +17390,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Unlike the non-streaming path in ``gateway/platforms/base.py`` (which
         also auto-detects bare local paths via ``extract_local_files``), this
-        post-stream rescan is EXPLICIT-ONLY. The visible reply has already
-        been streamed verbatim, so a bare path string here was either (a)
-        already shown to the user as text, or (b) stale tool/inspected
-        content that was never part of the intended visible reply. Promoting
-        such paths into uploads after the fact sent files the model never
-        asked to deliver (#20834). Only ``MEDIA:`` directives — the explicit
-        attachment contract — trigger post-stream uploads.
+        post-stream rescan is EXPLICIT-ONLY. ``MEDIA:`` directives and local
+        Markdown image embeds both unambiguously request an attachment. A bare
+        path string, however, was either already shown as text or came from
+        stale tool/inspected content; promoting those paths after the fact sent
+        files the model never asked to deliver (#20834).
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
@@ -15647,6 +17410,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            _cleaned, local_markdown_images = (
+                GatewayRunner._extract_local_markdown_images(cleaned)
+            )
             # Strip image URLs from the cleaned text for parity with the
             # non-streaming chain, but do NOT run extract_local_files here:
             # post-stream delivery is explicit-only (#20834). Bare local paths
@@ -15663,20 +17429,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (e.g. Signal's multi-attachment RPC). When [[as_document]] was
             # set, image-extension files skip the photo path and route to
             # send_document below — preserving original bytes.
-            image_paths: list = []
+            image_uploads: list[tuple[str, str]] = []
             non_image_media: list = []
             for media_path, is_voice in media_files:
                 ext = Path(media_path).suffix.lower()
                 if (ext in _IMAGE_EXTS
                         and not is_voice
                         and not force_document_attachments):
-                    image_paths.append(media_path)
+                    image_uploads.append((media_path, ""))
                 else:
                     non_image_media.append((media_path, is_voice))
 
-            if image_paths:
+            for image_path, alt_text in local_markdown_images:
+                if force_document_attachments:
+                    non_image_media.append((image_path, False))
+                elif not any(
+                    path == image_path for path, _alt in image_uploads
+                ):
+                    image_uploads.append((image_path, alt_text))
+
+            if image_uploads:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [
+                        (f"file://{_quote(path)}", alt_text)
+                        for path, alt_text in image_uploads
+                    ]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -19708,6 +21485,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        codex_delivery_grant: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -19746,6 +21524,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
+
+        def _delivery_still_current() -> bool:
+            return _run_still_current() and self._is_codex_delivery_current(
+                source,
+                codex_delivery_grant,
+            )
 
         # Build messages in OpenAI chat format --------------------------
         #
@@ -19848,7 +21632,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         metadata=_thread_metadata,
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
-                        run_still_current=_run_still_current,
+                        run_still_current=_delivery_still_current,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -19860,7 +21644,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Send typing indicator
         _adapter = self._adapter_for_source(source)
-        if _adapter:
+        if _adapter and _delivery_still_current():
             try:
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
@@ -20012,6 +21796,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        codex_resume_thread_id: Optional[str] = None,
+        codex_new_thread_cwd: Optional[str] = None,
+        codex_delivery_grant: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -20030,6 +21817,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                codex_resume_thread_id=codex_resume_thread_id,
+                codex_new_thread_cwd=codex_new_thread_cwd,
+                codex_delivery_grant=codex_delivery_grant,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -20041,6 +21831,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                codex_resume_thread_id=codex_resume_thread_id,
+                codex_new_thread_cwd=codex_new_thread_cwd,
+                codex_delivery_grant=codex_delivery_grant,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -20162,6 +21955,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        codex_resume_thread_id: Optional[str] = None,
+        codex_new_thread_cwd: Optional[str] = None,
+        codex_delivery_grant: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20186,15 +21982,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                codex_delivery_grant=codex_delivery_grant,
             )
 
         from run_agent import AIAgent
         import queue
 
+        # Filled by the app-server turn-start callback. The authority itself
+        # is thread-safe because this callback runs in the agent executor while
+        # the mirror watcher runs on the gateway event loop.
+        _codex_direct_turn_claims: set[str] = set()
+
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
+
+        def _delivery_still_current() -> bool:
+            return _run_still_current() and self._is_codex_delivery_current(
+                source,
+                codex_delivery_grant,
+            )
+
+        async def _await_if_delivery_current(factory):
+            """Re-check delivery authority on the event loop before platform I/O."""
+            if not _delivery_still_current():
+                return None
+            return await factory()
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
@@ -20330,6 +22144,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
         )
+        _interim_commentary_language = str(
+            resolve_display_setting(
+                user_config,
+                platform_key,
+                "interim_commentary_language",
+                "all",
+            )
+            or "all"
+        ).strip().lower()
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
@@ -20378,7 +22201,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             """tool_start_callback: speak a one-time ack in the voice channel."""
             if _voice_ack_fired[0] or _voice_ack_guild[0] is None:
                 return
-            if not _run_still_current():
+            if not _delivery_still_current():
                 return
             _voice_ack_fired[0] = True
             _adapter = self.adapters.get(Platform.DISCORD)
@@ -20386,7 +22209,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             try:
                 safe_schedule_threadsafe(
-                    _adapter.play_ack_in_voice(_voice_ack_guild[0]),
+                    _await_if_delivery_current(
+                        lambda: _adapter.play_ack_in_voice(
+                            _voice_ack_guild[0]
+                        )
+                    ),
                     _voice_ack_loop,
                     logger=logger,
                     log_message="voice ack scheduling error",
@@ -20431,14 +22258,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and tool_name != "_thinking"
             ):
                 try:
-                    if event_type == "tool.started" and tool_name and _run_still_current():
+                    if (
+                        event_type == "tool.started"
+                        and tool_name
+                        and _delivery_still_current()
+                    ):
                         from agent.display import build_status_phrase
                         _phrase = build_status_phrase(
                             tool_name,
                             args if _live_status_mode == "full" else None,
                         )
                         _live_status_adapter.set_status_text(source.chat_id, _phrase)
-                    elif event_type == "tool.completed":
+                    elif (
+                        event_type == "tool.completed"
+                        and _delivery_still_current()
+                    ):
                         # Between tools the model is genuinely "thinking"
                         # again — revert to the static default.
                         _live_status_adapter.set_status_text(source.chat_id, None)
@@ -20454,7 +22288,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
                 if not progress_queue:
                     return
-            if not progress_queue or not _run_still_current():
+            if not progress_queue or not _delivery_still_current():
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -20923,7 +22757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             while True:
                 try:
-                    if not _run_still_current():
+                    if not _delivery_still_current():
                         while not progress_queue.empty():
                             try:
                                 progress_queue.get_nowait()
@@ -20976,7 +22810,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if await _roll_progress_overflow_if_needed():
                         _last_edit_ts = time.monotonic()
                         await asyncio.sleep(0.3)
-                        if _run_still_current():
+                        if _delivery_still_current():
                             await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
                         continue
 
@@ -20993,7 +22827,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await asyncio.sleep(_remaining)
                         continue
 
-                    if not _run_still_current():
+                    if not _delivery_still_current():
                         return
 
                     if can_edit and progress_msg_id is not None:
@@ -21062,12 +22896,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     # Restore typing indicator
                     await asyncio.sleep(0.3)
-                    if _run_still_current():
+                    if _delivery_still_current():
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
+                    if not _delivery_still_current():
+                        while not progress_queue.empty():
+                            try:
+                                progress_queue.get_nowait()
+                            except Exception:
+                                break
+                        return
                     # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
@@ -21184,7 +23025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ) if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter or not _run_still_current():
+            if not _status_adapter or not _delivery_still_current():
                 return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
@@ -21200,7 +23041,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
+                _await_if_delivery_current(
+                    lambda: _send_or_update_status_coro(
+                        _status_adapter,
+                        _status_chat_id,
+                        event_type,
+                        prepared_message,
+                        _status_thread_metadata,
+                    )
+                ),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",
@@ -21373,20 +23222,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             ),
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
-                            run_still_current=_run_still_current,
+                            run_still_current=_delivery_still_current,
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
+                                if _delivery_still_current():
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                if not _run_still_current():
+                if not _delivery_still_current():
                     return
                 display_text = text
+                if (
+                    source.platform == Platform.TELEGRAM
+                    and _interim_commentary_language == "korean"
+                    and not _telegram_interim_commentary_visible(display_text)
+                ):
+                    return
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -21396,10 +23251,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if already_streamed or not _status_adapter or not str(display_text or "").strip():
                     return
                 safe_schedule_threadsafe(
-                    _status_adapter.send(
-                        _status_chat_id,
-                        display_text,
-                        metadata=_status_thread_metadata,
+                    _await_if_delivery_current(
+                        lambda: _status_adapter.send(
+                            _status_chat_id,
+                            display_text,
+                            metadata=_status_thread_metadata,
+                        )
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -21709,7 +23566,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # clear). The clear callback is a no-op: a sent platform message
             # can't be cleanly retracted, and the band already fired once.
             def _notice_callback_sync(notice) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _status_adapter or not _delivery_still_current():
                     return
                 try:
                     line = render_notice_line(notice)
@@ -21719,7 +23576,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not line:
                     return
                 safe_schedule_threadsafe(
-                    self._deliver_platform_notice(source, line),
+                    _await_if_delivery_current(
+                        lambda: self._deliver_platform_notice(source, line)
+                    ),
                     _loop_for_step,
                     logger=logger,
                     log_message="notice_callback delivery scheduling error",
@@ -21729,6 +23588,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
+            # Only explicit per-session slash-command selections are sent to
+            # Codex. Omitting these fields preserves model/effort chosen in the
+            # desktop app; turn/start persists explicit overrides for later
+            # turns on that Codex thread.
+            _codex_model_override = (
+                (getattr(self, "_session_model_overrides", {}) or {}).get(
+                    session_key
+                )
+                or {}
+            )
+            agent._codex_model_override = (
+                str(_codex_model_override.get("model") or "").strip() or None
+            )
+            _codex_reasoning_override = (
+                (getattr(self, "_session_reasoning_overrides", {}) or {}).get(
+                    session_key
+                )
+            )
+            if isinstance(_codex_reasoning_override, dict):
+                if _codex_reasoning_override.get("enabled") is False:
+                    agent._codex_reasoning_effort_override = "none"
+                else:
+                    agent._codex_reasoning_effort_override = (
+                        str(
+                            _codex_reasoning_override.get("effort") or ""
+                        ).strip().lower()
+                        or None
+                    )
+            else:
+                agent._codex_reasoning_effort_override = None
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
             # Must-deliver notes for THIS turn ride the current user message
@@ -21739,19 +23628,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent._gateway_turn_context_notes = "\n\n".join(
                 self._consume_pending_turn_sidecar_notes(session_key)
             )
+            if codex_new_thread_cwd:
+                # /ns creates the app-server thread lazily with the first
+                # message, so its project cwd must override the gateway
+                # process cwd before CodexAppServerSession is constructed.
+                agent.session_cwd = codex_new_thread_cwd
+            # /codex binds this gateway routing lane to a persisted Codex
+            # desktop thread. The caller resolves the binding before entering
+            # the worker thread so this function never reaches back into the
+            # mutable gateway SessionEntry. /codex selection evicts the cached
+            # agent, preventing a changed binding from reusing the old client.
+            agent._codex_resume_thread_id = codex_resume_thread_id
+            # A selected desktop thread may already be executing when a
+            # Telegram message arrives. Queue mode must preserve a real turn
+            # boundary here too; otherwise CodexAppServerSession's legacy
+            # resume path uses turn/steer and mutates the desktop turn.
+            agent._codex_resume_active_turn_mode = (
+                "queue" if self._busy_input_mode == "queue" else "steer"
+            )
+            agent._codex_turn_started_callback = None
+            if codex_resume_thread_id and session_key:
+                def _record_hermes_codex_turn(
+                    thread_id: str,
+                    turn_id: str,
+                ) -> None:
+                    if str(thread_id) != str(codex_resume_thread_id):
+                        return
+                    if self._get_codex_delivery_authority().acquire_direct_turn(
+                        codex_delivery_grant,
+                        turn_id,
+                    ):
+                        _codex_direct_turn_claims.add(str(turn_id))
+                    self._record_codex_mirror_turn_marker(
+                        source=source,
+                        session_key=session_key,
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        list_key="mirror_hermes_turn_ids",
+                    )
+
+                agent._codex_turn_started_callback = (
+                    _record_hermes_codex_turn
+                )
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _status_adapter or not _delivery_still_current():
                     return
                 safe_schedule_threadsafe(
-                    _status_adapter.send(
-                        _status_chat_id,
-                        message,
-                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                    _await_if_delivery_current(
+                        lambda: _status_adapter.send(
+                            _status_chat_id,
+                            message,
+                            metadata=_non_conversational_metadata(
+                                _status_thread_metadata,
+                                platform=source.platform,
+                            ),
+                        )
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -21768,7 +23704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _status_adapter or not _delivery_still_current():
                     return
                 if not _bg_review_release.is_set():
                     with _bg_review_pending_lock:
@@ -22414,6 +24350,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    **_codex_result_identity(result),
                 }
 
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -22545,6 +24482,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # self-persisted (it didn't — see codex_runtime.py).  Default
                 # True preserves the skip-db behaviour for the standard runtime.
                 "agent_persisted": (result_holder[0].get("agent_persisted", True) if result_holder[0] else True),
+                # /ns promotion needs the exact ids produced by thread/start
+                # and turn/start. Preserve them through the gateway envelope
+                # instead of silently dropping them after a successful turn.
+                **_codex_result_identity(result_holder[0]),
             }
         
         # Start progress message sender if enabled. Gate on needs_progress_queue
@@ -22799,6 +24740,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
             return False
 
+        response = None
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -23323,6 +25265,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    codex_resume_thread_id=codex_resume_thread_id,
+                    codex_new_thread_cwd=codex_new_thread_cwd,
+                    codex_delivery_grant=codex_delivery_grant,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -23361,6 +25306,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await stream_task
                         except asyncio.CancelledError:
                             pass
+
+            # Once Hermes has received a successful Codex completion, its
+            # direct delivery path (streaming or the delivery-obligation
+            # ledger below it) owns the final response. Persist that ownership
+            # before releasing the execution lane. Otherwise the desktop
+            # mirror can observe an inactive lane during this unwind and send
+            # a second combined question/progress/answer transcript.
+            _completed_result = (
+                response
+                if isinstance(response, dict)
+                else (
+                    result_holder[0]
+                    if isinstance(result_holder[0], dict)
+                    else None
+                )
+            )
+            try:
+                if _codex_result_is_successful_completion(_completed_result):
+                    self._record_codex_mirror_turn_marker(
+                        source=source,
+                        session_key=session_key or "",
+                        thread_id=str(
+                            _completed_result.get("codex_thread_id")
+                            or codex_resume_thread_id
+                            or ""
+                        ),
+                        turn_id=str(
+                            _completed_result.get("codex_turn_id") or ""
+                        ),
+                        list_key="mirror_hermes_completed_turn_ids",
+                    )
+            finally:
+                # Release after marker persistence. A mirror that observes the
+                # release re-reads that marker before deciding to send; failed
+                # turns have no marker and are deliberately handed off.
+                authority = self._get_codex_delivery_authority()
+                for direct_turn_id in tuple(_codex_direct_turn_claims):
+                    authority.release_direct_turn(
+                        codex_delivery_grant,
+                        direct_turn_id,
+                    )
+                _codex_direct_turn_claims.clear()
             
             # Clean up tracking
             tracking_task.cancel()

@@ -133,11 +133,18 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
+    CommandDef("model", "사용 모델 선택 및 변경", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
+    CommandDef("codex-session", "Attach this chat to a recent Codex desktop session",
+               "Session", aliases=("세션", "codex", "codex_session"),
+               args_hint="[off|refresh]", gateway_only=True),
+    CommandDef("ns", "새 Codex 세션을 프로젝트에서 시작",
+               "Session", args_hint="[number|refresh]", gateway_only=True),
+    CommandDef("sc", "Put both Windows monitors into standby", "Session",
+               gateway_only=True),
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
@@ -157,7 +164,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("on", "off", "status")),
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
-    CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
+    CommandDef("reasoning", "추론 강도 선택 및 변경", "Configuration",
                args_hint="[level|show|hide|full|clamp] [--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
@@ -558,15 +565,20 @@ _TELEGRAM_BOT_API_MAX_COMMANDS = 100
 _TELEGRAM_PRIORITY_MODES = {"prepend", "append", "replace"}
 
 _TELEGRAM_MENU_PRIORITY = (
-    # Most-typed everyday commands first.
+    # Codex mobile-control commands stay at the very top.
+    "codex_session",
+    "ns",
+    "model",
+    "reasoning",
+    # Most-typed everyday commands next.
     "help",
     "new",
     "stop",
     "status",
+    "sc",
     "egress",
     "resume",
     "sessions",
-    "model",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
     "restart",
@@ -580,7 +592,6 @@ _TELEGRAM_MENU_PRIORITY = (
     "steer",
     "background",
     # Lower-priority but still useful operational built-ins.
-    "reasoning",
     "usage",
     "platforms",
     "platform",
@@ -1172,7 +1183,15 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress"})
+#   - codex-session: mobile/Telegram session picker; reachable as
+#     /hermes codex-session on Slack without displacing an existing command.
+#   - sc: host-specific Windows monitor shortcut; kept out of Slack's native
+#     slots so adding it to Telegram cannot displace a cross-platform command.
+#   - version: available through /hermes version on Slack without consuming
+#     another native slot at Slack's 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "codex-session", "sc", "version"
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

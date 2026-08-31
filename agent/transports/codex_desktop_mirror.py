@@ -260,7 +260,7 @@ class CodexDesktopRolloutTail:
             )
             return
 
-        if event_type != "task_complete":
+        if event_type not in {"task_complete", "turn_aborted"}:
             return
         turn_id = str(payload.get("turn_id") or "").strip()
         if not turn_id:
@@ -274,11 +274,20 @@ class CodexDesktopRolloutTail:
             turn_id,
             {"user_text": "", "progress": [], "final_text": ""},
         )
-        final_text = payload.get("last_agent_message")
-        final_text = (
-            final_text.strip() if isinstance(final_text, str) else ""
-        )
-        error_text = self._task_error_text(payload.get("error"))
+        if event_type == "turn_aborted":
+            # Codex persists an explicit terminal event when an interrupt,
+            # timeout, or external teardown stops a turn. Treat it as a
+            # completed error snapshot so the mirror preserves the accumulated
+            # commentary, removes the misleading "working" state, and advances
+            # its cursor instead of resurrecting the turn forever on reattach.
+            final_text = ""
+            error_text = "Codex 작업이 완료되기 전에 중단되었습니다."
+        else:
+            final_text = payload.get("last_agent_message")
+            final_text = (
+                final_text.strip() if isinstance(final_text, str) else ""
+            )
+            error_text = self._task_error_text(payload.get("error"))
         if user_seen and (final_text or error_text):
             details["final_text"] = final_text
             details["error_text"] = error_text

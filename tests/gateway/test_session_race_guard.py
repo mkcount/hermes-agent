@@ -197,6 +197,41 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
         await task1
 
 
+@pytest.mark.asyncio
+async def test_different_internal_session_lanes_run_concurrently():
+    """Two Codex threads selected from one Telegram DM must not share a lock."""
+    runner = _make_runner()
+    event_a = _make_event(text="work in A")
+    event_b = _make_event(text="work in B")
+    event_a.source.session_lane = "desktop-thread-a"
+    event_b.source.session_lane = "desktop-thread-b"
+    key_a = build_session_key(event_a.source)
+    key_b = build_session_key(event_b.source)
+    release = asyncio.Event()
+    started = set()
+
+    async def slow_inner(self_inner, ev, src, qk, generation):
+        started.add(qk)
+        await release.wait()
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
+        task_a = asyncio.create_task(runner._handle_message(event_a))
+        task_b = asyncio.create_task(runner._handle_message(event_b))
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if started == {key_a, key_b}:
+                break
+
+        assert key_a != key_b
+        assert started == {key_a, key_b}
+        assert runner._running_agents.get(key_a) is _AGENT_PENDING_SENTINEL
+        assert runner._running_agents.get(key_b) is _AGENT_PENDING_SENTINEL
+
+        release.set()
+        await asyncio.gather(task_a, task_b)
+
+
 def test_merge_pending_message_event_merges_text_and_photo_followups():
     pending = {}
     source = SessionSource(
@@ -335,8 +370,8 @@ async def test_command_messages_do_not_leave_sentinel():
 
 
 @pytest.mark.asyncio
-async def test_start_command_is_noop_and_does_not_show_help():
-    """Telegram /start is a platform ping; it must not dump /help output."""
+async def test_start_command_acknowledges_without_showing_help():
+    """Telegram /start gives a concise entry point without dumping /help."""
     runner = _make_runner()
     event = _make_event(text="/start")
     session_key = build_session_key(event.source)
@@ -345,14 +380,14 @@ async def test_start_command_is_noop_and_does_not_show_help():
 
     result = await runner._handle_message(event)
 
-    assert result == ""
+    assert "/세션" in result
     runner._handle_help_command.assert_not_awaited()
     assert session_key not in runner._running_agents
 
 
 @pytest.mark.asyncio
-async def test_start_command_is_noop_during_active_session():
-    """A mid-run /start must not interrupt the active agent or show commands."""
+async def test_start_command_acknowledges_during_active_session_without_interrupting():
+    """A mid-run /start acknowledges without interrupting the active agent."""
     runner = _make_runner()
     event = _make_event(text="/start")
     session_key = build_session_key(event.source)
@@ -364,7 +399,7 @@ async def test_start_command_is_noop_during_active_session():
 
     result = await runner._handle_message(event)
 
-    assert result == ""
+    assert "/세션" in result
     runner._handle_help_command.assert_not_awaited()
     fake_agent.interrupt.assert_not_called()
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages

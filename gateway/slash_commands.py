@@ -25,6 +25,7 @@ import re
 import shlex
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -2918,22 +2919,354 @@ class GatewaySlashCommandsMixin:
         self._evict_cached_agent(session_key)
         return t("gateway.reasoning.set_session", effort=value)
 
-    def _reasoning_picker_choices(self, current_effort: str) -> list:
-        """Build the choice list for the interactive /reasoning picker."""
-        from hermes_constants import VALID_REASONING_EFFORTS
+    async def _handle_codex_session_command(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Attach a messaging chat to one of the three recent desktop threads."""
+        from agent.transports.codex_app_server_session import (
+            CodexThreadSummary,
+            list_recent_codex_desktop_threads,
+        )
+        from agent.transports.codex_desktop_mirror import (
+            snapshot_codex_rollout_latest,
+        )
+        from gateway.run import _load_gateway_config
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        # The picker is the control plane for a Telegram chat, not a command
+        # inside whichever Codex execution lane is currently selected.
+        if getattr(source, "session_lane", None):
+            source = dataclasses.replace(source, session_lane=None)
+        session_key = self._session_key_for_source(source)
+        await self.async_session_store.get_or_create_session(source)
+        raw_args = event.get_command_args().strip()
+        arg = raw_args.lower()
+
+        async def _store_binding(summary: Optional[CodexThreadSummary]) -> str:
+            if summary is None:
+                saved = await self._store_codex_control_binding(
+                    session_key,
+                    None,
+                )
+                if not saved:
+                    return (
+                        "세션 연결 해제를 저장하지 못했습니다. "
+                        "/세션 해제를 다시 실행해 주세요."
+                    )
+                self._evict_cached_agent(session_key)
+                reset_mirror = getattr(
+                    self, "_reset_codex_desktop_mirror_state", None
+                )
+                if callable(reset_mirror):
+                    reset_mirror(session_key)
+                return "Codex 데스크톱 세션 연결을 해제했습니다."
+
+            binding = {
+                "thread_id": summary.thread_id,
+                "title": summary.title,
+                "cwd": summary.cwd,
+                "updated_at": summary.updated_at,
+            }
+            latest_answer = ""
+            try:
+                rollout_path, latest_completion = await asyncio.to_thread(
+                    snapshot_codex_rollout_latest,
+                    summary.thread_id,
+                    hinted_path=summary.path or None,
+                )
+                if rollout_path:
+                    binding["rollout_path"] = rollout_path
+                if latest_completion is not None:
+                    binding["mirror_cursor_turn_id"] = (
+                        latest_completion.turn_id
+                    )
+                    from agent.redact import redact_sensitive_text
+
+                    latest_answer = redact_sensitive_text(
+                        latest_completion.final_text
+                    ).strip()
+            except Exception:
+                logger.debug(
+                    "Could not snapshot Codex desktop mirror cursor for %s",
+                    summary.thread_id,
+                    exc_info=True,
+                )
+            saved = await self._store_codex_control_binding(
+                session_key,
+                binding,
+            )
+            if not saved:
+                return "세션 연결을 저장하지 못했습니다. /세션을 다시 실행해 주세요."
+            self._evict_cached_agent(session_key)
+            reset_mirror = getattr(
+                self, "_reset_codex_desktop_mirror_state", None
+            )
+            if callable(reset_mirror):
+                reset_mirror(session_key)
+            confirmation = (
+                f"✅ Codex 세션 연결됨: {summary.title[:100]}\n"
+                "이제 이 채팅의 다음 메시지부터 데스크톱과 같은 세션으로 이어집니다. "
+                "데스크톱에서 시작한 새 응답도 이 채팅으로 전달됩니다."
+            )
+            if not latest_answer:
+                return confirmation
+            return (
+                confirmation
+                + "\n\n🧾 마지막 답변\n\n"
+                + latest_answer
+            )
+
+        if arg in {"off", "detach", "disconnect", "해제"}:
+            return await _store_binding(None)
+
+        try:
+            cfg = _load_gateway_config() or {}
+            model_cfg = cfg.get("model") or {}
+            if model_cfg.get("openai_runtime") != "codex_app_server":
+                return (
+                    "Codex app-server runtime이 꺼져 있습니다. 먼저 "
+                    "`/codex-runtime codex_app_server`를 실행해 주세요."
+                )
+        except Exception:
+            pass
+
+        try:
+            threads = await asyncio.to_thread(
+                list_recent_codex_desktop_threads, limit=5
+            )
+        except Exception as exc:
+            logger.warning("Codex desktop thread listing failed: %s", exc)
+            return (
+                "최근 Codex 데스크톱 세션을 불러오지 못했습니다. "
+                "Codex 데스크톱 앱 또는 원격 app-server가 실행 중인지 확인해 주세요."
+            )
+        if not threads:
+            return "연결 가능한 최근 Codex 데스크톱 세션이 없습니다."
+
+        by_id = {item.thread_id: item for item in threads}
+        if arg and arg not in {"refresh", "새로고침"}:
+            selected = None
+            if arg.isdigit() and 1 <= int(arg) <= len(threads):
+                selected = threads[int(arg) - 1]
+            else:
+                selected = by_id.get(raw_args)
+            if selected is None:
+                return "사용법: /세션, /세션 1, 또는 /세션 해제"
+            return await _store_binding(selected)
+
+        current = await self.async_session_store.get_session_metadata(
+            session_key, "codex_desktop_thread", None
+        )
+        current_id = (
+            str(current.get("thread_id") or "")
+            if isinstance(current, dict)
+            else ""
+        )
+
+        def _button_label(index: int, summary: CodexThreadSummary) -> str:
+            folder = os.path.basename(summary.cwd.rstrip(os.sep)) if summary.cwd else ""
+            live = "● " if summary.status == "active" else ""
+            suffix = f" · {folder}" if folder else ""
+            label = f"{index}. {live}{summary.title}{suffix}"
+            return label if len(label) <= 52 else label[:49].rstrip() + "…"
 
         choices = [
             {
-                "value": "none",
-                "label": t("gateway.reasoning.choice_none"),
-                "is_current": current_effort == "none",
+                "value": summary.thread_id,
+                "label": _button_label(index, summary),
+                "is_current": summary.thread_id == current_id,
+                "full_width": True,
             }
+            for index, summary in enumerate(threads, 1)
         ]
-        for level in VALID_REASONING_EFFORTS:
+        if current_id:
+            choices.append(
+                {
+                    "value": "off",
+                    "label": "✕ 연결 해제",
+                    "is_current": False,
+                    "full_width": True,
+                }
+            )
+
+        async def _on_thread_selected(_chat_id: str, value: str) -> str:
+            if value == "off":
+                return await _store_binding(None)
+            summary = by_id.get(value)
+            if summary is None:
+                return "선택 항목이 만료됐습니다. /세션을 다시 실행해 주세요."
+            return await _store_binding(summary)
+
+        picker_sent = await self._try_send_choice_picker(
+            event,
+            session_key,
+            title=(
+                "📱 *Codex 데스크톱 세션 연결*\n\n"
+                "최근 대화 5개 중 이어갈 세션을 선택하세요. "
+                "● 표시는 현재 데스크톱에서 열린 세션입니다."
+            ),
+            choices=choices,
+            on_choice_selected=_on_thread_selected,
+        )
+        if picker_sent:
+            return None
+
+        lines = ["최근 Codex 데스크톱 세션:"]
+        for index, summary in enumerate(threads, 1):
+            live = " (활성)" if summary.status == "active" else ""
+            lines.append(f"{index}. {summary.title[:100]}{live}")
+        lines.append("\n`/세션 1`처럼 번호를 보내 선택할 수 있습니다.")
+        if current_id:
+            lines.append("연결 해제: `/세션 해제`")
+        return "\n".join(lines)
+
+    async def _handle_codex_new_session_command(
+        self, event: MessageEvent
+    ) -> Optional[str]:
+        """Create and attach a fresh Codex thread in a selected project."""
+        from agent.transports.codex_app_server_session import (
+            CodexProjectSummary,
+            list_recent_codex_desktop_projects,
+        )
+        from gateway.run import _load_gateway_config
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        if getattr(source, "session_lane", None):
+            source = dataclasses.replace(source, session_lane=None)
+        session_key = self._session_key_for_source(source)
+        await self.async_session_store.get_or_create_session(source)
+        raw_args = event.get_command_args().strip()
+        arg = raw_args.lower()
+
+        try:
+            cfg = _load_gateway_config() or {}
+            model_cfg = cfg.get("model") or {}
+            if model_cfg.get("openai_runtime") != "codex_app_server":
+                return (
+                    "Codex app-server runtime이 꺼져 있습니다. 먼저 "
+                    "`/codex-runtime codex_app_server`를 실행해 주세요."
+                )
+        except Exception:
+            pass
+
+        try:
+            projects = await asyncio.to_thread(
+                list_recent_codex_desktop_projects,
+                limit=10,
+            )
+        except Exception as exc:
+            logger.warning("Codex desktop project listing failed: %s", exc)
+            return (
+                "Codex 프로젝트 목록을 불러오지 못했습니다. "
+                "Codex 데스크톱 앱 또는 원격 app-server 상태를 확인해 주세요."
+            )
+        if not projects:
+            return "새 세션을 시작할 수 있는 Codex 프로젝트가 없습니다."
+
+        by_cwd = {project.cwd: project for project in projects}
+
+        async def _reserve_and_attach(project: CodexProjectSummary) -> str:
+            # An empty app-server thread has no rollout and cannot be resumed
+            # after its creating connection closes. Reserve a unique delivery
+            # lane now; the next ordinary Telegram message creates the real
+            # thread and its first turn in one live app-server session.
+            pending_thread_id = f"pending_ns_{uuid.uuid4().hex}"
+            binding = {
+                "thread_id": pending_thread_id,
+                "title": f"새 대화 · {project.name}",
+                "cwd": project.cwd,
+                "updated_at": int(time.time()),
+                "pending_new": True,
+            }
+            saved = await self._store_codex_control_binding(
+                session_key,
+                binding,
+            )
+            if not saved:
+                return "새 Codex 세션 예약을 저장하지 못했습니다. /ns를 다시 실행해 주세요."
+            self._evict_cached_agent(session_key)
+            reset_mirror = getattr(
+                self, "_reset_codex_desktop_mirror_state", None
+            )
+            if callable(reset_mirror):
+                reset_mirror(session_key)
+            return (
+                f"✅ 새 Codex 세션 준비됨: {project.name}\n"
+                "이제 보낼 메시지와 동시에 새 세션이 생성되고, 그 메시지가 "
+                "첫 지시가 됩니다. 생성된 세션은 Codex 데스크톱 앱에도 표시됩니다."
+            )
+
+        if arg and arg not in {"refresh", "새로고침"}:
+            if not arg.isdigit() or not (1 <= int(arg) <= len(projects)):
+                return "사용법: /ns 또는 /ns 1"
+            return await _reserve_and_attach(projects[int(arg) - 1])
+
+        def _button_label(index: int, project: CodexProjectSummary) -> str:
+            label = f"{index}. {project.name} · {project.cwd}"
+            return label if len(label) <= 52 else label[:49].rstrip() + "…"
+
+        choices = [
+            {
+                "value": project.cwd,
+                "label": _button_label(index, project),
+                "is_current": False,
+                "full_width": True,
+            }
+            for index, project in enumerate(projects, 1)
+        ]
+
+        async def _on_project_selected(_chat_id: str, value: str) -> str:
+            project = by_cwd.get(value)
+            if project is None:
+                return "선택 항목이 만료됐습니다. /ns를 다시 실행해 주세요."
+            return await _reserve_and_attach(project)
+
+        picker_sent = await self._try_send_choice_picker(
+            event,
+            session_key,
+            title=(
+                "🆕 *새 Codex 세션*\n\n"
+                "새 대화를 시작할 프로젝트를 선택하세요."
+            ),
+            choices=choices,
+            on_choice_selected=_on_project_selected,
+        )
+        if picker_sent:
+            return None
+
+        lines = ["새 Codex 세션을 시작할 프로젝트:"]
+        for index, project in enumerate(projects, 1):
+            lines.append(f"{index}. {project.name} — {project.cwd}")
+        lines.append("\n`/ns 1`처럼 번호를 보내 선택할 수 있습니다.")
+        return "\n".join(lines)
+
+    def _reasoning_picker_choices(
+        self,
+        current_effort: str,
+        allowed_efforts: Optional[list[str]] = None,
+    ) -> list:
+        """Build the choice list for the interactive /reasoning picker."""
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        levels = (
+            [str(value).strip().lower() for value in allowed_efforts]
+            if allowed_efforts is not None
+            else ["none", *VALID_REASONING_EFFORTS]
+        )
+        choices = []
+        for level in levels:
             choices.append(
                 {
                     "value": level,
-                    "label": level,
+                    "label": (
+                        t("gateway.reasoning.choice_none")
+                        if level == "none"
+                        else level
+                    ),
                     "is_current": level == current_effort,
                 }
             )
@@ -2995,7 +3328,7 @@ class GatewaySlashCommandsMixin:
             /reasoning show|on               Show model reasoning in responses
             /reasoning hide|off              Hide model reasoning from responses
         """
-        from gateway.run import _platform_config_key
+        from gateway.run import _load_gateway_config, _platform_config_key
 
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
@@ -3007,9 +3340,40 @@ class GatewaySlashCommandsMixin:
         self._show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
         # config default) so per-model reasoning_overrides display correctly.
+        self._rehydrate_session_model_override(session_key)
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
         )
+        _codex_allowed_efforts: Optional[list[str]] = None
+        try:
+            _gateway_cfg = _load_gateway_config() or {}
+            _model_cfg = _gateway_cfg.get("model") or {}
+            if not _session_model and isinstance(_model_cfg, dict):
+                _session_model = str(
+                    _model_cfg.get("default")
+                    or _model_cfg.get("model")
+                    or ""
+                )
+            if (
+                isinstance(_model_cfg, dict)
+                and _model_cfg.get("openai_runtime") == "codex_app_server"
+                and _session_model
+            ):
+                from agent.transports.codex_app_server_session import (
+                    list_codex_model_reasoning_efforts,
+                )
+
+                _codex_allowed_efforts = await asyncio.to_thread(
+                    list_codex_model_reasoning_efforts,
+                    _session_model,
+                )
+                if not _codex_allowed_efforts:
+                    _codex_allowed_efforts = None
+        except Exception:
+            logger.debug(
+                "Could not load Codex reasoning capabilities",
+                exc_info=True,
+            )
         self._reasoning_config = self._resolve_session_reasoning_config(
             source=event.source,
             session_key=session_key,
@@ -3058,7 +3422,10 @@ class GatewaySlashCommandsMixin:
                     scope=scope,
                     display=display_state,
                 ),
-                choices=self._reasoning_picker_choices(current_effort),
+                choices=self._reasoning_picker_choices(
+                    current_effort,
+                    _codex_allowed_efforts,
+                ),
                 on_choice_selected=_on_reasoning_choice,
             )
             if picker_sent:
@@ -3069,6 +3436,24 @@ class GatewaySlashCommandsMixin:
                 level=level,
                 scope=scope,
                 display=display_state,
+            )
+
+        # Reject unsupported Codex efforts now instead of failing the next
+        # turn/start request after the user has already sent a real prompt.
+        if (
+            _codex_allowed_efforts is not None
+            and args in {
+                "none", "minimal", "low", "medium",
+                "high", "xhigh", "max", "ultra",
+            }
+            and args not in _codex_allowed_efforts
+        ):
+            supported = ", ".join(
+                f"`{item}`" for item in _codex_allowed_efforts
+            )
+            return (
+                f"⚠️ `{_session_model}`에서 지원하지 않는 추론 강도입니다: "
+                f"`{args}`\n지원: {supported}"
             )
 
         # Typed argument path — same applier the picker uses.

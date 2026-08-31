@@ -138,6 +138,25 @@ class TestAgentMessageProjection:
         assert r.messages == [{"role": "assistant", "content": "hi there"}]
         assert r.is_tool_iteration is False
 
+    def test_commentary_is_not_promoted_to_final_text(self) -> None:
+        p = CodexEventProjector()
+        r = p.project({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "x",
+                                "phase": "commentary", "text": "working..."}},
+        })
+        assert r.messages == [{"role": "assistant", "content": "working..."}]
+        assert r.final_text is None
+
+    def test_final_answer_phase_is_terminal(self) -> None:
+        p = CodexEventProjector()
+        r = p.project({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "x",
+                                "phase": "final_answer", "text": "done"}},
+        })
+        assert r.final_text == "done"
+
     def test_pending_reasoning_attaches_to_next_assistant_message(self) -> None:
         p = CodexEventProjector()
         # First a reasoning item lands
@@ -264,6 +283,14 @@ class TestHelpers:
         b = _deterministic_call_id("exec", "")
         assert a == b
         assert "exec" in a
+
+    def test_deterministic_call_id_compacts_oversized_values(self) -> None:
+        a = _deterministic_call_id("mcp__very_long_server__very_long_tool", "x" * 80)
+        b = _deterministic_call_id("mcp__very_long_server__very_long_tool", "x" * 80)
+        c = _deterministic_call_id("mcp__very_long_server__very_long_tool", "y" * 80)
+        assert len(a) <= 64
+        assert a == b
+        assert a != c
 
     def test_format_tool_args_sorted_keys(self) -> None:
         # Sorted keys = deterministic across replays = prefix cache stays valid

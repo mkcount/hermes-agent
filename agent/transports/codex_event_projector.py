@@ -42,9 +42,19 @@ def _deterministic_call_id(item_type: str, item_id: str) -> str:
     prefix caches stay valid. See AGENTS.md Pitfall #16 (deterministic IDs in
     tool call history)."""
     if item_id:
-        return f"codex_{item_type}_{item_id}"
-    digest = hashlib.sha256(f"{item_type}".encode()).hexdigest()[:16]
-    return f"codex_{item_type}_{digest}"
+        candidate = f"codex_{item_type}_{item_id}"
+    else:
+        digest = hashlib.sha256(f"{item_type}".encode()).hexdigest()[:16]
+        candidate = f"codex_{item_type}_{digest}"
+
+    # OpenAI tool-call ids are limited to 64 characters. Codex item ids are
+    # usually UUIDs, but MCP/dynamic items can contain a long namespaced type
+    # as well. Preserve the historical value when it already fits so replayed
+    # prefix caches remain stable; only compact oversized ids.
+    if len(candidate) <= 64:
+        return candidate
+    digest = hashlib.sha256(candidate.encode()).hexdigest()[:24]
+    return f"{candidate[:39]}_{digest}"
 
 
 def _format_tool_args(d: dict) -> str:
@@ -63,7 +73,7 @@ class ProjectionResult:
 
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
-    final_text: Optional[str] = None  # Set when an agentMessage completes
+    final_text: Optional[str] = None  # Set only for a terminal agentMessage
 
 
 class CodexEventProjector:
@@ -122,7 +132,17 @@ class CodexEventProjector:
         if self._pending_reasoning:
             msg["reasoning"] = "\n".join(self._pending_reasoning)
             self._pending_reasoning = []
-        return ProjectionResult(messages=[msg], final_text=text)
+        # Modern Codex emits both progress commentary and the terminal answer
+        # as agentMessage items. Treating every completed item as final caused
+        # Hermes to promote a Telegram progress update when a turn timed out or
+        # was interrupted. Older app-server builds did not include ``phase``,
+        # so retain the legacy terminal interpretation only when it is absent.
+        phase = str(item.get("phase") or "").strip().lower()
+        is_terminal = not phase or phase in {"final", "final_answer", "finalanswer"}
+        return ProjectionResult(
+            messages=[msg],
+            final_text=text if is_terminal else None,
+        )
 
     def _project_user_message(self, item: dict) -> ProjectionResult:
         # codex's userMessage content is a list of UserInput variants. For
