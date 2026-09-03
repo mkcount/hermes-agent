@@ -732,6 +732,15 @@ def build_session_context_prompt(
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+PERSISTABLE_REASONING_EFFORTS = {
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+}
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -749,6 +758,20 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
     return cleaned or None
+
+
+def sanitize_reasoning_override(
+    override: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the small, validated subset safe for ``sessions.json``."""
+    if not isinstance(override, dict):
+        return None
+    if override.get("enabled") is False:
+        return {"enabled": False}
+    effort = str(override.get("effort") or "").strip().lower()
+    if effort not in PERSISTABLE_REASONING_EFFORTS:
+        return None
+    return {"enabled": True, "effort": effort}
 
 
 @dataclass
@@ -842,6 +865,11 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Session-scoped /reasoning override. Like model_override, this must
+    # survive gateway restarts; otherwise a bound Codex thread keeps using the
+    # app-server effort while Telegram reports the unrelated global default.
+    reasoning_override: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -879,6 +907,10 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.reasoning_override:
+            result["reasoning_override"] = sanitize_reasoning_override(
+                self.reasoning_override
+            )
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -952,6 +984,9 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
+            reasoning_override=sanitize_reasoning_override(
+                data.get("reasoning_override")
+            ),
         )
 
 
@@ -1916,6 +1951,7 @@ class SessionStore:
                 # persisted /model override too so a later message doesn't
                 # rehydrate it after the in-memory override was popped.
                 entry.model_override = None
+                entry.reasoning_override = None
             self._save()
         if self._db:
             setter = getattr(self._db, "set_expiry_finalized", None)
@@ -2738,6 +2774,36 @@ class SessionStore:
             if entry is None:
                 return None
             return dict(entry.model_override) if entry.model_override else None
+
+    def set_reasoning_override(
+        self, session_key: str, override: Optional[Dict[str, Any]]
+    ) -> None:
+        """Persist or clear a validated session-scoped /reasoning override."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            cleaned = sanitize_reasoning_override(override)
+            if entry.reasoning_override == cleaned:
+                return
+            entry.reasoning_override = cleaned
+            self._save()
+
+    def get_reasoning_override(
+        self, session_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the persisted /reasoning override for one session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            return (
+                dict(entry.reasoning_override)
+                if entry.reasoning_override
+                else None
+            )
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.

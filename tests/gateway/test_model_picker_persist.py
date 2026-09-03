@@ -19,6 +19,8 @@ callback and assert ``config.yaml`` is (or isn't) updated — exercising the exa
 closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
+import dataclasses
+import json
 import types
 
 import yaml
@@ -40,10 +42,12 @@ class _FakePickerAdapter:
 
     def __init__(self):
         self.captured_callback = None
+        self.captured_kwargs = None
 
     async def send_model_picker(self, *, on_model_selected, **kwargs):
         # Stash the closure the handler built so the test can fire a "tap".
         self.captured_callback = on_model_selected
+        self.captured_kwargs = kwargs
         return types.SimpleNamespace(success=True)
 
 
@@ -156,6 +160,95 @@ async def _drive_picker(runner, event):
     assert adapter.captured_callback is not None, "picker callback was not wired"
     # Simulate the user tapping "gpt-5.5" under the openrouter provider.
     return await adapter.captured_callback("12345", "gpt-5.5", "openrouter")
+
+
+@pytest.mark.asyncio
+async def test_bound_codex_picker_uses_only_app_server_models(
+    tmp_path, monkeypatch
+):
+    import gateway.run as gateway_run
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "gpt-config-default",
+                    "provider": "openai-codex",
+                    "openai_runtime": "codex_app_server",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.list_codex_models",
+        lambda: ["gpt-5.6-sol", "gpt-5.6-luna"],
+    )
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "09"
+        / "03"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-5.6-sol",
+                    "effort": "xhigh",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    adapter = _FakePickerAdapter()
+    runner = _make_runner(adapter)
+    event = _make_event("/model")
+    event.source = dataclasses.replace(
+        event.source, session_lane=thread_id
+    )
+    event.metadata["codex_desktop_binding_snapshot"] = {
+        "thread_id": thread_id,
+        "rollout_path": str(rollout),
+    }
+
+    result = await runner._handle_model_command(event)
+
+    assert result is None
+    assert adapter.captured_kwargs["current_model"] == "gpt-5.6-sol"
+    assert adapter.captured_kwargs["current_provider"] == "openai-codex"
+    assert adapter.captured_kwargs["providers"] == [
+        {
+            "slug": "openai-codex",
+            "name": "OpenAI Codex",
+            "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+            "total_models": 2,
+            "is_current": True,
+        }
+    ]
+
+    blocked_event = _make_event(
+        "/model gpt-5.6-sol --provider openrouter"
+    )
+    blocked_event.source = dataclasses.replace(
+        blocked_event.source, session_lane=thread_id
+    )
+    blocked_event.metadata["codex_desktop_binding_snapshot"] = {
+        "thread_id": thread_id,
+        "rollout_path": str(rollout),
+    }
+    blocked = await runner._handle_model_command(blocked_event)
+    assert "/세션 해제" in blocked
 
 
 @pytest.mark.asyncio

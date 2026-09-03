@@ -3,6 +3,7 @@ from pathlib import Path
 
 from agent.transports.codex_desktop_mirror import (
     CodexDesktopRolloutTail,
+    read_codex_rollout_runtime_state,
     resolve_codex_rollout_path,
     snapshot_codex_rollout,
     snapshot_codex_rollout_latest,
@@ -291,6 +292,70 @@ def test_initial_scan_exposes_current_incomplete_turn_snapshot(tmp_path):
         "첫 번째 누적 보고",
         "두 번째 누적 보고",
     ]
+
+
+def test_new_turn_implicitly_aborts_unfinished_previous_turn(tmp_path):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = _rollout(tmp_path, thread_id)
+    path.write_text(
+        _event({"type": "task_started", "turn_id": "orphan-turn"})
+        + _event({"type": "user_message", "message": "중단된 질문"})
+        + _event(
+            {
+                "type": "agent_message",
+                "phase": "commentary",
+                "message": "중단 전 진행 보고",
+            }
+        )
+        + _turn("newer-turn", final_text="최신 완료 답변"),
+        encoding="utf-8",
+    )
+
+    completions, updates = CodexDesktopRolloutTail(
+        thread_id, path
+    ).scan_with_updates()
+
+    assert [item.turn_id for item in completions] == [
+        "orphan-turn",
+        "newer-turn",
+    ]
+    assert "이전 작업이 중단" in completions[0].error_text
+    assert updates[-1].turn_id == "newer-turn"
+    assert updates[-1].completed is True
+    assert not any(
+        update.turn_id == "orphan-turn" and not update.completed
+        for update in updates[3:]
+    )
+
+
+def test_runtime_state_reads_latest_turn_context_from_rollout_tail(tmp_path):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = _rollout(tmp_path, thread_id)
+    def context(model, effort):
+        return json.dumps(
+            {
+                "type": "turn_context",
+                "payload": {"model": model, "effort": effort},
+            }
+        ) + "\n"
+    path.write_text(
+        context("gpt-old", "low")
+        + ("x" * 256)
+        + "\n"
+        + context("gpt-current", "XHIGH"),
+        encoding="utf-8",
+    )
+
+    state = read_codex_rollout_runtime_state(
+        thread_id,
+        hinted_path=str(path),
+        codex_home=str(tmp_path),
+        max_scan_bytes=160,
+    )
+
+    assert state is not None
+    assert state.model == "gpt-current"
+    assert state.reasoning_effort == "xhigh"
 
 
 def test_snapshot_and_path_resolution_stay_inside_codex_sessions(tmp_path):

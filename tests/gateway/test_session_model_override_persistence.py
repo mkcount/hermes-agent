@@ -25,6 +25,7 @@ from gateway.session import (
     SessionSource,
     SessionStore,
     sanitize_model_override,
+    sanitize_reasoning_override,
 )
 
 OVERRIDE = {
@@ -145,6 +146,7 @@ def _make_runner(store):
 
     runner = object.__new__(GatewayRunner)
     runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
     runner.session_store = store
     return runner
 
@@ -232,3 +234,42 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+
+
+def test_reasoning_override_persists_rehydrates_and_resets(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    live_runner = _make_runner(store)
+    live_runner._set_session_reasoning_override(
+        session_key, {"enabled": True, "effort": "xhigh"}
+    )
+
+    restarted_store = store_factory()
+    assert restarted_store.get_reasoning_override(session_key) == {
+        "enabled": True,
+        "effort": "xhigh",
+    }
+    runner = _make_runner(restarted_store)
+    runner._rehydrate_session_reasoning_override(session_key)
+    assert runner._session_reasoning_overrides[session_key] == {
+        "enabled": True,
+        "effort": "xhigh",
+    }
+
+    restarted_store.reset_session(session_key)
+    assert restarted_store.get_reasoning_override(session_key) is None
+    assert store_factory().get_reasoning_override(session_key) is None
+
+
+def test_sanitize_reasoning_override_rejects_unrecognized_fields():
+    assert sanitize_reasoning_override(None) is None
+    assert sanitize_reasoning_override({"enabled": False}) == {
+        "enabled": False
+    }
+    assert sanitize_reasoning_override(
+        {"enabled": True, "effort": "ULTRA", "secret": "drop"}
+    ) == {"enabled": True, "effort": "ultra"}
+    assert sanitize_reasoning_override(
+        {"enabled": True, "effort": "impossible"}
+    ) is None

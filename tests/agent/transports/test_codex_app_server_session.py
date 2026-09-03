@@ -16,6 +16,7 @@ import pytest
 import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    list_codex_models,
     list_recent_codex_desktop_threads,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
@@ -295,6 +296,30 @@ class TestLifecycle:
         _, list_params = next(r for r in client.requests if r[0] == "thread/list")
         assert list_params["sourceKinds"] == ["vscode"]
         assert list_params["sortKey"] == "recency_at"
+
+    def test_codex_model_catalog_uses_authenticated_app_server(self):
+        client = FakeClient()
+
+        def handle(method, _params):
+            if method == "model/list":
+                return {
+                    "data": [
+                        {"id": "gpt-5.6-sol"},
+                        {"id": "gpt-5.6-luna"},
+                        {"id": "gpt-5.6-sol"},
+                        {"missing": "id"},
+                    ]
+                }
+            return {}
+
+        client._request_handler = handle
+
+        assert list_codex_models(client_factory=lambda **_: client) == [
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+        ]
+        assert client._initialized is True
+        assert client._closed is True
 
     def test_close_idempotent(self):
         client = FakeClient()

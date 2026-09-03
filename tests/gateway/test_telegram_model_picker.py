@@ -39,6 +39,7 @@ def _make_adapter():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._bot = AsyncMock()
     adapter._app = MagicMock()
+    adapter._is_callback_user_authorized = MagicMock(return_value=True)
     return adapter
 
 
@@ -322,6 +323,87 @@ class TestTelegramModelPicker:
 
         callback.assert_awaited_once_with("12345", "openai/gpt-5.5-pro", "openrouter")
         assert "12345" not in adapter._model_picker_state
+
+    @pytest.mark.asyncio
+    async def test_stale_model_picker_message_cannot_apply_new_picker_state(self):
+        adapter = _make_adapter()
+        callback = AsyncMock(return_value="switched")
+        adapter._model_picker_state["12345"] = {
+            "providers": [],
+            "current_model": "new-current",
+            "current_provider": "openai-codex",
+            "session_key": "new-session",
+            "on_model_selected": callback,
+            "selected_provider": "openai-codex",
+            "model_list": ["new-model"],
+            "msg_id": 200,
+        }
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 100
+        query.from_user = MagicMock(id=12345)
+        query.answer = AsyncMock()
+
+        await adapter._handle_model_picker_callback(
+            query, "mm:0", "12345"
+        )
+
+        callback.assert_not_awaited()
+        assert "expired" in query.answer.await_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_model_picker_tap_is_rejected(self):
+        adapter = _make_adapter()
+        adapter._is_callback_user_authorized.return_value = False
+        callback = AsyncMock(return_value="switched")
+        adapter._model_picker_state["12345"] = {
+            "providers": [],
+            "current_model": "current",
+            "current_provider": "openai-codex",
+            "session_key": "session",
+            "on_model_selected": callback,
+            "selected_provider": "openai-codex",
+            "model_list": ["gpt-5.6-sol"],
+            "msg_id": 42,
+        }
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 42
+        query.from_user = MagicMock(id=99999)
+        query.answer = AsyncMock()
+
+        await adapter._handle_model_picker_callback(
+            query, "mm:0", "12345"
+        )
+
+        callback.assert_not_awaited()
+        assert "not authorized" in query.answer.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_stale_choice_picker_message_cannot_apply_new_choices(self):
+        adapter = _make_adapter()
+        callback = AsyncMock(return_value="changed")
+        adapter._choice_picker_state["12345"] = {
+            "choices": [{"value": "high"}],
+            "session_key": "new-session",
+            "on_choice_selected": callback,
+            "msg_id": 200,
+        }
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 100
+        query.from_user = MagicMock(id=12345)
+        query.answer = AsyncMock()
+
+        await adapter._handle_choice_picker_callback(
+            query, "cp:0", "12345"
+        )
+
+        callback.assert_not_awaited()
+        assert "expired" in query.answer.await_args.kwargs["text"].lower()
 
     @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):

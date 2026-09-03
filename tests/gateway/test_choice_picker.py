@@ -8,6 +8,8 @@ command, so picker and typed arguments can never diverge.
 """
 
 import asyncio
+import dataclasses
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -151,6 +153,75 @@ class TestReasoningChoicePicker:
 
         current = [c["value"] for c in adapter.calls[0]["choices"] if c.get("is_current")]
         assert current == ["xhigh"]
+
+    @pytest.mark.asyncio
+    async def test_bound_codex_picker_uses_rollout_model_and_effort(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "default": "gpt-config-default",
+                        "openai_runtime": "codex_app_server",
+                    },
+                    "agent": {"reasoning_effort": "medium"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+        rollout = (
+            tmp_path
+            / "sessions"
+            / "2026"
+            / "09"
+            / "03"
+            / f"rollout-{thread_id}.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-desktop-current",
+                        "effort": "xhigh",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session."
+            "list_codex_model_reasoning_efforts",
+            lambda model: ["low", "medium", "high", "xhigh"],
+        )
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        event = _make_event("/reasoning")
+        event.source = dataclasses.replace(
+            event.source, session_lane=thread_id
+        )
+        event.metadata["codex_desktop_binding_snapshot"] = {
+            "thread_id": thread_id,
+            "rollout_path": str(rollout),
+        }
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert result is None
+        current = [
+            choice["value"]
+            for choice in adapter.calls[0]["choices"]
+            if choice.get("is_current")
+        ]
+        assert current == ["xhigh"]
+        assert "xhigh" in adapter.calls[0]["title"]
+        assert "session" in adapter.calls[0]["title"].lower()
 
     @pytest.mark.asyncio
     async def test_picker_show_choice_toggles_display(self, tmp_path, monkeypatch):

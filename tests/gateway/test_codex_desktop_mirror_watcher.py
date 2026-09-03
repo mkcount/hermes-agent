@@ -593,6 +593,65 @@ async def test_desktop_progress_edits_one_message_until_completion(
 
 
 @pytest.mark.asyncio
+async def test_new_turn_finalizes_live_message_for_superseded_turn(
+    tmp_path,
+    monkeypatch,
+):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "26"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(_turn("baseline", final_text="old"), encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    binding = {
+        "thread_id": thread_id,
+        "rollout_path": str(path),
+        "mirror_cursor_turn_id": "baseline",
+    }
+    runner, adapter = _runner(binding)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8775784529",
+        user_id="8775784529",
+        chat_type="dm",
+    )
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, binding
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _event({"type": "task_started", "turn_id": "old-live"})
+            + _event({"type": "user_message", "message": "중단될 질문"})
+        )
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, runner.async_session_store.binding
+    )
+    adapter.send.assert_awaited_once()
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _event({"type": "task_started", "turn_id": "replacement"})
+            + _event({"type": "user_message", "message": "새 질문"})
+        )
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, runner.async_session_store.binding
+    )
+
+    assert adapter.edit_message.await_count == 1
+    assert "이전 작업이 중단" in adapter.edit_message.await_args.args[2]
+    assert (
+        runner.async_session_store.binding["mirror_cursor_turn_id"]
+        == "old-live"
+    )
+
+
+@pytest.mark.asyncio
 async def test_attach_mid_turn_immediately_restores_question_and_progress(
     tmp_path,
     monkeypatch,
@@ -676,6 +735,60 @@ async def test_attach_mid_turn_immediately_restores_question_and_progress(
     edited_content = adapter.edit_message.await_args.args[2]
     assert "연결 전에 쌓인 첫 보고" in edited_content
     assert "연결 후 실시간 보고" in edited_content
+
+
+@pytest.mark.asyncio
+async def test_reattach_does_not_resurrect_superseded_unfinished_turn(
+    tmp_path,
+    monkeypatch,
+):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "26"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        _turn("baseline", final_text="old")
+        + _event({"type": "task_started", "turn_id": "orphan-turn"})
+        + _event({"type": "user_message", "message": "중단된 옛 질문"})
+        + _event(
+            {
+                "type": "agent_message",
+                "phase": "commentary",
+                "message": "중단된 옛 작업 보고",
+            }
+        )
+        + _turn("newer-complete", final_text="이미 전달된 최신 답변"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    binding = {
+        "thread_id": thread_id,
+        "rollout_path": str(path),
+        "mirror_cursor_turn_id": "newer-complete",
+    }
+    runner, adapter = _runner(binding)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8775784529",
+        user_id="8775784529",
+        chat_type="dm",
+    )
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, binding
+    )
+
+    adapter.send.assert_not_awaited()
+    adapter.edit_message.assert_not_awaited()
+    state = runner._codex_desktop_mirror_states["telegram-session"]
+    assert state["pending"] == []
+    assert state["pending_updates"] == {}
 
 
 @pytest.mark.asyncio

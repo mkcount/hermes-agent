@@ -262,6 +262,38 @@ def list_codex_model_reasoning_efforts(
             client.close()
 
 
+def list_codex_models(
+    *,
+    codex_bin: str = "codex",
+    codex_home: Optional[str] = None,
+    client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+) -> list[str]:
+    """Return model IDs advertised by the authenticated Codex app-server."""
+    factory = client_factory or CodexAppServerClient
+    client: Optional[CodexAppServerClient] = None
+    try:
+        client = factory(codex_bin=codex_bin, codex_home=codex_home)
+        client.initialize(
+            client_name="hermes-model-picker",
+            client_title="Hermes Model Picker",
+            client_version=_get_hermes_version(),
+        )
+        result = client.request("model/list", {}, timeout=15)
+        models: list[str] = []
+        for item in result.get("data") or []:
+            model_id = (
+                str(item.get("id") or "").strip()
+                if isinstance(item, dict)
+                else ""
+            )
+            if model_id and model_id not in models:
+                models.append(model_id)
+        return models
+    finally:
+        if client is not None:
+            client.close()
+
+
 @dataclass
 class TurnResult:
     """Result of one user→assistant→tool turn through the codex app-server."""

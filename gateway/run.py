@@ -4563,6 +4563,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model_override,
                 )
 
+        self._rehydrate_session_reasoning_override(old_key)
         reasoning_overrides = getattr(
             self,
             "_session_reasoning_overrides",
@@ -4571,7 +4572,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(reasoning_overrides, dict):
             reasoning_override = reasoning_overrides.get(old_key)
             if isinstance(reasoning_override, dict):
-                reasoning_overrides[new_key] = dict(reasoning_override)
+                self._set_session_reasoning_override(
+                    new_key, reasoning_override
+                )
 
     async def _attach_codex_delivery_grant(
         self,
@@ -6219,9 +6222,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
+        if resolved_session_key:
+            self._rehydrate_session_reasoning_override(resolved_session_key)
+            overrides = (
+                getattr(self, "_session_reasoning_overrides", {}) or {}
+            )
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
         return self._load_reasoning_config(model)
+
+    def _rehydrate_session_reasoning_override(
+        self, session_key: str
+    ) -> None:
+        """Lazily restore a persisted /reasoning override after restart."""
+        if not session_key:
+            return
+        if not hasattr(self, "_session_reasoning_overrides"):
+            self._session_reasoning_overrides = {}
+        if session_key in self._session_reasoning_overrides:
+            return
+        store = getattr(self, "session_store", None)
+        getter = getattr(store, "get_reasoning_override", None)
+        if not callable(getter):
+            return
+        try:
+            persisted = getter(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to read persisted session reasoning override",
+                exc_info=True,
+            )
+            return
+        if persisted:
+            self._session_reasoning_overrides[session_key] = dict(persisted)
 
     def _set_session_reasoning_override(
         self,
@@ -6237,6 +6270,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+        store = getattr(self, "session_store", None)
+        setter = getattr(store, "set_reasoning_override", None)
+        if callable(setter):
+            try:
+                setter(session_key, reasoning_config)
+            except Exception:
+                logger.debug(
+                    "Failed to persist session reasoning override",
+                    exc_info=True,
+                )
 
     def _resolve_session_service_tier(
         self,

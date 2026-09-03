@@ -5595,11 +5595,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if not state:
             await query.answer(text="Picker expired — run the command again.")
             return
+        query_message = getattr(query, "message", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        state_message_id = state.get("msg_id")
+        if (
+            isinstance(query_message_id, int)
+            and isinstance(state_message_id, int)
+            and query_message_id != state_message_id
+        ):
+            # A newer picker in the same chat replaced this one's state. Never
+            # let an old inline keyboard apply its index to the new choices.
+            await query.answer(text="Picker expired — run the command again.")
+            return
 
         # Same authorization gate as approval buttons: unauthorized users in a
         # shared group must not flip session/config state via someone else's
         # picker message.
-        query_message = getattr(query, "message", None)
         query_chat = getattr(query_message, "chat", None)
         if not self._is_callback_user_authorized(
             str(getattr(query.from_user, "id", "")),
@@ -5766,6 +5777,38 @@ class TelegramAdapter(BasePlatformAdapter):
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
+            return
+        query_message = getattr(query, "message", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        state_message_id = state.get("msg_id")
+        if (
+            isinstance(query_message_id, int)
+            and isinstance(state_message_id, int)
+            and query_message_id != state_message_id
+        ):
+            await query.answer(text="Picker expired — use /model again.")
+            return
+
+        query_chat = getattr(query_message, "chat", None)
+        if not self._is_callback_user_authorized(
+            str(getattr(query.from_user, "id", "")),
+            chat_id=getattr(query_message, "chat_id", None),
+            chat_type=(
+                str(getattr(query_chat, "type", None))
+                if getattr(query_chat, "type", None) is not None
+                else None
+            ),
+            thread_id=(
+                str(getattr(query_message, "message_thread_id", None))
+                if getattr(query_message, "message_thread_id", None)
+                is not None
+                else None
+            ),
+            user_name=getattr(query.from_user, "first_name", None),
+        ):
+            await query.answer(
+                text="⛔ You are not authorized to change this setting."
+            )
             return
 
         try:

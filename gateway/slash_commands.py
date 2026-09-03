@@ -1497,6 +1497,7 @@ class GatewaySlashCommandsMixin:
                 pass
 
         # Read current model/provider from config
+        gateway_cfg = {}
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
@@ -1506,20 +1507,20 @@ class GatewaySlashCommandsMixin:
         excluded_provs = []
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
-            cfg = _load_gateway_config()
-            if cfg:
-                model_cfg = cfg.get("model", {})
+            gateway_cfg = _load_gateway_config() or {}
+            if gateway_cfg:
+                model_cfg = gateway_cfg.get("model", {})
                 if isinstance(model_cfg, dict):
                     current_model = model_cfg.get("default", "")
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
-                user_provs = cfg.get("providers")
+                user_provs = gateway_cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
-                    custom_provs = get_compatible_custom_providers(cfg)
+                    custom_provs = get_compatible_custom_providers(gateway_cfg)
                 except Exception:
-                    custom_provs = cfg.get("custom_providers")
-                _excl = cfg.get("model_catalog", {}).get("excluded_providers")
+                    custom_provs = gateway_cfg.get("custom_providers")
+                _excl = gateway_cfg.get("model_catalog", {}).get("excluded_providers")
                 if isinstance(_excl, list):
                     excluded_provs = _excl
         except Exception:
@@ -1532,6 +1533,7 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        self._rehydrate_session_model_override(session_key)
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
@@ -1541,6 +1543,54 @@ class GatewaySlashCommandsMixin:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+
+        model_cfg = gateway_cfg.get("model") or {}
+        codex_bound = bool(
+            getattr(source, "session_lane", None)
+            and isinstance(model_cfg, dict)
+            and model_cfg.get("openai_runtime") == "codex_app_server"
+        )
+        codex_models: list[str] = []
+        if codex_bound:
+            binding = (getattr(event, "metadata", None) or {}).get(
+                "codex_desktop_binding_snapshot"
+            )
+            hinted_path = (
+                str(binding.get("rollout_path") or "").strip() or None
+                if isinstance(binding, dict)
+                else None
+            )
+            if not override:
+                try:
+                    from agent.transports.codex_desktop_mirror import (
+                        read_codex_rollout_runtime_state,
+                    )
+
+                    runtime_state = await asyncio.to_thread(
+                        read_codex_rollout_runtime_state,
+                        str(source.session_lane),
+                        hinted_path=hinted_path,
+                    )
+                    if runtime_state is not None and runtime_state.model:
+                        current_model = runtime_state.model
+                except Exception:
+                    logger.debug(
+                        "Could not read bound Codex runtime state",
+                        exc_info=True,
+                    )
+            current_provider = "openai-codex"
+            current_base_url = ""
+            try:
+                from agent.transports.codex_app_server_session import (
+                    list_codex_models,
+                )
+
+                codex_models = await asyncio.to_thread(list_codex_models)
+            except Exception:
+                logger.debug(
+                    "Could not load bound Codex model catalog",
+                    exc_info=True,
+                )
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -1556,17 +1606,28 @@ class GatewaySlashCommandsMixin:
                     # Offload blocking provider-listing (can fall through to a
                     # synchronous urllib HTTP fetch on a stale cache) off the
                     # event loop so the gateway doesn't freeze. See #41289.
-                    providers = await asyncio.to_thread(
-                        list_picker_providers,
-                        current_provider=current_provider,
-                        current_base_url=current_base_url,
-                        current_model=current_model,
-                        user_providers=user_provs,
-                        custom_providers=custom_provs,
-                        max_models=50,
-                        include_moa=True,
-                        excluded_providers=excluded_provs,
-                    )
+                    if codex_bound:
+                        providers = [
+                            {
+                                "slug": "openai-codex",
+                                "name": "OpenAI Codex",
+                                "models": codex_models,
+                                "total_models": len(codex_models),
+                                "is_current": True,
+                            }
+                        ] if codex_models else []
+                    else:
+                        providers = await asyncio.to_thread(
+                            list_picker_providers,
+                            current_provider=current_provider,
+                            current_base_url=current_base_url,
+                            current_model=current_model,
+                            user_providers=user_provs,
+                            custom_providers=custom_provs,
+                            max_models=50,
+                            include_moa=True,
+                            excluded_providers=excluded_provs,
+                        )
                 except Exception:
                     providers = []
 
@@ -1861,16 +1922,27 @@ class GatewaySlashCommandsMixin:
             try:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
-                providers = await asyncio.to_thread(
-                    list_authenticated_providers,
-                    current_provider=current_provider,
-                    current_base_url=current_base_url,
-                    current_model=current_model,
-                    user_providers=user_provs,
-                    custom_providers=custom_provs,
-                    max_models=5,
-                    excluded_providers=excluded_provs,
-                )
+                if codex_bound:
+                    providers = [
+                        {
+                            "slug": "openai-codex",
+                            "name": "OpenAI Codex",
+                            "models": codex_models,
+                            "total_models": len(codex_models),
+                            "is_current": True,
+                        }
+                    ]
+                else:
+                    providers = await asyncio.to_thread(
+                        list_authenticated_providers,
+                        current_provider=current_provider,
+                        current_base_url=current_base_url,
+                        current_model=current_model,
+                        user_providers=user_provs,
+                        custom_providers=custom_provs,
+                        max_models=5,
+                        excluded_providers=excluded_provs,
+                    )
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
                     lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
@@ -1885,9 +1957,25 @@ class GatewaySlashCommandsMixin:
                 pass
 
             lines.append(t("gateway.model.usage_switch_model"))
-            lines.append(t("gateway.model.usage_switch_provider"))
+            if not codex_bound:
+                lines.append(t("gateway.model.usage_switch_provider"))
             lines.append(t("gateway.model.usage_persist"))
             return "\n".join(lines)
+
+        if codex_bound:
+            if explicit_provider and explicit_provider != "openai-codex":
+                return (
+                    "⚠️ 연결된 Codex 데스크톱 세션에서는 OpenAI Codex "
+                    "모델만 선택할 수 있습니다. 다른 공급자를 쓰려면 먼저 "
+                    "`/세션 해제`를 실행하세요."
+                )
+            if model_input and codex_models and model_input not in codex_models:
+                supported = ", ".join(f"`{item}`" for item in codex_models)
+                return (
+                    f"⚠️ 현재 Codex 계정에서 사용할 수 없는 모델입니다: "
+                    f"`{model_input}`\n지원: {supported}"
+                )
+            explicit_provider = "openai-codex"
 
         # Perform the switch
         skew_error = _model_switch_skew_guard()
@@ -3337,28 +3425,68 @@ class GatewaySlashCommandsMixin:
         # reads — same fix as /model (#30479).
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
+        _async_store = (
+            self.async_session_store
+            if getattr(self, "session_store", None) is not None
+            else None
+        )
+        _ensure_session = getattr(_async_store, "get_or_create_session", None)
+        if callable(_ensure_session):
+            await _ensure_session(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
         # config default) so per-model reasoning_overrides display correctly.
         self._rehydrate_session_model_override(session_key)
+        self._rehydrate_session_reasoning_override(session_key)
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
         )
+        _has_model_override = bool(_session_model)
         _codex_allowed_efforts: Optional[list[str]] = None
+        _codex_runtime_effort = ""
+        _codex_runtime_state_found = False
         try:
             _gateway_cfg = _load_gateway_config() or {}
             _model_cfg = _gateway_cfg.get("model") or {}
+            _uses_codex_app_server = (
+                isinstance(_model_cfg, dict)
+                and _model_cfg.get("openai_runtime") == "codex_app_server"
+            )
+            if _uses_codex_app_server and getattr(
+                _reasoning_source, "session_lane", None
+            ):
+                from agent.transports.codex_desktop_mirror import (
+                    read_codex_rollout_runtime_state,
+                )
+
+                _binding = (
+                    (getattr(event, "metadata", None) or {}).get(
+                        "codex_desktop_binding_snapshot"
+                    )
+                    or {}
+                )
+                _runtime_state = await asyncio.to_thread(
+                    read_codex_rollout_runtime_state,
+                    str(_reasoning_source.session_lane),
+                    hinted_path=(
+                        str(_binding.get("rollout_path") or "").strip()
+                        or None
+                    ),
+                )
+                if _runtime_state is not None:
+                    _codex_runtime_state_found = True
+                    _codex_runtime_effort = (
+                        _runtime_state.reasoning_effort
+                    )
+                    if not _has_model_override and _runtime_state.model:
+                        _session_model = _runtime_state.model
             if not _session_model and isinstance(_model_cfg, dict):
                 _session_model = str(
                     _model_cfg.get("default")
                     or _model_cfg.get("model")
                     or ""
                 )
-            if (
-                isinstance(_model_cfg, dict)
-                and _model_cfg.get("openai_runtime") == "codex_app_server"
-                and _session_model
-            ):
+            if _uses_codex_app_server and _session_model:
                 from agent.transports.codex_app_server_session import (
                     list_codex_model_reasoning_efforts,
                 )
@@ -3366,9 +3494,7 @@ class GatewaySlashCommandsMixin:
                 _codex_allowed_efforts = await asyncio.to_thread(
                     list_codex_model_reasoning_efforts,
                     _session_model,
-                )
-                if not _codex_allowed_efforts:
-                    _codex_allowed_efforts = None
+                ) or None
         except Exception:
             logger.debug(
                 "Could not load Codex reasoning capabilities",
@@ -3379,6 +3505,17 @@ class GatewaySlashCommandsMixin:
             session_key=session_key,
             model=_session_model,
         )
+        _has_reasoning_override = session_key in (
+            getattr(self, "_session_reasoning_overrides", {}) or {}
+        )
+        if _codex_runtime_effort and not _has_reasoning_override:
+            from hermes_constants import parse_reasoning_effort
+
+            _runtime_reasoning = parse_reasoning_effort(
+                _codex_runtime_effort
+            )
+            if _runtime_reasoning is not None:
+                self._reasoning_config = _runtime_reasoning
 
         if not raw_args:
             # Show current state
@@ -3397,7 +3534,9 @@ class GatewaySlashCommandsMixin:
                 if self._show_reasoning
                 else t("gateway.reasoning.display_off")
             )
-            has_session_override = session_key in (getattr(self, "_session_reasoning_overrides", {}) or {})
+            has_session_override = (
+                _has_reasoning_override or _codex_runtime_state_found
+            )
             scope = (
                 t("gateway.reasoning.scope_session")
                 if has_session_override

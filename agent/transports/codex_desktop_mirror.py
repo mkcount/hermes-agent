@@ -36,6 +36,9 @@ _RUNTIME_CONTEXT_PREFIXES = (
     "<apps_instructions>",
     "<plugins_instructions>",
 )
+_SUPERSEDED_TURN_ERROR = (
+    "새 작업이 시작되어 이전 작업이 중단된 것으로 처리했습니다."
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,12 @@ class CodexDesktopTurnUpdate:
     client_id: Optional[str]
     completed: bool
     error_text: str = ""
+
+
+@dataclass(frozen=True)
+class CodexThreadRuntimeState:
+    model: str
+    reasoning_effort: str
 
 
 def resolve_codex_rollout_path(
@@ -119,6 +128,66 @@ def resolve_codex_rollout_path(
     if not matches:
         return None
     return max(matches, key=lambda path: path.stat().st_mtime_ns)
+
+
+def read_codex_rollout_runtime_state(
+    thread_id: str,
+    *,
+    hinted_path: Optional[str] = None,
+    codex_home: Optional[str] = None,
+    max_scan_bytes: int = 16 * 1024 * 1024,
+) -> Optional[CodexThreadRuntimeState]:
+    """Read the latest persisted model/effort without scanning a rollout.
+
+    ``turn_context`` is written once per turn. Reading backward from EOF keeps
+    the common path proportional to the latest turn's tail rather than the
+    entire long-lived desktop transcript. The bounded scan deliberately falls
+    back to caller defaults when an unusually large turn pushes its context
+    beyond the window.
+    """
+    path = resolve_codex_rollout_path(
+        thread_id,
+        hinted_path=hinted_path,
+        codex_home=codex_home,
+    )
+    if path is None:
+        return None
+    try:
+        size = path.stat().st_size
+        scan_size = min(size, max(1, int(max_scan_bytes)))
+        start = size - scan_size
+        with path.open("rb") as handle:
+            begins_at_record = start == 0
+            if start > 0:
+                handle.seek(start - 1)
+                begins_at_record = handle.read(1) == b"\n"
+            handle.seek(start)
+            raw = handle.read(scan_size)
+    except (OSError, ValueError):
+        return None
+
+    lines = raw.splitlines()
+    if not begins_at_record and lines:
+        # The window normally begins inside a JSONL record.
+        lines = lines[1:]
+    for line in reversed(lines):
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "turn_context":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        model = str(payload.get("model") or "").strip()
+        effort = str(payload.get("effort") or "").strip().lower()
+        if model or effort:
+            return CodexThreadRuntimeState(
+                model=model,
+                reasoning_effort=effort,
+            )
+    return None
 
 
 class CodexDesktopRolloutTail:
@@ -220,6 +289,20 @@ class CodexDesktopRolloutTail:
         if event_type == "task_started":
             turn_id = str(payload.get("turn_id") or "").strip()
             if turn_id:
+                previous_turn_id = self._active_turn_id
+                if previous_turn_id and previous_turn_id != turn_id:
+                    # A Codex thread can execute only one turn at a time. Some
+                    # client/profile transitions omit ``turn_aborted`` before
+                    # appending the next ``task_started``. Close that orphan
+                    # here so a later Telegram attach cannot resurrect it as
+                    # the current live turn.
+                    self._finish_turn(
+                        previous_turn_id,
+                        final_text="",
+                        error_text=_SUPERSEDED_TURN_ERROR,
+                        completions=completions,
+                        updates=updates,
+                    )
                 self._active_turn_id = turn_id
                 self._turn_origins[turn_id] = (False, None)
                 self._turn_details[turn_id] = {
@@ -265,15 +348,6 @@ class CodexDesktopRolloutTail:
         turn_id = str(payload.get("turn_id") or "").strip()
         if not turn_id:
             return
-        user_seen, client_id = self._turn_origins.pop(
-            turn_id, (False, None)
-        )
-        if self._active_turn_id == turn_id:
-            self._active_turn_id = None
-        details = self._turn_details.pop(
-            turn_id,
-            {"user_text": "", "progress": [], "final_text": ""},
-        )
         if event_type == "turn_aborted":
             # Codex persists an explicit terminal event when an interrupt,
             # timeout, or external teardown stops a turn. Treat it as a
@@ -288,6 +362,33 @@ class CodexDesktopRolloutTail:
                 final_text.strip() if isinstance(final_text, str) else ""
             )
             error_text = self._task_error_text(payload.get("error"))
+        self._finish_turn(
+            turn_id,
+            final_text=final_text,
+            error_text=error_text,
+            completions=completions,
+            updates=updates,
+        )
+
+    def _finish_turn(
+        self,
+        turn_id: str,
+        *,
+        final_text: str,
+        error_text: str,
+        completions: list[CodexDesktopCompletion],
+        updates: list[CodexDesktopTurnUpdate],
+    ) -> None:
+        """Close one turn and publish a terminal snapshot when it was visible."""
+        user_seen, client_id = self._turn_origins.pop(
+            turn_id, (False, None)
+        )
+        if self._active_turn_id == turn_id:
+            self._active_turn_id = None
+        details = self._turn_details.pop(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
         if user_seen and (final_text or error_text):
             details["final_text"] = final_text
             details["error_text"] = error_text
