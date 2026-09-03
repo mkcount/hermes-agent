@@ -9626,6 +9626,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     pending_updates[update.turn_id] = update
 
+        # A turn/start response can arrive after an earlier mirror poll has
+        # already sent the user snapshot. Reconcile every extant live bubble,
+        # even when Codex wrote no new rollout record this second, so the late
+        # exact ownership claim removes that duplicate immediately.
+        if not await self._reconcile_codex_desktop_mirror_live_messages(
+            state,
+            session_key,
+            source,
+            thread_id,
+            mirror_grant_metadata,
+        ):
+            if not authority.allows(mirror_grant_metadata):
+                states.pop(session_key, None)
+            return
+
         # Initial attach snapshots and live updates share one retryable queue.
         # This makes "attach mid-turn" visible immediately, while a transient
         # Telegram failure is retried even when Codex emits no further event.
@@ -9659,8 +9674,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # owns its normal/streamed platform delivery. Drop the queued
                 # rollout snapshot instead of converting a released execution
                 # lane into a false mirror handoff.
+                if not await self._delete_codex_desktop_mirror_live_message(
+                    state,
+                    source,
+                    turn_id,
+                    mirror_grant_metadata,
+                ):
+                    return
                 pending_updates.pop(turn_id, None)
                 state.setdefault("handoff_turn_ids", set()).discard(turn_id)
+                continue
+            if authority.owns_direct_client(
+                mirror_grant_metadata,
+                getattr(update, "client_id", None),
+            ):
+                if not await self._delete_codex_desktop_mirror_live_message(
+                    state,
+                    source,
+                    turn_id,
+                    mirror_grant_metadata,
+                ):
+                    return
+                # Keep the snapshot queued until turn/start returns and the
+                # exact turn-id lease replaces this pre-response client lease.
                 continue
             if turn_id in hermes_turn_ids:
                 if self._codex_mirror_direct_execution_active(
@@ -9669,6 +9705,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     turn_id,
                     mirror_grant_metadata,
                 ):
+                    if not await self._delete_codex_desktop_mirror_live_message(
+                        state,
+                        source,
+                        turn_id,
+                        mirror_grant_metadata,
+                    ):
+                        return
                     # Keep the newest snapshot queued. If the direct request
                     # later times out without another Codex event, the next
                     # poll can still hand this exact turn to the mirror.
@@ -9738,6 +9781,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     completion.turn_id,
                     mirror_grant_metadata,
                 ):
+                    if not await self._delete_codex_desktop_mirror_live_message(
+                        state,
+                        source,
+                        completion.turn_id,
+                        mirror_grant_metadata,
+                    ):
+                        return
                     # task_complete reaches the rollout before the gateway has
                     # necessarily finished delivering the final response. Keep
                     # this completion queued until direct ownership resolves.
@@ -9752,6 +9802,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     completion.turn_id,
                 ):
                     hermes_completed_turn_ids.add(completion.turn_id)
+            if completion.turn_id in hermes_completed_turn_ids:
+                if not await self._delete_codex_desktop_mirror_live_message(
+                    state,
+                    source,
+                    completion.turn_id,
+                    mirror_grant_metadata,
+                ):
+                    return
             error_text = str(
                 getattr(completion, "error_text", "") or ""
             ).strip()
@@ -9810,6 +9868,108 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             state.setdefault("handoff_turn_ids", set()).discard(
                 completion.turn_id
             )
+
+    async def _reconcile_codex_desktop_mirror_live_messages(
+        self,
+        state: Dict[str, Any],
+        control_session_key: str,
+        source: SessionSource,
+        thread_id: str,
+        delivery_grant: Dict[str, Any],
+    ) -> bool:
+        """Remove mirror bubbles later proven to belong to direct delivery."""
+        live_messages = state.setdefault("live_messages", {})
+        if not live_messages:
+            return True
+        authority = self._get_codex_delivery_authority()
+        if not authority.allows(delivery_grant):
+            return False
+        current = await self.async_session_store.get_session_metadata(
+            control_session_key,
+            "codex_desktop_thread",
+            None,
+        )
+        if (
+            not isinstance(current, dict)
+            or str(current.get("thread_id") or "") != thread_id
+        ):
+            return False
+        _hermes_turn_ids, completed_turn_ids = (
+            await self._codex_mirror_hermes_turn_state(
+                control_session_key,
+                source,
+                thread_id,
+                current,
+            )
+        )
+        for turn_id, live in list(live_messages.items()):
+            client_id = (
+                live.get("client_id") if isinstance(live, dict) else None
+            )
+            if not (
+                turn_id in completed_turn_ids
+                or authority.owns_direct_turn(delivery_grant, turn_id)
+                or authority.owns_direct_client(delivery_grant, client_id)
+            ):
+                continue
+            if not await self._delete_codex_desktop_mirror_live_message(
+                state,
+                source,
+                turn_id,
+                delivery_grant,
+            ):
+                return False
+        return True
+
+    async def _delete_codex_desktop_mirror_live_message(
+        self,
+        state: Dict[str, Any],
+        source: SessionSource,
+        turn_id: str,
+        delivery_grant: Dict[str, Any],
+    ) -> bool:
+        """Delete every Telegram chunk for one wrongly claimed live turn."""
+        live_messages = state.setdefault("live_messages", {})
+        live = live_messages.get(turn_id)
+        if not isinstance(live, dict):
+            live_messages.pop(turn_id, None)
+            return True
+        authority = self._get_codex_delivery_authority()
+        if not authority.allows(delivery_grant):
+            return False
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+        message_ids = [
+            str(message_id)
+            for message_id in (live.get("message_ids") or ())
+            if message_id
+        ]
+        if not message_ids and live.get("message_id"):
+            message_ids = [str(live["message_id"])]
+        for message_id in message_ids:
+            if not authority.allows(delivery_grant):
+                return False
+            try:
+                deleted = await adapter.delete_message(
+                    source.chat_id,
+                    message_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Could not delete duplicate Codex mirror message %s",
+                    message_id,
+                    exc_info=True,
+                )
+                return False
+            if not deleted:
+                logger.debug(
+                    "Platform refused duplicate Codex mirror deletion for %s",
+                    message_id,
+                )
+                return False
+        live_messages.pop(turn_id, None)
+        return True
 
     async def _codex_mirror_hermes_turn_state(
         self,
@@ -10073,6 +10233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "content": content,
                 "contents": list(previous_chunks),
                 "completed": completed,
+                "client_id": getattr(turn, "client_id", None),
                 "sent_image_paths": sorted(sent_image_paths),
             }
 
@@ -22035,6 +22196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is thread-safe because this callback runs in the agent executor while
         # the mirror watcher runs on the gateway event loop.
         _codex_direct_turn_claims: set[str] = set()
+        _codex_direct_client_claims: set[str] = set()
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -23689,8 +23851,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent._codex_resume_active_turn_mode = (
                 "queue" if self._busy_input_mode == "queue" else "steer"
             )
+            agent._codex_turn_starting_callback = None
             agent._codex_turn_started_callback = None
             if codex_resume_thread_id and session_key:
+                def _claim_hermes_codex_client(
+                    thread_id: str,
+                    client_id: str,
+                ) -> None:
+                    if str(thread_id) != str(codex_resume_thread_id):
+                        return
+                    if self._get_codex_delivery_authority().acquire_direct_client(
+                        codex_delivery_grant,
+                        client_id,
+                    ):
+                        _codex_direct_client_claims.add(str(client_id))
+
                 def _record_hermes_codex_turn(
                     thread_id: str,
                     turn_id: str,
@@ -23709,7 +23884,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         turn_id=turn_id,
                         list_key="mirror_hermes_turn_ids",
                     )
+                    # The durable turn-id marker and exact direct-turn lease
+                    # now cover ownership. Retire the short pre-response client
+                    # leases only after both have been established so there is
+                    # no unowned interval for the rollout watcher to exploit.
+                    authority = self._get_codex_delivery_authority()
+                    for client_id in tuple(_codex_direct_client_claims):
+                        authority.release_direct_client(
+                            codex_delivery_grant,
+                            client_id,
+                        )
+                        _codex_direct_client_claims.discard(client_id)
 
+                agent._codex_turn_starting_callback = (
+                    _claim_hermes_codex_client
+                )
                 agent._codex_turn_started_callback = (
                     _record_hermes_codex_turn
                 )
@@ -25391,6 +25580,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         direct_turn_id,
                     )
                 _codex_direct_turn_claims.clear()
+                for client_id in tuple(_codex_direct_client_claims):
+                    authority.release_direct_client(
+                        codex_delivery_grant,
+                        client_id,
+                    )
+                _codex_direct_client_claims.clear()
             
             # Clean up tracking
             tracking_task.cancel()

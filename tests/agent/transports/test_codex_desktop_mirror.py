@@ -33,6 +33,20 @@ def _response_message(turn_id, role, text, *, phase=None):
     return json.dumps({"type": "response_item", "payload": payload}) + "\n"
 
 
+def _completed_user_item(turn_id, text, client_id):
+    return _event(
+        {
+            "type": "item_completed",
+            "turn_id": turn_id,
+            "item": {
+                "type": "UserMessage",
+                "client_id": client_id,
+                "content": [{"type": "text", "text": text}],
+            },
+        }
+    )
+
+
 def _modern_turn(turn_id, *, final_text="done"):
     return (
         _event({"type": "task_started", "turn_id": turn_id})
@@ -219,6 +233,36 @@ def test_tail_reads_modern_response_item_messages(tmp_path):
     assert completions[0].final_text == "modern final answer"
     assert updates[-1].completed is True
     assert updates[-1].final_text == "modern final answer"
+
+
+def test_tail_enriches_modern_user_snapshot_from_completed_item(tmp_path):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = _rollout(tmp_path, thread_id)
+    turn_id = "modern-client-turn"
+    path.write_text(
+        _event({"type": "task_started", "turn_id": turn_id})
+        + _response_message(turn_id, "user", "Telegram question"),
+        encoding="utf-8",
+    )
+    tail = CodexDesktopRolloutTail(thread_id, path)
+
+    _completions, initial_updates = tail.scan_with_updates()
+    assert initial_updates[-1].client_id is None
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _completed_user_item(
+                turn_id,
+                "Telegram question",
+                "hermes-client-1",
+            )
+        )
+    _completions, corrected_updates = tail.scan_with_updates()
+
+    assert len(corrected_updates) == 1
+    assert corrected_updates[0].turn_id == turn_id
+    assert corrected_updates[0].client_id == "hermes-client-1"
+    assert corrected_updates[0].user_text == "Telegram question"
 
 
 def test_tail_ignores_modern_runtime_context_before_user_prompt(tmp_path):

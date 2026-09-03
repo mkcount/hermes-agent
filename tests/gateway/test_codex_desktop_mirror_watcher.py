@@ -13,6 +13,37 @@ def _event(payload):
     return json.dumps({"type": "event_msg", "payload": payload}) + "\n"
 
 
+def _response_message(turn_id, role, text, *, phase=None):
+    payload = {
+        "type": "message",
+        "role": role,
+        "content": [
+            {
+                "type": "input_text" if role == "user" else "output_text",
+                "text": text,
+            }
+        ],
+        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+    }
+    if phase is not None:
+        payload["phase"] = phase
+    return json.dumps({"type": "response_item", "payload": payload}) + "\n"
+
+
+def _completed_user_item(turn_id, text, client_id):
+    return _event(
+        {
+            "type": "item_completed",
+            "turn_id": turn_id,
+            "item": {
+                "type": "UserMessage",
+                "client_id": client_id,
+                "content": [{"type": "text", "text": text}],
+            },
+        }
+    )
+
+
 def _turn(
     turn_id,
     *,
@@ -210,6 +241,154 @@ async def test_desktop_completion_is_delivered_but_telegram_completion_is_not(
         runner.async_session_store.binding["mirror_cursor_turn_id"]
         == "telegram-new"
     )
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_client_claim_suppresses_modern_live_mirror(
+    tmp_path,
+    monkeypatch,
+):
+    """Hermes owns the rollout before turn/start returns the turn id."""
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    turn_id = "hermes-pre-response"
+    client_id = "hermes-client-pre-response"
+    path = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "26"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        _turn("baseline", final_text="old")
+        + _event({"type": "task_started", "turn_id": turn_id})
+        + _response_message(turn_id, "user", "Telegram question")
+        + _completed_user_item(turn_id, "Telegram question", client_id),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    binding = {
+        "thread_id": thread_id,
+        "rollout_path": str(path),
+        "mirror_cursor_turn_id": "baseline",
+    }
+    runner, adapter = _runner(binding)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8775784529",
+        user_id="8775784529",
+        chat_type="dm",
+    )
+    authority = runner._get_codex_delivery_authority()
+    authority.observe_binding("telegram-session", thread_id)
+    grant = authority.issue_grant("telegram-session", thread_id)
+    assert grant is not None
+    grant_metadata = grant.to_metadata()
+    assert authority.acquire_direct_client(grant_metadata, client_id)
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session",
+        source,
+        binding,
+    )
+
+    adapter.send.assert_not_awaited()
+    pending = runner._codex_desktop_mirror_states[
+        "telegram-session"
+    ]["pending_updates"]
+    assert pending[turn_id].client_id == client_id
+
+    # turn/start returned: exact turn ownership replaces the temporary client
+    # claim without leaving a mirror-visible interval.
+    assert authority.acquire_direct_turn(grant_metadata, turn_id)
+    runner.async_session_store.binding["mirror_hermes_turn_ids"] = [turn_id]
+    authority.release_direct_client(grant_metadata, client_id)
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session",
+        source,
+        runner.async_session_store.binding,
+    )
+
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_direct_claim_deletes_already_sent_mirror_without_new_event(
+    tmp_path,
+    monkeypatch,
+):
+    """A late turn/start response heals a mirror bubble on the next poll."""
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    turn_id = "late-direct-owner"
+    path = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "26"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        _turn("baseline", final_text="old")
+        + _event({"type": "task_started", "turn_id": turn_id})
+        + _event(
+            {
+                "type": "user_message",
+                "message": "Telegram question",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    binding = {
+        "thread_id": thread_id,
+        "rollout_path": str(path),
+        "mirror_cursor_turn_id": "baseline",
+    }
+    runner, adapter = _runner(binding)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8775784529",
+        user_id="8775784529",
+        chat_type="dm",
+    )
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session",
+        source,
+        binding,
+    )
+    adapter.send.assert_awaited_once()
+    assert turn_id in runner._codex_desktop_mirror_states[
+        "telegram-session"
+    ]["live_messages"]
+
+    authority = runner._get_codex_delivery_authority()
+    grant = authority.issue_grant("telegram-session", thread_id)
+    assert grant is not None
+    grant_metadata = grant.to_metadata()
+    assert authority.acquire_direct_turn(grant_metadata, turn_id)
+    runner.async_session_store.binding["mirror_hermes_turn_ids"] = [turn_id]
+
+    # No additional rollout line is appended here. Reconciliation itself must
+    # notice the exact direct claim and remove the duplicate bubble.
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session",
+        source,
+        runner.async_session_store.binding,
+    )
+
+    adapter.delete_message.assert_awaited_once_with(
+        "8775784529",
+        "message-1",
+    )
+    assert turn_id not in runner._codex_desktop_mirror_states[
+        "telegram-session"
+    ]["live_messages"]
 
 
 @pytest.mark.asyncio

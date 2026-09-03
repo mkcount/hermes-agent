@@ -333,6 +333,43 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_turn_starting_callback_precedes_turn_start_request(self):
+        client = FakeClient()
+        events: list[tuple[str, str]] = []
+
+        def handle(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                events.append(("request", params["clientUserMessageId"]))
+                return {"turn": {"id": "turn-fake-001"}}
+            return {}
+
+        client._request_handler = handle
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(
+            client,
+            on_turn_starting=lambda _thread_id, client_id: events.append(
+                ("callback", client_id)
+            ),
+        ).run_turn("from telegram", turn_timeout=2.0)
+
+        assert result.turn_id == "turn-fake-001"
+        assert [kind for kind, _client_id in events] == [
+            "callback",
+            "request",
+        ]
+        assert events[0][1] == events[1][1]
+
     def test_turn_started_callback_receives_exact_thread_and_turn_ids(self):
         client = FakeClient()
         client.queue_notification(

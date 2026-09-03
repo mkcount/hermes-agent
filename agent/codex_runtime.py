@@ -701,6 +701,22 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            on_turn_starting=getattr(
+                agent, "_codex_turn_starting_callback", None
+            ),
+            on_turn_started=getattr(
+                agent, "_codex_turn_started_callback", None
+            ),
+        )
+    else:
+        # The Codex session is cached with the AIAgent, while these callbacks
+        # close over one gateway request's generation-scoped delivery claims.
+        # Refresh them before every reused turn so later turns do not write
+        # into an already-cleaned claim set from the first request.
+        agent._codex_session.set_turn_callbacks(
+            on_turn_starting=getattr(
+                agent, "_codex_turn_starting_callback", None
+            ),
             on_turn_started=getattr(
                 agent, "_codex_turn_started_callback", None
             ),

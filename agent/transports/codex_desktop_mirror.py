@@ -343,6 +343,10 @@ class CodexDesktopRolloutTail:
             )
             return
 
+        if event_type == "item_completed":
+            self._consume_completed_user_item(payload, updates)
+            return
+
         if event_type not in {"task_complete", "turn_aborted"}:
             return
         turn_id = str(payload.get("turn_id") or "").strip()
@@ -450,6 +454,54 @@ class CodexDesktopRolloutTail:
                 str(payload.get("phase") or "").strip(),
                 updates,
             )
+
+    def _consume_completed_user_item(
+        self,
+        payload: dict,
+        updates: list[CodexDesktopTurnUpdate],
+    ) -> None:
+        """Attach Codex's client id to the preceding persisted user item.
+
+        Current Codex rollouts put the visible text and turn id in a
+        ``response_item`` first, then persist ``clientUserMessageId`` only in
+        the following ``event_msg.item_completed.item.client_id``. Emitting a
+        corrected snapshot here lets the gateway arbitrate ownership before
+        it sends the first live mirror message.
+        """
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return
+        item_type = str(item.get("type") or "").replace("_", "").lower()
+        if item_type != "usermessage":
+            return
+        turn_id = str(
+            payload.get("turn_id")
+            or payload.get("turnId")
+            or self._active_turn_id
+            or ""
+        ).strip()
+        if not turn_id or turn_id not in self._turn_origins:
+            return
+        user_seen, existing_client_id = self._turn_origins.get(
+            turn_id,
+            (False, None),
+        )
+        client_id = self._client_id_from_payload(item)
+        if not user_seen or not client_id or client_id == existing_client_id:
+            return
+        self._turn_origins[turn_id] = (True, client_id)
+        details = self._turn_details.setdefault(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
+        updates.append(
+            self._turn_update(
+                turn_id,
+                details,
+                client_id,
+                completed=False,
+            )
+        )
 
     def _response_item_turn_id(self, payload: dict) -> Optional[str]:
         """Resolve a response item to its persisted or currently active turn."""

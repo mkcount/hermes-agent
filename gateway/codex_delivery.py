@@ -73,6 +73,11 @@ class CodexDeliveryAuthority:
         self._states: Dict[str, CodexBindingState] = {}
         self._transition_locks: Dict[str, asyncio.Lock] = {}
         self._direct_turn_claims: set[tuple[str, int, str, str]] = set()
+        # A new Codex turn is persisted before ``turn/start`` returns its
+        # server-assigned turn id.  Track the caller-supplied
+        # ``clientUserMessageId`` during that gap so the rollout mirror cannot
+        # briefly claim the same Telegram-originated request.
+        self._direct_client_claims: set[tuple[str, int, str, str]] = set()
         self._state_lock = threading.RLock()
 
     def transition_lock(self, control_session_key: str) -> asyncio.Lock:
@@ -94,6 +99,11 @@ class CodexDeliveryAuthority:
         return normalized or None
 
     @staticmethod
+    def _normalize_client_id(client_id: Any) -> Optional[str]:
+        normalized = str(client_id or "").strip()
+        return normalized or None
+
+    @staticmethod
     def _direct_turn_claim_key(
         grant: CodexDeliveryGrant,
         turn_id: str,
@@ -103,6 +113,18 @@ class CodexDeliveryAuthority:
             grant.generation,
             grant.thread_id,
             turn_id,
+        )
+
+    @staticmethod
+    def _direct_client_claim_key(
+        grant: CodexDeliveryGrant,
+        client_id: str,
+    ) -> tuple[str, int, str, str]:
+        return (
+            grant.control_session_key,
+            grant.generation,
+            grant.thread_id,
+            client_id,
         )
 
     def _allows_grant_locked(self, grant: CodexDeliveryGrant) -> bool:
@@ -120,6 +142,11 @@ class CodexDeliveryAuthority:
         self._direct_turn_claims = {
             claim
             for claim in self._direct_turn_claims
+            if claim[0] != control_session_key
+        }
+        self._direct_client_claims = {
+            claim
+            for claim in self._direct_client_claims
             if claim[0] != control_session_key
         }
 
@@ -244,6 +271,52 @@ class CodexDeliveryAuthority:
         with self._state_lock:
             self._direct_turn_claims.discard(
                 self._direct_turn_claim_key(grant, normalized_turn_id)
+            )
+
+    def acquire_direct_client(self, metadata: Any, client_id: Any) -> bool:
+        """Claim a submitted request before Codex assigns its turn id.
+
+        This lease is deliberately process-local. If the gateway dies before
+        learning the turn id, the rollout mirror is allowed to recover the
+        still-running turn after restart instead of suppressing it forever.
+        """
+        grant = CodexDeliveryGrant.from_metadata(metadata)
+        normalized_client_id = self._normalize_client_id(client_id)
+        if grant is None or normalized_client_id is None:
+            return False
+        with self._state_lock:
+            if not self._allows_grant_locked(grant):
+                return False
+            self._direct_client_claims.add(
+                self._direct_client_claim_key(grant, normalized_client_id)
+            )
+            return True
+
+    def owns_direct_client(self, metadata: Any, client_id: Any) -> bool:
+        """Return whether direct delivery owns this pre-turn client id."""
+        grant = CodexDeliveryGrant.from_metadata(metadata)
+        normalized_client_id = self._normalize_client_id(client_id)
+        if grant is None or normalized_client_id is None:
+            return False
+        with self._state_lock:
+            return bool(
+                self._allows_grant_locked(grant)
+                and self._direct_client_claim_key(
+                    grant,
+                    normalized_client_id,
+                )
+                in self._direct_client_claims
+            )
+
+    def release_direct_client(self, metadata: Any, client_id: Any) -> None:
+        """Release the request claim after turn-id ownership is established."""
+        grant = CodexDeliveryGrant.from_metadata(metadata)
+        normalized_client_id = self._normalize_client_id(client_id)
+        if grant is None or normalized_client_id is None:
+            return
+        with self._state_lock:
+            self._direct_client_claims.discard(
+                self._direct_client_claim_key(grant, normalized_client_id)
             )
 
     def state_for(self, control_session_key: str) -> Optional[CodexBindingState]:

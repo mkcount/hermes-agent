@@ -513,6 +513,7 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_turn_starting: Optional[Callable[[str, str], None]] = None,
         on_turn_started: Optional[Callable[[str, str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
@@ -533,6 +534,7 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_turn_starting = on_turn_starting
         self._on_turn_started = on_turn_started
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
@@ -566,6 +568,22 @@ class CodexAppServerSession:
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+
+    def set_turn_callbacks(
+        self,
+        *,
+        on_turn_starting: Optional[Callable[[str, str], None]],
+        on_turn_started: Optional[Callable[[str, str], None]],
+    ) -> None:
+        """Refresh gateway-owned callbacks on a reused agent session.
+
+        ``CodexAppServerSession`` outlives one gateway request. The callbacks,
+        however, close over that request's delivery grant and claim sets, so
+        retaining the constructor-time callbacks would leak ownership into a
+        completed request and leave later turns unprotected.
+        """
+        self._on_turn_starting = on_turn_starting
+        self._on_turn_started = on_turn_started
 
     # ---------- lifecycle ----------
 
@@ -1026,6 +1044,28 @@ class CodexAppServerSession:
         # boundary. In steer mode, retain the protocol-native append behavior.
         input_items = [{"type": "text", "text": user_input_text}]
         client_message_id = str(uuid.uuid4())
+
+        def _start_new_turn() -> dict[str, Any]:
+            # Codex writes task_started/user records before turn/start returns
+            # the server-assigned turn id. Publish the client-side id first so
+            # the rollout watcher can recognize direct Hermes ownership during
+            # that otherwise-unclaimed interval.
+            if self._on_turn_starting is not None and self._thread_id is not None:
+                try:
+                    self._on_turn_starting(
+                        str(self._thread_id),
+                        client_message_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "on_turn_starting callback raised",
+                        exc_info=True,
+                    )
+            return self._start_turn_with_reconnect(
+                input_items,
+                client_message_id=client_message_id,
+            )
+
         try:
             if (
                 self._resumed_active_turn_id
@@ -1049,10 +1089,7 @@ class CodexAppServerSession:
                     self._interrupt_event.clear()
                     return result
                 self._resumed_active_turn_id = None
-                ts = self._start_turn_with_reconnect(
-                    input_items,
-                    client_message_id=client_message_id,
-                )
+                ts = _start_new_turn()
             elif self._resumed_active_turn_id:
                 result.turn_id = self._resumed_active_turn_id
                 try:
@@ -1075,15 +1112,9 @@ class CodexAppServerSession:
                         "new turn on the resumed thread"
                     )
                     self._resumed_active_turn_id = None
-                    ts = self._start_turn_with_reconnect(
-                        input_items,
-                        client_message_id=client_message_id,
-                    )
+                    ts = _start_new_turn()
             else:
-                ts = self._start_turn_with_reconnect(
-                    input_items,
-                    client_message_id=client_message_id,
-                )
+                ts = _start_new_turn()
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.

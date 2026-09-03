@@ -566,6 +566,9 @@ class TestBridgeWiredInRuntime:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
+            def set_turn_callbacks(self, **kwargs):
+                captured["refreshed_callbacks"] = kwargs
+
             def run_turn(self, user_input, **_):
                 from agent.transports.codex_app_server_session import TurnResult
                 return TurnResult(
@@ -589,6 +592,7 @@ class TestBridgeWiredInRuntime:
         agent = SimpleNamespace(
             session_cwd=None,
             _codex_session=None,
+            _codex_turn_starting_callback=MagicMock(),
             _codex_turn_started_callback=MagicMock(),
             tool_progress_callback=MagicMock(),
             _fire_stream_delta=MagicMock(),
@@ -630,6 +634,10 @@ class TestBridgeWiredInRuntime:
             captured["on_turn_started"]
             is agent._codex_turn_started_callback
         )
+        assert (
+            captured["on_turn_starting"]
+            is agent._codex_turn_starting_callback
+        )
 
         # And the bridge must actually drive the agent's callbacks when
         # fed a representative notification.
@@ -641,3 +649,20 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+        replacement_starting = MagicMock()
+        replacement_started = MagicMock()
+        agent._codex_turn_starting_callback = replacement_starting
+        agent._codex_turn_started_callback = replacement_started
+        codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="second",
+            original_user_message="second",
+            messages=[],
+            effective_task_id="t2",
+        )
+
+        assert captured["refreshed_callbacks"] == {
+            "on_turn_starting": replacement_starting,
+            "on_turn_started": replacement_started,
+        }

@@ -97,6 +97,33 @@ def test_invalid_grant_cannot_claim_direct_turn():
     )
 
 
+def test_direct_client_claim_covers_pre_turn_gap_and_is_generation_scoped():
+    authority = CodexDeliveryAuthority()
+    control_key = "telegram:456:123"
+    authority.observe_binding(control_key, "thread-a")
+    grant = authority.issue_grant(control_key, "thread-a")
+    assert grant is not None
+    metadata = grant.to_metadata()
+
+    assert authority.acquire_direct_client(metadata, "client-1")
+    assert authority.owns_direct_client(metadata, "client-1")
+
+    authority.release_direct_client(metadata, "client-1")
+    assert not authority.owns_direct_client(metadata, "client-1")
+
+    assert authority.acquire_direct_client(metadata, "client-1")
+    _transition(authority, control_key, "thread-b")
+    assert not authority.owns_direct_client(metadata, "client-1")
+
+    _transition(authority, control_key, "thread-a")
+    new_grant = authority.issue_grant(control_key, "thread-a")
+    assert new_grant is not None
+    assert not authority.owns_direct_client(
+        new_grant.to_metadata(),
+        "client-1",
+    )
+
+
 @pytest.mark.asyncio
 async def test_transition_lock_serializes_same_control_chat():
     authority = CodexDeliveryAuthority()
