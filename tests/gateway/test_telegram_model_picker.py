@@ -406,6 +406,103 @@ class TestTelegramModelPicker:
         assert "expired" in query.answer.await_args.kwargs["text"].lower()
 
     @pytest.mark.asyncio
+    async def test_choice_picker_long_result_is_split_after_immediate_ack(self):
+        adapter = _make_adapter()
+        long_result = "x" * 5000
+
+        async def callback(chat_id, value):
+            # The Telegram callback must be acknowledged before potentially
+            # slow result work starts.
+            query.answer.assert_awaited_once_with(text="Loading...")
+            return long_result
+
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=42)
+        )
+        picker = await adapter.send_choice_picker(
+            chat_id="12345",
+            title="Pick a session",
+            choices=[{"value": "session-1", "label": "Session 1"}],
+            session_key="s",
+            on_choice_selected=callback,
+            metadata={"thread_id": "99999"},
+        )
+        assert picker.success is True
+        assert adapter._choice_picker_state["12345"]["metadata"] == {
+            "thread_id": "99999"
+        }
+
+        adapter._bot.send_message.reset_mock()
+        adapter._bot.send_message.return_value = SimpleNamespace(message_id=43)
+        adapter._bot.edit_message_text = AsyncMock()
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 42
+        query.message.message_thread_id = 99999
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=12345, first_name="Tester")
+        query.answer = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+
+        await adapter._handle_choice_picker_callback(
+            query, "cp:0", "12345"
+        )
+
+        query.edit_message_reply_markup.assert_awaited_once_with(
+            reply_markup=None
+        )
+        adapter._bot.edit_message_text.assert_awaited_once()
+        adapter._bot.send_message.assert_awaited_once()
+        assert len(adapter._bot.edit_message_text.await_args.kwargs["text"]) <= 4096
+        assert len(adapter._bot.send_message.await_args.kwargs["text"]) <= 4096
+        assert adapter._bot.send_message.await_args.kwargs[
+            "reply_to_message_id"
+        ] == 42
+        assert "12345" not in adapter._choice_picker_state
+
+    @pytest.mark.asyncio
+    async def test_choice_picker_edit_failure_falls_back_to_fresh_send(self):
+        adapter = _make_adapter()
+        callback = AsyncMock(return_value="Recovered result")
+        adapter._choice_picker_state["12345"] = {
+            "choices": [{"value": "session-1"}],
+            "session_key": "s",
+            "on_choice_selected": callback,
+            "metadata": {"thread_id": "99999"},
+            "msg_id": 42,
+        }
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                error="message cannot be edited",
+                raw_response=None,
+            )
+        )
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, error=None)
+        )
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 42
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=12345, first_name="Tester")
+        query.answer = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+
+        await adapter._handle_choice_picker_callback(
+            query, "cp:0", "12345"
+        )
+
+        adapter.send.assert_awaited_once_with(
+            "12345", "Recovered result", metadata={"thread_id": "99999"}
+        )
+        assert "12345" not in adapter._choice_picker_state
+
+    @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):
         adapter = _make_adapter()
         providers = [{"slug": "openai", "name": "OpenAI", "total_models": 2, "is_current": True}]

@@ -5581,6 +5581,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "choices": choices,
                 "session_key": session_key,
                 "on_choice_selected": on_choice_selected,
+                "metadata": dict(metadata or {}),
             }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -5634,6 +5635,27 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text="Picker expired.")
             return
 
+        # Acknowledge the tap before running callbacks that may need disk or
+        # network I/O. Otherwise Telegram keeps showing a spinner and a slow
+        # (or ultimately failed) result looks exactly like an ignored tap.
+        try:
+            await query.answer(text="Loading...")
+        except Exception as exc:
+            logger.debug(
+                "[%s] Choice picker callback acknowledgement failed: %s",
+                self.name, _redact_telegram_error_text(exc),
+            )
+
+        # Remove the keyboard immediately so a second tap cannot re-run a
+        # state-changing callback while the first one is still completing.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Choice picker keyboard removal failed: %s",
+                self.name, _redact_telegram_error_text(exc),
+            )
+
         try:
             result_text = await callback(chat_id, str(choice.get("value") or ""))
         except Exception as exc:
@@ -5641,20 +5663,59 @@ class TelegramAdapter(BasePlatformAdapter):
             result_text = f"Error applying selection: {exc}"
 
         try:
-            await query.edit_message_text(
-                text=self.format_message(result_text),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=None,
-            )
-        except Exception:
-            try:
-                await query.edit_message_text(
-                    text=result_text, parse_mode=None, reply_markup=None,
+            result_text = str(result_text or "Selection applied.")
+            metadata = state.get("metadata") or None
+            message_id = state_message_id or query_message_id
+
+            if message_id is not None:
+                delivery = await self.edit_message(
+                    chat_id,
+                    str(message_id),
+                    result_text,
+                    finalize=True,
+                    metadata=metadata,
                 )
-            except Exception:
-                pass
-        await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+            else:
+                delivery = await self.send(
+                    chat_id, result_text, metadata=metadata,
+                )
+
+            if not delivery.success:
+                logger.error(
+                    "[%s] Choice picker result edit failed; sending a fresh "
+                    "message instead: %s",
+                    self.name, delivery.error,
+                )
+
+                # If an overflow edit delivered some chunks before a later
+                # continuation failed, retry only the missing suffix. For all
+                # other failures, send the complete result as a fresh message.
+                fallback_text = result_text
+                raw_response = delivery.raw_response or {}
+                if raw_response.get("partial_overflow"):
+                    delivered_prefix = str(
+                        raw_response.get("delivered_prefix") or ""
+                    )
+                    if delivered_prefix and result_text.startswith(delivered_prefix):
+                        fallback_text = result_text[len(delivered_prefix):]
+
+                if fallback_text.strip():
+                    fallback = await self.send(
+                        chat_id, fallback_text, metadata=metadata,
+                    )
+                    if not fallback.success:
+                        logger.error(
+                            "[%s] Choice picker result fallback send failed: %s",
+                            self.name, fallback.error,
+                        )
+        except Exception as exc:
+            logger.error(
+                "[%s] Choice picker result delivery raised unexpectedly: %s",
+                self.name, _redact_telegram_error_text(exc),
+                exc_info=True,
+            )
+        finally:
+            self._choice_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
 
