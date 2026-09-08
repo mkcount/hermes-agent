@@ -9593,6 +9593,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Turns whose direct Hermes response path ended while Codex
                 # was still running.  The mirror owns these through completion.
                 "handoff_turn_ids": set(),
+                # Hermes turns for which the mirror has actually published a
+                # live snapshot. A stale direct completion marker must not
+                # retract these after a /세션 binding transition.
+                "mirror_owned_turn_ids": set(),
             }
             initial_live_updates: Dict[str, Any] = {}
             for update in initial_updates:
@@ -9669,7 +9673,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id,
                 current,
             )
-            if turn_id in hermes_completed_turn_ids:
+            mirror_owned_turn_ids = state.setdefault(
+                "mirror_owned_turn_ids", set()
+            )
+            if (
+                turn_id in hermes_completed_turn_ids
+                and turn_id not in mirror_owned_turn_ids
+            ):
                 # Hermes already received this successful Codex completion and
                 # owns its normal/streamed platform delivery. Drop the queued
                 # rollout snapshot instead of converting a released execution
@@ -9720,11 +9730,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # marker is written. Re-read after observing no owner so a
                 # mirror poll that began during that release cannot act on its
                 # earlier, stale marker snapshot.
-                if await self._codex_mirror_hermes_turn_completed(
-                    session_key,
-                    source,
-                    thread_id,
-                    turn_id,
+                if (
+                    turn_id not in mirror_owned_turn_ids
+                    and await self._codex_mirror_hermes_turn_completed(
+                        session_key,
+                        source,
+                        thread_id,
+                        turn_id,
+                    )
                 ):
                     pending_updates.pop(turn_id, None)
                     state.setdefault("handoff_turn_ids", set()).discard(
@@ -9742,6 +9755,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not authority.allows(mirror_grant_metadata):
                     states.pop(session_key, None)
                 return
+            if turn_id in hermes_turn_ids:
+                mirror_owned_turn_ids.add(turn_id)
             pending_updates.pop(turn_id, None)
 
         pending = state["pending"]
@@ -9802,7 +9817,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     completion.turn_id,
                 ):
                     hermes_completed_turn_ids.add(completion.turn_id)
-            if completion.turn_id in hermes_completed_turn_ids:
+            mirror_owned_turn_ids = state.setdefault(
+                "mirror_owned_turn_ids", set()
+            )
+            direct_completion_owned = (
+                completion.turn_id in hermes_completed_turn_ids
+                and completion.turn_id not in mirror_owned_turn_ids
+            )
+            if direct_completion_owned:
                 if not await self._delete_codex_desktop_mirror_live_message(
                     state,
                     source,
@@ -9816,7 +9838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             should_deliver = (
                 bool(error_text)
                 or (
-                    completion.turn_id not in hermes_completed_turn_ids
+                    not direct_completion_owned
                     and (
                         completion.turn_id not in hermes_turn_ids
                         or completion.turn_id
@@ -9850,6 +9872,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if not authority.allows(mirror_grant_metadata):
                             states.pop(session_key, None)
                         return
+                    if completion.turn_id in hermes_turn_ids:
+                        mirror_owned_turn_ids.add(completion.turn_id)
 
             if not authority.allows(mirror_grant_metadata):
                 states.pop(session_key, None)
@@ -9868,6 +9892,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             state.setdefault("handoff_turn_ids", set()).discard(
                 completion.turn_id
             )
+            mirror_owned_turn_ids.discard(completion.turn_id)
 
     async def _reconcile_codex_desktop_mirror_live_messages(
         self,
@@ -9902,12 +9927,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 current,
             )
         )
+        mirror_owned_turn_ids = state.setdefault(
+            "mirror_owned_turn_ids", set()
+        )
         for turn_id, live in list(live_messages.items()):
             client_id = (
                 live.get("client_id") if isinstance(live, dict) else None
             )
             if not (
-                turn_id in completed_turn_ids
+                (
+                    turn_id in completed_turn_ids
+                    and turn_id not in mirror_owned_turn_ids
+                )
                 or authority.owns_direct_turn(delivery_grant, turn_id)
                 or authority.owns_direct_client(delivery_grant, client_id)
             ):
@@ -10157,6 +10188,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # retry the queued mirror snapshot on the next poll.
         if running_agent is _AGENT_PENDING_SENTINEL:
             return True
+        # A still-running Codex session can belong to a revoked delivery
+        # generation after A -> B -> A session selection. Its callbacks are
+        # already fail-closed by the immutable grant, so the rollout mirror
+        # must take over instead of mistaking process liveness for delivery
+        # ownership. Agents without this per-run marker retain the conservative
+        # compatibility behavior below.
+        if hasattr(running_agent, "_gateway_codex_delivery_grant"):
+            running_grant = getattr(
+                running_agent,
+                "_gateway_codex_delivery_grant",
+                None,
+            )
+            if not authority.allows(running_grant):
+                return False
         codex_session = getattr(running_agent, "_codex_session", None)
         ownership_probe = getattr(
             codex_session,
@@ -23823,6 +23868,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             else:
                 agent._codex_reasoning_effort_override = None
+            # Keep the immutable per-run grant beside the running agent so the
+            # desktop mirror can distinguish a live-but-revoked execution lane
+            # from the lane that still owns Telegram delivery.
+            agent._gateway_codex_delivery_grant = (
+                dict(codex_delivery_grant)
+                if isinstance(codex_delivery_grant, dict)
+                else None
+            )
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
             # Must-deliver notes for THIS turn ride the current user message
@@ -25555,7 +25608,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             )
             try:
-                if _codex_result_is_successful_completion(_completed_result):
+                if (
+                    _codex_result_is_successful_completion(_completed_result)
+                    and _delivery_still_current()
+                ):
                     self._record_codex_mirror_turn_marker(
                         source=source,
                         session_key=session_key or "",

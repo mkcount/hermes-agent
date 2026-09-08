@@ -1086,6 +1086,126 @@ async def test_attach_does_not_echo_active_hermes_originated_turn(
     ]["pending_updates"]
 
 
+@pytest.mark.asyncio
+async def test_reselect_hands_stale_direct_turn_to_mirror_through_completion(
+    tmp_path,
+    monkeypatch,
+):
+    """A revoked A turn must be mirrored after an A -> B -> A selection."""
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    turn_id = "hermes-active-before-reselect"
+    path = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "26"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        _turn("baseline", final_text="old")
+        + _event({"type": "task_started", "turn_id": turn_id})
+        + _event(
+            {
+                "type": "user_message",
+                "message": "전환 전에 Telegram에서 시작된 질문",
+                "client_id": "hermes-client",
+            }
+        )
+        + _event(
+            {
+                "type": "agent_message",
+                "phase": "commentary",
+                "message": "전환 뒤 복원되어야 하는 중간보고",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    binding = {
+        "thread_id": thread_id,
+        "rollout_path": str(path),
+        "mirror_cursor_turn_id": "baseline",
+        "mirror_hermes_turn_ids": [turn_id],
+    }
+    runner, adapter = _runner(binding)
+    runner.async_session_store.lane_binding = {
+        "thread_id": thread_id,
+        "mirror_hermes_turn_ids": [turn_id],
+    }
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8775784529",
+        user_id="8775784529",
+        chat_type="dm",
+    )
+    authority = runner._get_codex_delivery_authority()
+    authority.observe_binding("telegram-session", thread_id)
+    old_grant = authority.issue_grant("telegram-session", thread_id)
+    assert old_grant is not None
+    old_grant_metadata = old_grant.to_metadata()
+    assert authority.acquire_direct_turn(old_grant_metadata, turn_id)
+    runner._running_agents["execution-lane"] = SimpleNamespace(
+        _gateway_codex_delivery_grant=old_grant_metadata,
+        _codex_session=SimpleNamespace(
+            is_directly_streaming_turn=lambda candidate: candidate == turn_id
+        ),
+    )
+
+    generation = authority.begin_transition("telegram-session")
+    assert authority.commit_transition(
+        "telegram-session", generation, "thread-b"
+    )
+    generation = authority.begin_transition("telegram-session")
+    assert authority.commit_transition(
+        "telegram-session", generation, thread_id
+    )
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, binding
+    )
+
+    adapter.send.assert_awaited_once()
+    assert "전환 뒤 복원되어야 하는 중간보고" in adapter.send.await_args.args[1]
+    state = runner._codex_desktop_mirror_states["telegram-session"]
+    assert turn_id in state["mirror_owned_turn_ids"]
+
+    # The revoked direct run can finish close to the transition and leave its
+    # durable marker behind. Once the mirror has visibly taken ownership, that
+    # late marker must not retract the live bubble or suppress its final edit.
+    runner.async_session_store.binding[
+        "mirror_hermes_completed_turn_ids"
+    ] = [turn_id]
+    runner.async_session_store.lane_binding[
+        "mirror_hermes_completed_turn_ids"
+    ] = [turn_id]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _event(
+                {
+                    "type": "task_complete",
+                    "turn_id": turn_id,
+                    "last_agent_message": "전환 뒤 미러가 전달할 최종 답변",
+                }
+            )
+        )
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, runner.async_session_store.binding
+    )
+
+    adapter.delete_message.assert_not_awaited()
+    adapter.edit_message.assert_awaited_once()
+    final_content = adapter.edit_message.await_args.args[2]
+    assert "전환 뒤 미러가 전달할 최종 답변" in final_content
+    assert "⏳ 작업 중" not in final_content
+    assert (
+        runner.async_session_store.binding["mirror_cursor_turn_id"]
+        == turn_id
+    )
+
+
 def test_completed_turn_marker_is_persisted_to_control_and_execution_lane():
     thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
     binding = {"thread_id": thread_id}
