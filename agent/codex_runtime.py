@@ -519,10 +519,23 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    # With live commentary enabled, a completed app-server ``agentMessage``
+    # reaches the interim callback before ``turn/completed``.  On a simple
+    # no-tool turn that item is also the final answer.  Preserve that
+    # exact-match fact so the gateway can verify the platform actually
+    # delivered it and avoid a second normal final send.  A different interim
+    # message must not suppress the final summary.
+    response_previewed = False
+    if turn.final_text:
+        try:
+            response_previewed = bool(agent._interim_text_was_delivered(turn.final_text))
+        except Exception:
+            logger.debug("codex app-server final preview comparison failed", exc_info=True)
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
+        response_previewed=response_previewed,
         codex_submission_started=turn.submitted_user_text is not None,
         codex_should_retire=bool(turn.should_retire),
         **usage_result,

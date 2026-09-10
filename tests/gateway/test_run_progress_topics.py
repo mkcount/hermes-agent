@@ -1059,6 +1059,43 @@ async def _run_with_agent(
 
 
 @pytest.mark.asyncio
+async def test_exact_interim_final_is_delivered_once(monkeypatch, tmp_path):
+    """The real gateway path must accept a successfully delivered exact
+    interim preview as the turn final instead of sending it again."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PreviewedResponseAgent,
+        session_id="sess-previewed-final",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
+            "streaming": {"enabled": False},
+        },
+    )
+
+    assert [call["content"] for call in adapter.sent] == ["You're welcome."]
+    assert result.get("already_sent") is True
+
+
+@pytest.mark.asyncio
+async def test_different_interim_keeps_final_send_eligible(monkeypatch, tmp_path):
+    """A preview claim cannot suppress a different final response."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PreviewedSplitAfterCommentaryAgent,
+        session_id="sess-previewed-different-final",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
+            "streaming": {"enabled": False},
+        },
+    )
+
+    assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+    assert result.get("already_sent") is not True
+
+
+@pytest.mark.asyncio
 async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id(
     monkeypatch, tmp_path
 ):
