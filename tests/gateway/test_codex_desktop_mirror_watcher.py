@@ -244,6 +244,101 @@ async def test_desktop_completion_is_delivered_but_telegram_completion_is_not(
 
 
 @pytest.mark.asyncio
+async def test_attach_delivers_userless_resume_after_interrupted_cursor(
+    tmp_path,
+    monkeypatch,
+):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "26"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        _turn("baseline", final_text="old")
+        + _event({"type": "task_started", "turn_id": "original-turn"})
+        + _response_message("original-turn", "user", "모두 진행해.")
+        + _event(
+            {
+                "type": "turn_aborted",
+                "turn_id": "original-turn",
+                "reason": "interrupted",
+            }
+        )
+        + _event({"type": "task_started", "turn_id": "short-resume"})
+        + _response_message(
+            "short-resume",
+            "user",
+            "<environment_context>cwd</environment_context>",
+        )
+        + _event(
+            {
+                "type": "turn_aborted",
+                "turn_id": "short-resume",
+                "reason": "interrupted",
+            }
+        )
+        + _event({"type": "task_started", "turn_id": "final-resume"})
+        + _response_message(
+            "final-resume",
+            "user",
+            "<environment_context>cwd</environment_context>",
+        )
+        + _response_message(
+            "final-resume",
+            "assistant",
+            "재개한 작업을 검증하고 있습니다.",
+            phase="commentary",
+        )
+        + _response_message(
+            "final-resume",
+            "assistant",
+            "모두 완료했습니다.",
+            phase="final_answer",
+        )
+        + _event(
+            {
+                "type": "task_complete",
+                "turn_id": "final-resume",
+                "last_agent_message": "모두 완료했습니다.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    binding = {
+        "thread_id": thread_id,
+        "rollout_path": str(path),
+        "mirror_cursor_turn_id": "original-turn",
+    }
+    runner, adapter = _runner(binding)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8775784529",
+        user_id="8775784529",
+        chat_type="dm",
+    )
+
+    await runner._poll_codex_desktop_mirror_binding(
+        "telegram-session", source, binding
+    )
+
+    adapter.send.assert_awaited_once()
+    content = adapter.send.await_args.args[1]
+    assert "모두 진행해." in content
+    assert "재개한 작업을 검증하고 있습니다." in content
+    assert "모두 완료했습니다." in content
+    assert (
+        runner.async_session_store.binding["mirror_cursor_turn_id"]
+        == "final-resume"
+    )
+
+
+@pytest.mark.asyncio
 async def test_pre_turn_client_claim_suppresses_modern_live_mirror(
     tmp_path,
     monkeypatch,

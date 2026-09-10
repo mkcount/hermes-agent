@@ -296,6 +296,85 @@ def test_tail_ignores_modern_runtime_context_before_user_prompt(tmp_path):
     assert all("recommended_plugins" not in item.user_text for item in updates)
 
 
+def test_interrupted_turn_resume_without_repeated_user_message_is_visible(
+    tmp_path,
+):
+    thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
+    path = _rollout(tmp_path, thread_id)
+    context = [
+        "<collaboration_mode>Default</collaboration_mode>",
+        "<environment_context>cwd</environment_context>",
+    ]
+    path.write_text(
+        _event({"type": "task_started", "turn_id": "original-turn"})
+        + _response_message("original-turn", "user", "모두 진행해.")
+        + _response_message(
+            "original-turn",
+            "assistant",
+            "첫 번째 작업을 진행하고 있습니다.",
+            phase="commentary",
+        )
+        + _event(
+            {
+                "type": "turn_aborted",
+                "turn_id": "original-turn",
+                "reason": "interrupted",
+            }
+        )
+        + _event({"type": "task_started", "turn_id": "short-resume"})
+        + _response_message("short-resume", "user", context)
+        + _event(
+            {
+                "type": "turn_aborted",
+                "turn_id": "short-resume",
+                "reason": "interrupted",
+            }
+        )
+        + _event({"type": "task_started", "turn_id": "final-resume"})
+        + _response_message("final-resume", "user", context)
+        + _response_message(
+            "final-resume",
+            "assistant",
+            "재개한 작업을 검증하고 있습니다.",
+            phase="commentary",
+        )
+        + _response_message(
+            "final-resume",
+            "assistant",
+            "모두 완료했습니다.",
+            phase="final_answer",
+        )
+        + _event(
+            {
+                "type": "task_complete",
+                "turn_id": "final-resume",
+                "last_agent_message": "모두 완료했습니다.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completions, updates = CodexDesktopRolloutTail(
+        thread_id, path
+    ).scan_with_updates()
+
+    assert [item.turn_id for item in completions] == [
+        "original-turn",
+        "final-resume",
+    ]
+    resumed = completions[-1]
+    assert resumed.user_text == "모두 진행해."
+    assert resumed.is_desktop_originated is True
+    assert [item.text for item in resumed.progress] == [
+        "재개한 작업을 검증하고 있습니다."
+    ]
+    assert resumed.final_text == "모두 완료했습니다."
+    assert any(
+        update.turn_id == "final-resume" and not update.completed
+        for update in updates
+    )
+
+
 def test_initial_scan_exposes_current_incomplete_turn_snapshot(tmp_path):
     thread_id = "019fa0b8-f2d1-7f01-9749-953a39197b16"
     path = _rollout(tmp_path, thread_id)
@@ -364,6 +443,7 @@ def test_new_turn_implicitly_aborts_unfinished_previous_turn(tmp_path):
         "newer-turn",
     ]
     assert "이전 작업이 중단" in completions[0].error_text
+    assert completions[1].user_text == "hello"
     assert updates[-1].turn_id == "newer-turn"
     assert updates[-1].completed is True
     assert not any(

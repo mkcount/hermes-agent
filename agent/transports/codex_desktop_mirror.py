@@ -78,6 +78,12 @@ class CodexThreadRuntimeState:
     reasoning_effort: str
 
 
+@dataclass(frozen=True)
+class _ContinuationSeed:
+    user_text: str
+    client_id: Optional[str]
+
+
 def resolve_codex_rollout_path(
     thread_id: str,
     *,
@@ -200,6 +206,7 @@ class CodexDesktopRolloutTail:
         self._active_turn_id: Optional[str] = None
         self._turn_origins: dict[str, tuple[bool, Optional[str]]] = {}
         self._turn_details: dict[str, dict] = {}
+        self._continuation_seed: Optional[_ContinuationSeed] = None
 
     @classmethod
     def open(
@@ -239,6 +246,7 @@ class CodexDesktopRolloutTail:
             self._active_turn_id = None
             self._turn_origins.clear()
             self._turn_details.clear()
+            self._continuation_seed = None
 
         completions: list[CodexDesktopCompletion] = []
         updates: list[CodexDesktopTurnUpdate] = []
@@ -296,6 +304,7 @@ class CodexDesktopRolloutTail:
                     # appending the next ``task_started``. Close that orphan
                     # here so a later Telegram attach cannot resurrect it as
                     # the current live turn.
+                    self._remember_continuation(previous_turn_id)
                     self._finish_turn(
                         previous_turn_id,
                         final_text="",
@@ -360,12 +369,18 @@ class CodexDesktopRolloutTail:
             # its cursor instead of resurrecting the turn forever on reattach.
             final_text = ""
             error_text = "Codex 작업이 완료되기 전에 중단되었습니다."
+            if str(payload.get("reason") or "").strip() == "interrupted":
+                self._remember_continuation(turn_id)
+            else:
+                self._continuation_seed = None
         else:
             final_text = payload.get("last_agent_message")
             final_text = (
                 final_text.strip() if isinstance(final_text, str) else ""
             )
             error_text = self._task_error_text(payload.get("error"))
+            if final_text or error_text:
+                self._activate_continuation(turn_id)
         self._finish_turn(
             turn_id,
             final_text=final_text,
@@ -416,6 +431,38 @@ class CodexDesktopRolloutTail:
                     error_text=completion.error_text,
                 )
             )
+
+    def _remember_continuation(self, turn_id: str) -> None:
+        """Keep the visible origin while Codex restarts the same user work."""
+        user_seen, client_id = self._turn_origins.get(
+            turn_id, (False, None)
+        )
+        if not user_seen:
+            return
+        details = self._turn_details.get(turn_id) or {}
+        self._continuation_seed = _ContinuationSeed(
+            user_text=str(details.get("user_text") or ""),
+            client_id=client_id,
+        )
+
+    def _activate_continuation(self, turn_id: str) -> bool:
+        """Make a user-less successor visible once it produces public output."""
+        user_seen, _client_id = self._turn_origins.get(
+            turn_id, (False, None)
+        )
+        if user_seen:
+            return True
+        seed = self._continuation_seed
+        if seed is None:
+            return False
+        self._turn_origins[turn_id] = (True, seed.client_id)
+        details = self._turn_details.setdefault(
+            turn_id,
+            {"user_text": "", "progress": [], "final_text": ""},
+        )
+        details["user_text"] = seed.user_text
+        self._continuation_seed = None
+        return True
 
     def _consume_response_item(
         self,
@@ -570,6 +617,7 @@ class CodexDesktopRolloutTail:
         updates: list[CodexDesktopTurnUpdate],
     ) -> None:
         """Record the visible user instruction and emit an active-turn update."""
+        self._continuation_seed = None
         self._turn_origins[turn_id] = (True, client_id)
         details = self._turn_details.setdefault(
             turn_id,
@@ -590,14 +638,19 @@ class CodexDesktopRolloutTail:
         updates: list[CodexDesktopTurnUpdate],
     ) -> None:
         """Record durable public commentary or a final answer for one turn."""
+        cleaned = text.strip()
         user_seen, client_id = self._turn_origins.get(turn_id, (False, None))
         if not user_seen:
-            return
+            is_public_output = bool(cleaned) and (
+                phase == "final_answer" or bool(re.search(r"[가-힣]", cleaned))
+            )
+            if not is_public_output or not self._activate_continuation(turn_id):
+                return
+            _user_seen, client_id = self._turn_origins[turn_id]
         details = self._turn_details.setdefault(
             turn_id,
             {"user_text": "", "progress": [], "final_text": ""},
         )
-        cleaned = text.strip()
         if phase == "final_answer":
             if cleaned:
                 details["final_text"] = cleaned
@@ -647,6 +700,7 @@ class CodexDesktopRolloutTail:
             {"user_text": "", "progress": [], "final_text": ""},
         )
         details["user_text"] = objective or "활성 목표 계속 진행"
+        self._continuation_seed = None
         self._turn_origins[turn_id] = (True, None)
         updates.append(
             self._turn_update(
