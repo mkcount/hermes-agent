@@ -46,6 +46,15 @@ class RolloutSnapshot:
     latest_final_text: str = ""
 
 
+@dataclass(frozen=True)
+class _ContinuationSeed:
+    turn: dict[str, Any]
+    aborted_at: float
+    turn_id: str
+    offset: int
+    interrupted: bool = False
+
+
 def _codex_home(value: Optional[str]) -> Path:
     return Path(value or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
 
@@ -166,7 +175,7 @@ class RolloutTail:
         self.active_start_offset: Optional[int] = None
         self.turns: dict[str, dict[str, Any]] = {}
         self.latest_final_text = ""
-        self._continuation_seed: Optional[tuple[dict[str, Any], float, str, int]] = None
+        self._continuation_seed: Optional[_ContinuationSeed] = None
         self._bad_line: Optional[tuple[int, str]] = None
         self._bad_line_attempts = 0
         if self.offset:
@@ -280,17 +289,16 @@ class RolloutTail:
         seed_info = self._continuation_seed
         if seed_info is None or observed_at is None:
             return
-        seed, aborted_at, turn_id, offset = seed_info
-        if observed_at - aborted_at < _CONTINUATION_WINDOW_SECONDS:
+        if observed_at - seed_info.aborted_at < _CONTINUATION_WINDOW_SECONDS:
             return
         self._continuation_seed = None
-        if events is not None and seed.get("user_seen"):
+        if events is not None and seed_info.turn.get("user_seen"):
             events.append(self._event(
-                turn_id,
+                seed_info.turn_id,
                 "error",
                 "Codex 작업이 중단되었습니다.",
-                max(offset, self.offset),
-                seed.get("client_id"),
+                max(seed_info.offset, self.offset),
+                seed_info.turn.get("client_id"),
             ))
 
     def _flush_pending_commentary(
@@ -372,13 +380,16 @@ class RolloutTail:
                 self.active_turn_id, self.active_start_offset = turn_id, line_start
                 inherited: Optional[dict[str, Any]] = None
                 if self._continuation_seed is not None:
-                    seed, aborted_at, _aborted_turn_id, _aborted_offset = self._continuation_seed
+                    seed = self._continuation_seed
                     started_at = self._record_time(record)
                     if (
-                        started_at is not None
-                        and 0 <= started_at - aborted_at <= _CONTINUATION_WINDOW_SECONDS
+                        seed.interrupted
+                        or (
+                            started_at is not None
+                            and 0 <= started_at - seed.aborted_at <= _CONTINUATION_WINDOW_SECONDS
+                        )
                     ):
-                        inherited = seed
+                        inherited = seed.turn
                     else:
                         self._expire_continuation(events, started_at or float("inf"))
                 self._continuation_seed = None
@@ -414,14 +425,16 @@ class RolloutTail:
         elif event_type in {"task_complete", "turn_aborted"}:
             self._flush_pending_commentary(events, turn_id, offset)
             if event_type == "turn_aborted":
-                # Codex host compaction/model transitions explicitly emit
-                # turn_aborted immediately followed by a replacement
-                # task_started with no repeated user item. Carry only this
-                # scoped turn's provenance across a short timestamp window;
-                # never infer ownership from language or arbitrary later work.
+                # Codex host continuation explicitly records reason=interrupted
+                # before a replacement task_started with no repeated user item.
+                # A persisted continuation can be resumed hours later, so that
+                # structured marker survives the short legacy time window.
                 aborted_at = self._record_time(record)
                 if turn.get("user_seen") and aborted_at is not None:
-                    self._continuation_seed = (dict(turn), aborted_at, turn_id, offset)
+                    self._continuation_seed = _ContinuationSeed(
+                        turn=dict(turn), aborted_at=aborted_at, turn_id=turn_id, offset=offset,
+                        interrupted=str(payload.get("reason") or "").strip().lower() == "interrupted",
+                    )
             else:
                 final = str(payload.get("last_agent_message") or turn.get("final") or "").strip()
                 if final and turn.get("user_seen"):

@@ -97,6 +97,39 @@ def test_explicit_aborted_turn_continues_provenance_without_new_user_item(tmp_pa
     ]
 
 
+def test_persisted_interrupted_turn_resumes_after_long_idle_without_new_user_item(tmp_path):
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    records = [
+        _meta(THREAD),
+        {"timestamp": "2026-09-10T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-one"}},
+        {"timestamp": "2026-09-10T00:00:02Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "do all fixes"}],
+                     "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"}}},
+        {"timestamp": "2026-09-10T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-one",
+                     "reason": "interrupted"}},
+        {"timestamp": "2026-09-10T02:14:03Z", "type": "event_msg",
+         "payload": {"type": "thread_settings_applied", "thread_id": THREAD}},
+        {"timestamp": "2026-09-10T02:14:04Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-two"}},
+        {"timestamp": "2026-09-10T02:14:05Z", "type": "response_item",
+         "payload": {"type": "message", "role": "assistant", "phase": "final_answer",
+                     "content": [{"type": "output_text", "text": "all done"}],
+                     "internal_chat_message_metadata_passthrough": {"turn_id": "turn-two"}}},
+        {"timestamp": "2026-09-10T02:14:06Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-two",
+                     "last_agent_message": "all done"}},
+    ]
+    _write(path, records)
+
+    snapshot = inspect_rollout(THREAD, hinted_path=str(path), codex_home=str(tmp_path))
+
+    assert snapshot is not None
+    assert snapshot.latest_final_text == "all done"
+
+
 def test_stale_unrelated_turn_does_not_inherit_aborted_user(tmp_path):
     path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
     records = [
