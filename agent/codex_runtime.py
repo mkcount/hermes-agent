@@ -284,9 +284,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
     Tool items fire ``tool_progress_callback`` plus the stable-ID ``tool_start_callback`` /
     ``tool_complete_callback`` card hooks; deltas go to ``_fire_stream_delta`` / ``_fire_reasoning_delta``;
-    a completed agentMessage goes to ``_emit_interim_assistant_message`` (the gateway's ``already_streamed``
-    check dedupes against streamed deltas). Every callback is guarded so a buggy display hook cannot
-    tear down the turn loop."""
+    a completed commentary agentMessage goes to ``_emit_interim_assistant_message`` while a
+    ``final_answer`` is left to the authoritative turn-finalization path. Every callback is guarded
+    so a buggy display hook cannot tear down the turn loop."""
     # item_id -> (tool_name, args, started_monotonic); duration even when codex omits durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
@@ -330,6 +330,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
+        # Modern app-server items identify their role in the turn.  A
+        # final_answer was already emitted through agentMessage deltas and is
+        # adopted authoritatively by finish(final_text); routing the completed
+        # item through the interim callback creates a second Telegram bubble.
+        # Keep the phase-less path for older Codex versions whose completed
+        # agentMessage was the only live commentary signal.
+        phase = str(item.get("phase") or "").strip().lower().replace("_", "").replace("-", "")
+        if phase and phase != "commentary":
+            return
         # display.show_commentary=false keeps mid-turn narration off the interim path too (codex_responses contract).
         if isinstance(text, str) and text.strip() and getattr(agent, "show_commentary", True):
             agent_cb("_emit_interim_assistant_message", "_emit_interim_assistant_message raised",

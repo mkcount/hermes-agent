@@ -250,17 +250,40 @@ class TestToolProgressDispatch:
 
 
 class TestAgentMessageInterimDispatch:
-    def test_completed_agent_message_emits_interim(self):
+    @pytest.mark.parametrize("phase", [None, "commentary"])
+    def test_completed_commentary_or_legacy_message_emits_interim(self, phase):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
-        bridge(_item_completed({
+        item = {
             "type": "agentMessage",
             "id": "am-1",
             "text": "I'll check the config first.",
-        }))
+        }
+        if phase is not None:
+            item["phase"] = phase
+        bridge(_item_completed(item))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
         )
+
+    def test_completed_final_answer_is_not_replayed_as_interim(self):
+        """The same final text arrives through deltas and turn/completed;
+        replaying its completed item as commentary creates a second bubble."""
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"delta": "Final answer."},
+        })
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-final",
+            "text": "Final answer.",
+            "phase": "final_answer",
+        }))
+
+        agent._fire_stream_delta.assert_called_once_with("Final answer.")
+        agent._emit_interim_assistant_message.assert_not_called()
 
 
 
