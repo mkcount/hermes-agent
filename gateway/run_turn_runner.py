@@ -35,6 +35,28 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _should_inject_tool_tail_recovery(
+    agent_history: Any,
+    interruption_is_fresh: bool,
+    *,
+    codex_bridge_bound: bool,
+) -> bool:
+    """Whether a local transcript tail is sufficient evidence of an interrupted turn.
+
+    A Codex bridge lane resumes a Codex thread whose rollout is the authoritative
+    conversation.  Its Hermes transcript is only a delivery/execution projection and
+    may legitimately end at an older tool row after the Codex thread has already
+    completed a later desktop turn.  Inferring interruption from that projection
+    creates a false recovery note and exposes it as user text in Codex Desktop.
+    """
+    return bool(
+        not codex_bridge_bound
+        and agent_history
+        and agent_history[-1].get("role") == "tool"
+        and interruption_is_fresh
+    )
+
+
 class _ExecApprovalDeclined(RuntimeError):
     """The connector refused the approval card's destination.
 
@@ -1468,7 +1490,11 @@ class TurnRunner:
             ctx.message, persist_override = _prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),
             )
-        elif agent_history and agent_history[-1].get("role") == "tool" and interruption_is_fresh:
+        elif _should_inject_tool_tail_recovery(
+            agent_history,
+            interruption_is_fresh,
+            codex_bridge_bound=bool(ctx.codex_bridge_control_key),
+        ):
             persist_override = ctx.message
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "

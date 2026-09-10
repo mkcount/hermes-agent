@@ -28,6 +28,7 @@ PRs #9850, #9934, #7536):
 import asyncio
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -46,6 +47,8 @@ from gateway.run import (
     build_resume_recovery_note,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -379,6 +382,56 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "pending tool outputs" in result
         assert "Do NOT re-execute" in result
+
+    def test_codex_bridge_does_not_infer_interruption_from_local_tool_tail(self):
+        """A Codex rollout can be complete while its Hermes projection still ends in a tool row."""
+        history = [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+            ], "timestamp": time.time() - 2},
+            {"role": "tool", "tool_call_id": "c1", "content": "result",
+             "timestamp": time.time() - 1},
+        ]
+        ctx = TurnContext(
+            source=_make_source(),
+            message="new Telegram message",
+            history=history,
+            session_key="agent:main:telegram:dm:1:lane:codex",
+            codex_bridge_control_key="agent:main:telegram:dm:1",
+        )
+        runner = SimpleNamespace(session_store=SimpleNamespace(_entries={}))
+
+        persisted, timestamp = TurnRunner(runner, ctx)._prepare_turn_message(
+            _build_agent_history(history)
+        )
+
+        assert ctx.message == "new Telegram message"
+        assert "[System note:" not in ctx.message
+        assert persisted is None
+        assert timestamp is None
+
+    def test_non_codex_session_still_recovers_from_fresh_tool_tail(self):
+        history = [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+            ], "timestamp": time.time() - 2},
+            {"role": "tool", "tool_call_id": "c1", "content": "result",
+             "timestamp": time.time() - 1},
+        ]
+        ctx = TurnContext(
+            source=_make_source(),
+            message="new Telegram message",
+            history=history,
+            session_key="agent:main:telegram:dm:1",
+        )
+        runner = SimpleNamespace(session_store=SimpleNamespace(_entries={}))
+
+        persisted, _ = TurnRunner(runner, ctx)._prepare_turn_message(
+            _build_agent_history(history)
+        )
+
+        assert ctx.message.startswith("[System note:")
+        assert persisted == "new Telegram message"
 
     def test_stale_resume_pending_does_not_inject_restart_note(self):
         """Old restart markers must not revive an unrelated stale task.
@@ -1257,5 +1310,4 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
 
