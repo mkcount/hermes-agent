@@ -56,6 +56,17 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    def test_trusted_local_lane_is_wire_invisible(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="12345", trusted_local_lane="codex:grant:1",
+        )
+        payload = source.to_dict()
+        restored = SessionSource.from_dict(payload)
+
+        assert "trusted_local_lane" not in payload
+        assert restored.trusted_local_lane is None
+        assert build_session_key(source) != build_session_key(restored)
+
 
 class TestSessionSourceDescription:
     def test_local_cli(self):
@@ -1657,5 +1668,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

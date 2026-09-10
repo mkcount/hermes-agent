@@ -607,7 +607,13 @@ class GatewayInboundMixin:
         if _handled:
             return _result
 
-        effective_busy_input_mode = self._effective_busy_input_mode(source)
+        # A bound Codex thread has explicit FIFO ownership. A second Telegram
+        # prompt is a later turn; it must never interrupt/steer the first turn
+        # or inherit the gateway's generic busy-mode preference.
+        effective_busy_input_mode = (
+            "queue" if (event.metadata or {}).get("codex_bridge_input_id")
+            else self._effective_busy_input_mode(source)
+        )
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
             return None
 
@@ -1252,7 +1258,17 @@ class GatewayInboundMixin:
 
         try:
             try:
+                # The bridge input becomes restart-recoverable only after all
+                # auth/pause/plugin/command/drain/concurrency gates above have
+                # accepted this turn. From this point every exit crosses the
+                # durable release/finalize boundary below.
+                _codex_begin_error = self._codex_bridge_begin_input(event)
+                if _codex_begin_error is not None:
+                    return _codex_begin_error
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                _agent_result = await self._codex_bridge_finalize_input(
+                    event, _quick_key, _agent_result, _run_generation,
+                )
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
@@ -1275,6 +1291,7 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            self._codex_bridge_release_input(event, "turn did not reach durable output")
             # MoA one-shot restore must run on EVERY exit path (success, exception, interrupt):
             # the restore data lives on the per-turn event and would leak permanently otherwise.
             self._restore_moa_one_shot(event, _quick_key)

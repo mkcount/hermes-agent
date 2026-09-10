@@ -513,6 +513,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
         self._max_doc_bytes: int = 2 * 1024 * 1024 * 1024 if extra.get("base_url") else 20 * 1024 * 1024
         self._model_picker_state: Dict[str, dict] = {}  # per-chat interactive picker state
+        # Generic pickers are keyed by (chat, bot-message), not just chat: two
+        # concurrently-open pickers in one conversation must not overwrite one
+        # another.  Entries carry a monotonic expiry so stale buttons cannot
+        # mutate current session state indefinitely.
         self._choice_picker_state: Dict[str, dict] = {}
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
@@ -3899,8 +3903,15 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard = InlineKeyboardMarkup(self._rows_of_two(buttons))
 
             def _remember(msg):
-                self._choice_picker_state[str(chat_id)] = {
-                    "msg_id": msg.message_id, "choices": choices, "session_key": session_key, "on_choice_selected": on_choice_selected}
+                now = time.monotonic()
+                expired = [key for key, value in self._choice_picker_state.items()
+                           if float(value.get("expires_at") or 0) <= now]
+                for key in expired:
+                    self._choice_picker_state.pop(key, None)
+                picker_key = f"{chat_id}:{msg.message_id}"
+                self._choice_picker_state[picker_key] = {
+                    "msg_id": msg.message_id, "choices": choices, "session_key": session_key,
+                    "on_choice_selected": on_choice_selected, "expires_at": now + 600.0}
             return self.format_message(title), keyboard, _remember
         return await self._send_prompt(
             "send_choice_picker", chat_id, metadata, build, thread_id=metadata.get("thread_id") if metadata else None,
@@ -3916,8 +3927,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_choice_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle choice picker button taps (cp:<index>)."""
-        state = self._choice_picker_state.get(chat_id)
-        if not state:
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        picker_key = f"{chat_id}:{message_id}"
+        state = self._choice_picker_state.get(picker_key)
+        if not state or float(state.get("expires_at") or 0) <= time.monotonic():
+            self._choice_picker_state.pop(picker_key, None)
             await query.answer(text="Picker expired — run the command again.")
             return
         # Same auth gate as approval buttons: strangers in a shared group must not flip session state.
@@ -3932,14 +3946,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if not callback:
             await query.answer(text="Picker expired.")
             return
+        # Claim before invoking user code. A double tap or concurrent callback
+        # can apply this selection at most once.
+        if self._choice_picker_state.pop(picker_key, None) is not state:
+            await query.answer(text="Picker expired — run the command again.")
+            return
         try:
             result_text = await callback(chat_id, str(choice.get("value") or ""))
         except Exception as exc:
-            logger.error("Choice picker selection failed: %s", exc)
-            result_text = f"Error applying selection: {exc}"
+            logger.error("Choice picker selection failed: %s", _redact_telegram_error_text(exc), exc_info=True)
+            result_text = "선택을 적용하지 못했습니다. 명령을 다시 실행해 주세요."
         await self._edit_result_text(query, result_text)
         await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
 

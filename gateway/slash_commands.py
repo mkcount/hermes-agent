@@ -415,6 +415,10 @@ class GatewaySlashCommandsMixin(
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        codex_cancelled = (
+            self._codex_bridge_cancel_lane(session_key, source)
+            if getattr(source, "trusted_local_lane", None) else 0
+        )
 
         async def _stop(key: str, invalidation_reason: str) -> None:
             await self._interrupt_and_clear_session(
@@ -424,10 +428,16 @@ class GatewaySlashCommandsMixin(
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
             await _stop(session_key, "stop_command_pending")
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
-            return EphemeralReply(t("gateway.stop.stopped_pending"))
+            return EphemeralReply(
+                "Codex에 대기·실행 중이던 Telegram 작업만 중단했습니다. 데스크톱 작업은 유지됩니다."
+                if codex_cancelled else t("gateway.stop.stopped_pending")
+            )
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
             await _stop(session_key, "stop_command_handler")
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return EphemeralReply(
+                "Codex에 대기·실행 중이던 Telegram 작업만 중단했습니다. 데스크톱 작업은 유지됩니다."
+                if codex_cancelled else t("gateway.stop.stopped")
+            )
 
         # No run under the caller's own key. In a per-user thread (thread_sessions_per_user=True) a
         # run another user started lives under a different key, yet authorized users must still be
@@ -450,6 +460,8 @@ class GatewaySlashCommandsMixin(
                 await adapter._stop_typing_with_metadata(source.chat_id, self._reply_metadata(event))
         except Exception:
             logger.debug("Failed to clear typing on /stop with no active agent", exc_info=True)
+        if codex_cancelled:
+            return "Codex에 대기 중이던 Telegram 작업을 취소했습니다. 데스크톱 작업은 유지됩니다."
         return t("gateway.stop.no_active")
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:

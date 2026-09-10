@@ -1971,7 +1971,16 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
                 message_type=event.message_type,
+                codex_bridge_control_key=(event.metadata or {}).get("codex_bridge_control_key"),
+                codex_bridge_thread_id=(event.metadata or {}).get("codex_bridge_thread_id"),
+                codex_bridge_generation=(event.metadata or {}).get("codex_bridge_generation"),
+                codex_bridge_input_id=(event.metadata or {}).get("codex_bridge_input_id"),
             )
+            if (event.metadata or {}).get("codex_bridge_input_id") and isinstance(agent_result, dict):
+                # Response shaping returns only the user-facing string. Keep a
+                # private copy of the transport outcome so the durable bridge
+                # can distinguish a safe failure from an ambiguous submission.
+                event._codex_bridge_agent_result = dict(agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -3301,6 +3310,18 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
+            # Telegram-bound Codex inputs have their own durable lifecycle.
+            # Let BasePlatformAdapter hand them to a fresh task so each queued
+            # event crosses begin/finalize/delivery independently.  The normal
+            # recursive drain would collapse several durable inputs into one
+            # outer handler completion and leave later rows stuck at admitted.
+            if source.trusted_local_lane:
+                pending_slot = getattr(adapter, "_pending_messages", None)
+                if isinstance(pending_slot, dict) and session_key not in pending_slot:
+                    overflow = self._overflow_queue(session_key)
+                    if overflow:
+                        pending_slot[session_key] = overflow.pop(0)
+                return None, None
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
@@ -3811,6 +3832,10 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        codex_bridge_control_key: Optional[str] = None,
+        codex_bridge_thread_id: Optional[str] = None,
+        codex_bridge_generation: Optional[int] = None,
+        codex_bridge_input_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -3835,6 +3860,10 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
+            codex_bridge_control_key=codex_bridge_control_key,
+            codex_bridge_thread_id=codex_bridge_thread_id,
+            codex_bridge_generation=codex_bridge_generation,
+            codex_bridge_input_id=codex_bridge_input_id,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

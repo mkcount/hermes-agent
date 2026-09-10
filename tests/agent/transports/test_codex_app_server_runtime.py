@@ -7,6 +7,10 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import io
+import queue
+import threading
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -109,6 +113,53 @@ class TestCodexAppServerModule:
         assert isinstance(err, RuntimeError)
         assert "boom" in str(err)
         assert "-32600" in str(err)
+
+    @staticmethod
+    def _bare_client():
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        client = object.__new__(CodexAppServerClient)
+        client._next_id = 1
+        client._id_lock = threading.Lock()
+        client._pending_lock = threading.Lock()
+        client._pending = {}
+        client._closed = False
+        return client
+
+    def test_failed_send_does_not_leak_pending_request(self):
+        client = self._bare_client()
+        client._send = lambda _message: (_ for _ in ()).throw(OSError("socket reset"))
+
+        with pytest.raises(OSError, match="socket reset"):
+            client.request("thread/list", timeout=0.01)
+
+        assert client._pending == {}
+
+    def test_stdout_eof_wakes_all_pending_requests(self):
+        client = self._bare_client()
+        waiter = queue.Queue(maxsize=1)
+        client._pending[7] = waiter
+
+        class Proc:
+            stdout = io.BytesIO(b"")
+
+            @staticmethod
+            def poll():
+                return 1
+
+            @staticmethod
+            def terminate():
+                return None
+
+        client._proc = Proc()
+        client._stderr_lines = []
+        client._stderr_lock = threading.Lock()
+
+        client._read_stdout()
+
+        failure = waiter.get_nowait()
+        assert "EOF" in str(failure.error)
+        assert client._pending == {}
 
 
 class TestSpawnEnvIsolation:
@@ -339,4 +390,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

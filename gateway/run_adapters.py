@@ -1044,6 +1044,20 @@ class GatewayAdapterLifecycleMixin:
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        _set_session_route_resolver = getattr(adapter, "set_session_route_resolver", None)
+        if adapter.platform == Platform.TELEGRAM and callable(_set_session_route_resolver):
+            async def _resolve_codex_route(event, _adapter=adapter):
+                # The resolver runs before the message/busy wrappers. Stamp
+                # the adapter's multiplex owner now so bridge state, session
+                # keys and profile-scoped HERMES_HOME all agree.
+                profile = _adapter._session_key_profile(event.source)
+                if profile:
+                    self._stamp_event_profile(event, profile)
+                return await self._resolve_codex_bridge_route(_adapter, event)
+
+            _set_session_route_resolver(_resolve_codex_route)
+        elif callable(_set_session_route_resolver):
+            _set_session_route_resolver(None)
         adapter.set_authorization_check(
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )

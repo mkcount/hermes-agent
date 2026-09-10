@@ -146,6 +146,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]", argument_mode="mixed"),
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
+    CommandDef(
+        "codex-session", "Attach this Telegram chat to a recent Codex session", "Session",
+        aliases=("세션", "코덱스세션", "codex", "codex_session"), args_hint="[off|number|refresh]",
+        gateway_only=True,
+    ),
+    CommandDef(
+        "ns", "Start a new Codex session in a recent project", "Session",
+        args_hint="[number|refresh]", gateway_only=True,
+    ),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",

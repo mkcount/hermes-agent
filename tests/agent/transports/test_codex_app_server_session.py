@@ -111,6 +111,15 @@ class FakeClient:
         self._notifications.append({"method": method, "params": params})
 
     def queue_server_request(self, method: str, request_id: Any = "srv-1", **params):
+        # Keep the same shorthand normalization as queue_notification so
+        # request-scope tests exercise the active fake turn, not a foreign one.
+        if params.get("threadId") in {"t", "th"}:
+            params["threadId"] = "thread-fake-001"
+        if params.get("turnId") == "tu1":
+            params["turnId"] = "turn-fake-001"
+        if method.endswith("/requestApproval"):
+            params.setdefault("threadId", "thread-fake-001")
+            params.setdefault("turnId", "turn-fake-001")
         self._server_requests.append({"id": request_id, "method": method, "params": params})
 
     def set_stderr_tail(self, lines):
@@ -182,6 +191,147 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_turn_starting_fence_failure_prevents_submission(self):
+        client = FakeClient()
+
+        def reject_unfenced_submission(_thread_id, _message_id):
+            raise RuntimeError("durable fence unavailable")
+
+        session = make_session(client, on_turn_starting=reject_unfenced_submission)
+
+        with pytest.raises(RuntimeError, match="durable fence unavailable"):
+            session.run_turn("do not submit unfenced")
+
+        assert not any(method == "turn/start" for method, _ in client.requests)
+
+    def test_resume_retries_single_writer_collision_without_forking(self):
+        client = FakeClient()
+        attempts = 0
+
+        def handle(method, params):
+            nonlocal attempts
+            if method == "thread/resume":
+                attempts += 1
+                if attempts == 1:
+                    from agent.transports.codex_app_server import CodexAppServerError
+
+                    raise CodexAppServerError(-32600, "thread already has an active writer")
+                return {"thread": {"id": "desktop-thread", "turns": []}}
+            return {}
+
+        client._request_handler = handle
+        session = make_session(
+            client, resume_thread_id="desktop-thread", resume_active_turn_mode="queue",
+        )
+
+        with patch.object(session._interrupt_event, "wait", return_value=False):
+            assert session.ensure_started() == "desktop-thread"
+
+        assert attempts == 2
+        assert not any(method == "thread/fork" for method, _ in client.requests)
+
+    def test_stop_before_resume_does_not_acquire_or_retire_writer(self):
+        client = FakeClient()
+        session = make_session(
+            client, resume_thread_id="desktop-thread", resume_active_turn_mode="queue",
+        )
+        session.request_interrupt()
+
+        result = session.run_turn("cancel me", turn_timeout=1.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is False
+        assert client.requests == []
+
+    def test_desktop_control_waits_before_subscribing_to_active_thread(self):
+        client = FakeClient()
+        reads = 0
+
+        def handle(method, params):
+            nonlocal reads
+            if method == "thread/read":
+                reads += 1
+                return {"thread": {"id": "desktop-thread", "status": {
+                    "type": "active" if reads == 1 else "idle",
+                }, "turns": []}}
+            if method == "thread/resume":
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}, "turns": []}}
+            return {}
+
+        client._request_handler = handle
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp", client_factory=factory, resume_thread_id="desktop-thread",
+            resume_active_turn_mode="queue", prefer_desktop_control_socket=True,
+        )
+        with (
+            patch.object(session_mod, "find_codex_control_socket", return_value="/tmp/codex.sock"),
+            patch.object(session_mod.time, "sleep"),
+        ):
+            assert session.ensure_started() == "desktop-thread"
+
+        assert captured["control_socket_path"] == "/tmp/codex.sock"
+        methods = [method for method, _ in client.requests]
+        assert methods == ["thread/read", "thread/read", "thread/resume"]
+        assert all(
+            params["includeTurns"] is False
+            for method, params in client.requests if method == "thread/read"
+        )
+
+    def test_desktop_turn_start_race_detaches_and_retries_after_boundary(self):
+        first = FakeClient()
+        second = FakeClient()
+        first_reads = 0
+        second_reads = 0
+        first_resumes = 0
+
+        def first_handle(method, params):
+            nonlocal first_reads, first_resumes
+            if method == "thread/read":
+                first_reads += 1
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}}}
+            if method == "thread/resume":
+                first_resumes += 1
+                return {"thread": {"id": "desktop-thread", "status": {"type": "active"},
+                                   "turns": [{"id": "desktop-turn", "status": "inProgress"}]}}
+            return {}
+
+        def second_handle(method, params):
+            nonlocal second_reads
+            if method == "thread/read":
+                second_reads += 1
+                status = "active" if second_reads == 1 else "idle"
+                return {"thread": {"id": "desktop-thread", "status": {"type": status}}}
+            if method == "thread/resume":
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}, "turns": []}}
+            return {}
+
+        first._request_handler = first_handle
+        second._request_handler = second_handle
+        clients = iter((first, second))
+        session = CodexAppServerSession(
+            cwd="/tmp", client_factory=lambda **_kwargs: next(clients),
+            resume_thread_id="desktop-thread", resume_active_turn_mode="queue",
+            prefer_desktop_control_socket=True,
+        )
+
+        with (
+            patch.object(session_mod, "find_codex_control_socket", return_value="/tmp/codex.sock"),
+            patch.object(session_mod.time, "sleep"),
+        ):
+            assert session.ensure_started() == "desktop-thread"
+
+        assert first_reads == 1
+        assert first_resumes == 1
+        assert first._closed is True
+        assert second_reads == 2
+        assert [method for method, _ in second.requests][-1] == "thread/resume"
+
 
 # ---- turn loop ----
 
@@ -225,6 +375,29 @@ class TestRunTurn:
         _, params = next(request for request in client.requests if request[0] == "turn/start")
         assert result.submitted_user_text == params["input"][0]["text"]
         assert result.submitted_user_text != rich_input
+
+    def test_full_access_turn_policy_and_stable_input_id_reach_app_server(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(
+            client,
+            approval_policy="never",
+            sandbox_policy={"type": "dangerFullAccess"},
+            client_user_message_id="durable-input-1",
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+        )
+
+        session.run_turn("do it", turn_timeout=1.0)
+        _, params = next(call for call in client.requests if call[0] == "turn/start")
+        assert params["approvalPolicy"] == "never"
+        assert params["sandboxPolicy"] == {"type": "dangerFullAccess"}
+        assert params["clientUserMessageId"] == "durable-input-1"
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["effort"] == "high"
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""
@@ -537,6 +710,39 @@ class TestServerRequestRouting:
             for (rid, code, _msg) in client.error_responses
         )
 
+    def test_unscoped_approval_is_rejected_without_invoking_callback(self):
+        client = FakeClient()
+        client._server_requests.append({
+            "id": "unscoped", "method": "item/commandExecution/requestApproval",
+            "params": {"command": "rm -rf something"},
+        })
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        callbacks = []
+        session = make_session(
+            client, approval_callback=lambda *args, **kwargs: callbacks.append(args) or "once",
+        )
+
+        session.run_turn("hi", turn_timeout=1.0)
+
+        assert callbacks == []
+        assert any(rid == "unscoped" and code == -32602 for rid, code, _ in client.error_responses)
+
+    def test_stop_while_waiting_for_desktop_turn_does_not_interrupt_desktop(self):
+        client = FakeClient()
+        session = make_session(client)
+        session._client = client
+        session._thread_id = "thread-fake-001"
+        with session._active_turn_lock:
+            session._active_turn_id = "desktop-turn"
+            session._waiting_for_resumed_turn_id = "desktop-turn"
+
+        session.request_interrupt()
+
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
     def test_on_event_fires_during_approval_drain(self):
         """When a server-initiated approval request arrives, the session
         drains up to 8 pending notifications first so per-turn state
@@ -760,7 +966,7 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 999.0, 1000.2])
         with patch.object(
             session_mod.time,
             "monotonic",
@@ -910,4 +1116,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

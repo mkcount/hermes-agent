@@ -131,6 +131,19 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_ensure_never_resets_an_existing_delivered_row(self):
+        _record("stable")
+        dl.mark_delivered("stable")
+
+        inserted = dl.ensure_obligation(
+            obligation_id="stable", session_key="agent:main:slack:channel:C1",
+            platform="slack", chat_id="C1", thread_id="171.001",
+            content="the final answer",
+        )
+
+        assert inserted is False
+        assert _row("stable")["state"] == "delivered"
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):

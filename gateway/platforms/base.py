@@ -1713,6 +1713,14 @@ _RETRYABLE_ERROR_PATTERNS = (
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
 
 
+class SessionRouteRejected(RuntimeError):
+    """Trusted pre-dispatch router rejected an event without falling back."""
+
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
 def resolve_channel_prompt(config_extra: dict, channel_id: str, parent_id: str | None = None) -> str | None:
     """Per-channel ephemeral prompt from ``config.extra["channel_prompts"]``: exact *channel_id*
     first, then *parent_id* (threads inherit the parent prompt). Blank prompts count as absent."""
@@ -1822,6 +1830,12 @@ class BasePlatformAdapter(ABC):
         self._platform_event_handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = None
         # Rewrites ``event.source.thread_id`` before session keying (Telegram DM topics).
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
+        # Trusted, concrete routing seam used by the Codex Telegram bridge.
+        # It runs before the adapter claims its per-session guard so the
+        # adapter and runner always serialize on the same lane key.
+        self._session_route_resolver: Optional[
+            Callable[[MessageEvent], Awaitable[MessageEvent]]
+        ] = None
         self._running, self._fatal_error_retryable = False, True
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -2175,6 +2189,12 @@ class BasePlatformAdapter(ABC):
         before session keying; a non-None return replaces ``source.thread_id``. ``None`` clears
         it."""
         self._topic_recovery_fn = fn
+
+    def set_session_route_resolver(
+        self, resolver: Optional[Callable[[MessageEvent], Awaitable[MessageEvent]]]
+    ) -> None:
+        """Install the trusted pre-guard session router; ``None`` clears it."""
+        self._session_route_resolver = resolver
 
     def _apply_topic_recovery(self, event: MessageEvent) -> None:
         """Rewrite ``event.source.thread_id`` in place if the hook returns one."""
@@ -3500,6 +3520,30 @@ class BasePlatformAdapter(ABC):
         if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
+        resolver = getattr(self, "_session_route_resolver", None)
+        if resolver is not None and not expected_session_key:
+            try:
+                event = await resolver(event)
+            except SessionRouteRejected as exc:
+                event._gateway_accepted = True
+                if exc.user_message:
+                    await self.send(
+                        event.source.chat_id, exc.user_message,
+                        metadata=_thread_metadata_for_event(event),
+                    )
+                return
+            except Exception:
+                # A broken ownership store must never silently fall through to
+                # the ordinary Hermes session: that would execute the prompt in
+                # the wrong conversation with different permissions.
+                logger.exception("[%s] trusted session routing failed", self.name)
+                event._gateway_accepted = True
+                await self.send(
+                    event.source.chat_id,
+                    "Codex 세션 연결 상태를 확인하지 못해 이 메시지를 실행하지 않았습니다. 잠시 후 다시 보내 주세요.",
+                    metadata=_thread_metadata_for_event(event),
+                )
+                return
         session_key = self._event_session_key(event)
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",

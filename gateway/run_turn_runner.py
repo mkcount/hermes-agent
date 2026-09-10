@@ -1043,6 +1043,8 @@ class TurnRunner:
         hits) or build a fresh one. Returns (agent, reused_cached_agent)."""
         ctx = self._ctx
         runner = self._runner
+        if ctx.codex_bridge_control_key:
+            turn_route = {**turn_route, "runtime": {**turn_route["runtime"], "api_mode": "codex_app_server"}}
         skip_context_files = self._skip_context_files(platform_key)
         sig = runner._agent_config_signature(
             turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
@@ -1075,6 +1077,7 @@ class TurnRunner:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        runner._configure_codex_bridge_agent(agent, ctx)
         return agent, found.reused
 
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────

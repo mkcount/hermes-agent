@@ -275,7 +275,7 @@ class GatewayBusySessionMixin:
     # Metadata that must match for two pending events to merge into one slot.
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
-        "gateway_session_id", "gateway_session_strict",
+        "gateway_session_id", "gateway_session_strict", "codex_bridge_input_id",
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
@@ -319,6 +319,7 @@ class GatewayBusySessionMixin:
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            self._codex_bridge_cancel_input(event, "busy queue at capacity")
             return
 
         self._enqueue_fifo(session_key, event, adapter)
@@ -761,7 +762,7 @@ class GatewayBusySessionMixin:
         "approvals", "model", "codex-runtime", "personality", "suggestions", "save", "retry",
         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
-        "loop", "refine", "review", "voice",
+        "loop", "refine", "review", "voice", "codex-session", "ns",
     )
 
     def _command_handler_table(self, names) -> Dict[str, Any]:
@@ -866,10 +867,18 @@ class GatewayBusySessionMixin:
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
         from gateway.run import _INTERRUPT_REASON_STOP
+        cancelled = (
+            self._codex_bridge_cancel_lane(quick_key, source)
+            if getattr(source, "trusted_local_lane", None) else 0
+        )
         await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+        if cancelled:
+            return EphemeralReply(
+                "Codex에 대기·실행 중이던 Telegram 작업만 중단했습니다. 데스크톱 작업은 유지됩니다."
+            )
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):

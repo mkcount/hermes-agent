@@ -14,12 +14,17 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
 from agent.redact import redact_sensitive_text
-from agent.transports.codex_app_server import CodexAppServerClient, CodexAppServerError
+from agent.transports.codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    find_codex_control_socket,
+)
 from agent.transports.codex_event_projector import CodexEventProjector, ProjectionResult
 
 logger = logging.getLogger(__name__)
@@ -153,8 +158,18 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_turn_starting: Optional[Callable[[str, str], None]] = None,
+        on_turn_started: Optional[Callable[[str, str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        resume_thread_id: Optional[str] = None,
+        prefer_desktop_control_socket: bool = False,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        resume_active_turn_mode: str = "steer",
+        approval_policy: Optional[str] = None,
+        sandbox_policy: Optional[dict[str, Any]] = None,
+        client_user_message_id: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -164,29 +179,172 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_turn_starting = on_turn_starting
+        self._on_turn_started = on_turn_started
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        self._resume_thread_id = str(resume_thread_id or "").strip() or None
+        self._prefer_desktop_control_socket = bool(prefer_desktop_control_socket)
+        self._model = str(model or "").strip() or None
+        self._reasoning_effort = str(reasoning_effort or "").strip().lower() or None
+        self._resume_active_turn_mode = (
+            "queue" if str(resume_active_turn_mode or "").strip().lower() == "queue" else "steer"
+        )
+        self._approval_policy = str(approval_policy or "").strip() or None
+        self._sandbox_policy = dict(sandbox_policy) if isinstance(sandbox_policy, dict) else None
+        self._client_user_message_id = str(client_user_message_id or "").strip() or None
 
         self._client: Optional[CodexAppServerClient] = None
+        self._using_desktop_control = False
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
+        self._resumed_active_turn_id: Optional[str] = None
+        self._waiting_for_resumed_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
         # In-progress fileChange items by id (item/started -> item/completed):
         # approval params don't carry the changeset, so this feeds the prompt summary.
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
 
+    def set_turn_callbacks(
+        self, *, on_turn_starting: Optional[Callable[[str, str], None]],
+        on_turn_started: Optional[Callable[[str, str], None]],
+        client_user_message_id: Optional[str] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> None:
+        """Refresh request-scoped ownership and policy inputs on a cached session."""
+        self._on_turn_starting = on_turn_starting
+        self._on_turn_started = on_turn_started
+        self._client_user_message_id = str(client_user_message_id or "").strip() or None
+        self._model = str(model or "").strip() or None
+        self._reasoning_effort = str(reasoning_effort or "").strip().lower() or None
+
+    def _open_client(self, control_socket: Optional[str] = None) -> CodexAppServerClient:
+        kwargs: dict[str, Any] = {
+            "codex_bin": self._codex_bin,
+            "codex_home": self._codex_home,
+        }
+        if control_socket:
+            kwargs["control_socket_path"] = control_socket
+        client = self._client_factory(**kwargs)
+        try:
+            client.initialize(
+                client_name="hermes", client_title="Hermes Agent",
+                client_version=_get_hermes_version(),
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                client.close()
+            raise
+        return client
+
     def ensure_started(self) -> str:
-        """Spawn, handshake, and ``thread/start``; idempotent, returns the codex thread id."""
+        """Spawn, handshake, then start or resume a thread; idempotent."""
         if self._thread_id is not None:
             return self._thread_id
+        if (
+            self._resume_thread_id
+            and self._resume_active_turn_mode == "queue"
+            and self._interrupt_event.is_set()
+        ):
+            raise InterruptedError("Codex resume cancelled before acquiring the thread writer")
         if self._client is None:
-            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home)
-        self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
-        # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
-        # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.
-        result = self._client.request("thread/start", {"cwd": self._cwd}, timeout=15)
+            control_socket = (
+                find_codex_control_socket(self._codex_home)
+                if self._prefer_desktop_control_socket and self._resume_thread_id else None
+            )
+            try:
+                self._client = self._open_client(control_socket)
+                self._using_desktop_control = bool(control_socket)
+            except Exception:
+                if not control_socket:
+                    raise
+                logger.info(
+                    "Codex desktop control unavailable; falling back to an isolated app-server",
+                    exc_info=True,
+                )
+                if self._client is not None:
+                    with contextlib.suppress(Exception):
+                        self._client.close()
+                self._client = self._open_client()
+                self._using_desktop_control = False
+        if self._resume_thread_id:
+            method, params = "thread/resume", {"threadId": self._resume_thread_id}
+        else:
+            method, params = "thread/start", {"cwd": self._cwd}
+            if self._model:
+                params["model"] = self._model
+        if self._resume_thread_id and self._using_desktop_control:
+            # Observe the existing writer before subscribing with
+            # thread/resume. This keeps a long desktop turn's notifications
+            # and approval requests on its owning client rather than filling
+            # this Telegram connection's queues while it waits.
+            self._thread_id = self._resume_thread_id
+            wait_error = self._wait_for_resumed_turn_boundary(
+                "desktop-writer", timeout=None, poll_timeout=0.25,
+            )
+            self._thread_id = None
+            if wait_error:
+                if self._interrupt_event.is_set():
+                    raise InterruptedError(wait_error)
+                raise RuntimeError(wait_error)
+        while True:
+            try:
+                result = self._client.request(method, params, timeout=15)
+            except CodexAppServerError as exc:
+                message = str(exc.message or "").lower()
+                if method == "thread/resume" and "archived" in message:
+                    self._client.request("thread/unarchive", {"threadId": self._resume_thread_id}, timeout=15)
+                    continue
+                if (
+                    method == "thread/resume"
+                    and self._resume_active_turn_mode == "queue"
+                    and exc.code == -32600
+                    and "active writer" in message
+                ):
+                    # Codex enforces one writer per durable thread. A desktop
+                    # turn can therefore make thread/resume temporarily fail
+                    # before this app-server has enough state to poll it. Keep
+                    # the Telegram input durable and retry acquisition; never
+                    # fork, interrupt, or silently run it in another thread.
+                    if self._interrupt_event.wait(0.5) or self._closed:
+                        raise InterruptedError(
+                            "Codex resume cancelled while waiting for the desktop writer"
+                        ) from exc
+                    continue
+                raise
+            thread_obj = result.get("thread") or {}
+            raced_turn_id = (
+                self._in_progress_turn_id(thread_obj)
+                or ("desktop-writer" if self._thread_is_active(thread_obj) else None)
+                if method == "thread/resume"
+                and self._using_desktop_control
+                and self._resume_active_turn_mode == "queue"
+                else None
+            )
+            if raced_turn_id:
+                # Desktop started after the pre-resume idle read. Detach this
+                # newly subscribed client immediately, then observe from a
+                # fresh unresumed connection so its notifications/approvals
+                # remain exclusively with the desktop owner.
+                self._client.close()
+                control_socket = find_codex_control_socket(self._codex_home)
+                if not control_socket:
+                    raise RuntimeError("Codex desktop control disappeared while waiting for its active turn")
+                self._client = self._open_client(control_socket)
+                self._thread_id = self._resume_thread_id
+                wait_error = self._wait_for_resumed_turn_boundary(
+                    raced_turn_id, timeout=None, poll_timeout=0.25,
+                )
+                self._thread_id = None
+                if wait_error:
+                    if self._interrupt_event.is_set():
+                        raise InterruptedError(wait_error)
+                    raise RuntimeError(wait_error)
+                continue
+            break
         # Different codex versions serialize the id under thread.id / sessionId / threadId.
         thread_obj = result.get("thread") or {}
         thread_id = thread_obj.get("id") or thread_obj.get("sessionId") or result.get("sessionId") or result.get("threadId")
@@ -195,7 +353,12 @@ class CodexAppServerSession:
                 code=-32603, message=f"codex thread/start returned no thread id (payload keys: {sorted(result.keys())})",
             )
         self._thread_id = thread_id
-        logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
+        if self._resume_thread_id:
+            self._resumed_active_turn_id = self._in_progress_turn_id(thread_obj)
+        logger.info(
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if self._resume_thread_id else "started", thread_id[:8], self._permission_profile, self._cwd,
+        )
         return thread_id
 
     def close(self) -> None:
@@ -204,15 +367,26 @@ class CodexAppServerSession:
         self._closed = True
         with self._active_turn_lock:
             self._active_turn_id = None
+            self._waiting_for_resumed_turn_id = None
         if self._client is not None:
             with contextlib.suppress(Exception):  # pragma: no cover - best-effort cleanup
                 self._client.close()
         self._client = None
         self._thread_id = None
+        self._resumed_active_turn_id = None
+        self._using_desktop_control = False
 
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to issue turn/interrupt and unwind."""
         self._interrupt_event.set()
+        # A queue-mode wait observes a desktop-owned turn but does not own it.
+        # /stop cancels only the Telegram input and must never interrupt that
+        # foreign desktop turn.
+        with self._active_turn_lock:
+            turn_id = self._active_turn_id
+            waiting_for = self._waiting_for_resumed_turn_id
+        if turn_id and turn_id != waiting_for:
+            self._issue_interrupt(turn_id)
 
     def request_steer(self, text: str) -> bool:
         """Append user guidance to the active Codex turn via ``turn/steer``."""
@@ -268,7 +442,10 @@ class CodexAppServerSession:
         """ensure_started(); startup failures become a retiring TurnResult.error instead of raw exceptions."""
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except InterruptedError:
+            result.interrupted = True
+            return False
+        except (CodexAppServerError, TimeoutError, RuntimeError, OSError) as exc:
             self._retire(result, self._format_error_with_stderr("codex app-server startup failed", exc))
             return False
         assert self._client is not None and self._thread_id is not None
@@ -279,11 +456,17 @@ class CodexAppServerSession:
         """Issue ``method``; on failure fill ``result.error`` and return None. A timeout always retires."""
         try:
             return self._client.request(method, params, timeout=10)
-        except CodexAppServerError as exc:
-            self._set_classified_error(result, f"{label} failed", exc.message, exc)
+        # ``TimeoutError`` is an ``OSError`` subclass on CPython, so it must
+        # be classified before transport failures. Timeouts retire the
+        # subprocess; an ordinary JSON-RPC error does not.
         except TimeoutError as exc:
             hint = _classify_oauth_failure(self._stderr_blob(40))
             self._retire(result, hint or self._format_error_with_stderr(f"{label} timed out", exc))
+        except (CodexAppServerError, RuntimeError, OSError) as exc:
+            if not isinstance(exc, CodexAppServerError):
+                self._retire(result, self._format_error_with_stderr(f"{label} transport failed", exc))
+                return None
+            self._set_classified_error(result, f"{label} failed", exc.message, exc)
         return None
 
     def _subprocess_died(self, result: TurnResult) -> bool:
@@ -323,6 +506,92 @@ class CodexAppServerSession:
                 result.error = result.error or "codex reported turn_aborted"
         return projection, aborted
 
+    def _turn_start_params(self, user_text: str, client_message_id: str) -> dict[str, Any]:
+        """Build the stable per-turn app-server policy and idempotency payload."""
+        params: dict[str, Any] = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_text}],
+            "clientUserMessageId": client_message_id,
+        }
+        if self._model:
+            params["model"] = self._model
+        if self._reasoning_effort:
+            params["effort"] = self._reasoning_effort
+        if self._approval_policy:
+            params["approvalPolicy"] = self._approval_policy
+        if self._sandbox_policy:
+            params["sandboxPolicy"] = dict(self._sandbox_policy)
+        return params
+
+    @staticmethod
+    def _in_progress_turn_id(thread_obj: Any) -> Optional[str]:
+        if not isinstance(thread_obj, dict):
+            return None
+        for turn in reversed(thread_obj.get("turns") or []):
+            if not isinstance(turn, dict):
+                continue
+            raw_status = turn.get("status")
+            status = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
+            if str(status or "").replace("_", "").lower() == "inprogress":
+                return str(turn.get("id") or "").strip() or None
+        return None
+
+    @staticmethod
+    def _thread_is_active(thread_obj: Any) -> bool:
+        if not isinstance(thread_obj, dict):
+            return False
+        raw_status = thread_obj.get("status")
+        status = raw_status.get("type") if isinstance(raw_status, dict) else raw_status
+        return str(status or "").replace("_", "").lower() in {"active", "inprogress"}
+
+    def _wait_for_resumed_turn_boundary(
+        self, turn_id: str, *, timeout: Optional[float], poll_timeout: float,
+    ) -> Optional[str]:
+        """Wait for a desktop-owned turn without steering or interrupting it."""
+        assert self._client is not None and self._thread_id is not None
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._active_turn_lock:
+            self._active_turn_id = turn_id
+            self._waiting_for_resumed_turn_id = turn_id
+        try:
+            while deadline is None or time.monotonic() < deadline:
+                if self._interrupt_event.is_set():
+                    return "queued Telegram turn cancelled while waiting for the desktop turn"
+                if not self._client.is_alive():
+                    return self._format_error_with_stderr(
+                        "codex app-server subprocess exited while waiting for the desktop turn",
+                        tail_lines=20,
+                    )
+                # A resumed app-server reads the durable thread state. Polling
+                # thread/read works even though the desktop turn's live events
+                # belong to another process and are mirrored from its rollout.
+                try:
+                    state = self._client.request(
+                        # Runtime status is sufficient here. Omitting turn
+                        # bodies avoids reloading multi-megabyte histories on
+                        # every desktop-writer poll.
+                        "thread/read", {"threadId": self._thread_id, "includeTurns": False},
+                        timeout=max(2.0, min(10.0, poll_timeout * 4)),
+                    )
+                except (CodexAppServerError, TimeoutError, RuntimeError, OSError) as exc:
+                    return f"could not observe active desktop turn: {exc}"
+                thread_state = state.get("thread") or state
+                current = self._in_progress_turn_id(thread_state)
+                if current is not None:
+                    still_active = current == turn_id
+                else:
+                    still_active = self._thread_is_active(thread_state)
+                if not still_active:
+                    return None
+                time.sleep(max(0.1, min(2.0, poll_timeout)))
+            return "timed out waiting for the active desktop turn before starting the Telegram turn"
+        finally:
+            with self._active_turn_lock:
+                if self._active_turn_id == turn_id:
+                    self._active_turn_id = None
+                if self._waiting_for_resumed_turn_id == turn_id:
+                    self._waiting_for_resumed_turn_id = None
+
     def run_turn(
         self, user_input: Any, *, turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
@@ -344,9 +613,29 @@ class CodexAppServerSession:
                 result.interrupted = True
             else:
                 result.submitted_user_text = _coerce_turn_input_text(user_input)
+                client_message_id = self._client_user_message_id or str(uuid.uuid4())
+                if self._resumed_active_turn_id and self._resume_active_turn_mode == "queue":
+                    wait_error = self._wait_for_resumed_turn_boundary(
+                        # A foreign desktop turn has no Hermes inactivity
+                        # deadline. The durable Telegram input waits until the
+                        # boundary or an explicit /stop/shutdown signal.
+                        self._resumed_active_turn_id, timeout=None,
+                        poll_timeout=notification_poll_timeout,
+                    )
+                    self._resumed_active_turn_id = None
+                    if wait_error:
+                        result.error = wait_error
+                        result.interrupted = self._interrupt_event.is_set()
+                        result.should_retire = not result.interrupted
+                        self._interrupt_event.clear()
+                        return result
+                # This callback is the durable ambiguity fence. It must run
+                # immediately before the request write, after every wait that
+                # can still cancel without submitting anything to Codex.
+                if self._on_turn_starting is not None:
+                    self._on_turn_starting(str(self._thread_id), client_message_id)
                 ts = self._request_for(
-                    result, "turn/start",
-                    {"threadId": self._thread_id, "input": [{"type": "text", "text": result.submitted_user_text}]},
+                    result, "turn/start", self._turn_start_params(result.submitted_user_text, client_message_id),
                     "turn/start",
                 )
                 if ts is not None:
@@ -363,6 +652,10 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
+            self._waiting_for_resumed_turn_id = None
+        if self._on_turn_started is not None and result.turn_id is not None:
+            with contextlib.suppress(Exception):
+                self._on_turn_started(str(self._thread_id), str(result.turn_id))
         # Post-tool watchdog: armed on each tool completion, cleared by any other activity.
         last_tool_completion_at: Optional[float] = None
 
@@ -406,7 +699,11 @@ class CodexAppServerSession:
                 return aborted
             turn_obj = (note.get("params") or {}).get("turn") or {}
             turn_status = turn_obj.get("status")
-            if turn_status and turn_status not in {"completed", "interrupted"} and turn_obj.get("error"):
+            if turn_status == "interrupted":
+                result.interrupted = True
+                if not self._interrupt_event.is_set():
+                    result.error = result.error or "Codex 작업이 외부 요인으로 중단되어 완료되지 않았습니다."
+            elif turn_status and turn_status != "completed" and turn_obj.get("error"):
                 err_msg = _format_responses_error(turn_obj["error"], str(turn_status))
                 self._set_classified_error(result, f"turn ended status={turn_status}", err_msg, err_msg)
             return True
@@ -448,6 +745,7 @@ class CodexAppServerSession:
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
                 turn_complete = on_server_request(sreq)
+                deadline = time.monotonic() + turn_timeout
                 continue
             note = self._client.take_notification(timeout=notification_poll_timeout)
             if note is None:
@@ -458,6 +756,9 @@ class CodexAppServerSession:
             if not _notification_belongs_to_turn(note, thread_id=self._thread_id, turn_id=result.turn_id):
                 logger.debug("ignoring foreign codex notification: method=%s", method)
                 continue
+            # This is an inactivity deadline, not a wall-clock cap. Healthy
+            # multi-hour turns keep their lease while scoped events arrive.
+            deadline = time.monotonic() + turn_timeout
             turn_complete = on_note(note, method)
 
         if accept_final_text_at_deadline and not turn_complete and not result.interrupted and result.final_text and result.error is None:
@@ -542,7 +843,7 @@ class CodexAppServerSession:
             return
         try:
             self._client.request("turn/interrupt", {"threadId": self._thread_id, "turnId": turn_id}, timeout=5)
-        except CodexAppServerError as exc:
+        except (CodexAppServerError, RuntimeError, OSError) as exc:
             # "no active turn to interrupt" is fine — already done.
             logger.debug("turn/interrupt non-fatal: %s", exc)
         except TimeoutError:
@@ -559,6 +860,25 @@ class CodexAppServerSession:
         method = req.get("method", "")
         rid = req.get("id")
         params = req.get("params") or {}
+        observed_thread, observed_turn = _notification_scope_ids({"params": params})
+        with self._active_turn_lock:
+            active_turn = self._active_turn_id
+        approval_request = method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+        }
+        if (
+            (approval_request and (observed_thread is None or observed_turn is None or active_turn is None))
+            or (observed_thread is not None and str(observed_thread) != str(self._thread_id))
+            or (observed_turn is not None and active_turn is not None and str(observed_turn) != str(active_turn))
+        ):
+            logger.warning(
+                "Rejecting foreign codex server request: method=%s thread=%s turn=%s",
+                method, observed_thread, observed_turn,
+            )
+            self._client.respond_error(rid, code=-32602, message="Request is outside this Hermes turn")
+            return
         handler = self._SERVER_REQUEST_HANDLERS.get(method)
         if handler is None:
             logger.warning("Unknown codex server request: %s", method)
@@ -575,7 +895,9 @@ class CodexAppServerSession:
     _SERVER_REQUEST_HANDLERS: dict[str, Callable[..., dict]] = {
         "item/commandExecution/requestApproval": lambda self, p: {"decision": self._decide_exec_approval(p)},
         "item/fileChange/requestApproval": lambda self, p: {"decision": self._decide_apply_patch_approval(p)},
-        "item/permissions/requestApproval": lambda self, p: {"decision": "decline"},
+        "item/permissions/requestApproval": lambda self, p: {
+            "decision": "accept" if self._approval_policy == "never" else "decline"
+        },
         "mcpServer/elicitation/request": _respond_elicitation,
     }
 

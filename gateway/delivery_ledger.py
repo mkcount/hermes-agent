@@ -267,6 +267,31 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
     _prune()
 
 
+def ensure_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                      thread_id: Optional[str], content: str,
+                      adapter_profile: Optional[str] = None) -> bool:
+    """Create an obligation only when its stable id has no existing state.
+
+    Recovery paths use this instead of ``record_obligation`` so observing an
+    already-delivered or concurrently-attempting row can never reset it to
+    pending and duplicate a reply. Returns whether this call inserted it.
+    """
+    now, (pid, started) = time.time(), _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, adapter_profile)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+            (obligation_id, session_key, platform, str(chat_id),
+             str(thread_id) if thread_id else None, content, now, now, pid, started,
+             str(adapter_profile).strip() if adapter_profile else "default"),
+        )
+    _prune()
+    return bool(cursor.rowcount)
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 

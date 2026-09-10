@@ -381,21 +381,34 @@ def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any]:
 
 def _ensure_codex_session(agent) -> None:
     """Lazily spawn one CodexAppServerSession per AIAgent (reused across turns, closed by the _cleanup hook)."""
-    if getattr(agent, "_codex_session", None) is not None:
+    existing = getattr(agent, "_codex_session", None)
+    if existing is not None:
+        existing.set_turn_callbacks(
+            on_turn_starting=getattr(agent, "_codex_turn_starting_callback", None),
+            on_turn_started=getattr(agent, "_codex_turn_started_callback", None),
+            client_user_message_id=getattr(agent, "_codex_client_user_message_id", None),
+            model=getattr(agent, "_codex_model_override", None),
+            reasoning_effort=getattr(agent, "_codex_reasoning_effort_override", None),
+        )
         return
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
+    bridge_full_access = getattr(agent, "_gateway_codex_full_access", False) is True
     # Approval callback: Hermes' standard prompt flow when a CLI thread installed one.
+    # A Telegram Codex binding is an explicit, session-scoped full-access grant;
+    # it must not open a second Hermes approval UI on top of app-server's
+    # approvalPolicy=never.
     approval_callback = None
-    with suppress(Exception):
-        from tools.terminal_tool import _get_approval_callback
-        approval_callback = _get_approval_callback()
+    if not bridge_full_access:
+        with suppress(Exception):
+            from tools.terminal_tool import _get_approval_callback
+            approval_callback = _get_approval_callback()
     # Gateway/cron have no UI for codex approval requests, so exec/apply_patch fail closed by default. Only an
     # explicit approval bypass (approvals.mode: off, /yolo, --yolo, HERMES_YOLO_MODE) hands policy to codex's sandbox.
-    auto_approve_requests = False
+    auto_approve_requests = bridge_full_access
     try:
         from tools.approval import is_approval_bypass_active
-        auto_approve_requests = is_approval_bypass_active()
+        auto_approve_requests = bridge_full_access or is_approval_bypass_active()
     except Exception:
         logger.debug("codex app-server: approval-bypass lookup failed; keeping fail-closed default", exc_info=True)
     # Bridge codex JSON-RPC notifications (item/started, item/completed, item/agentMessage/delta, ...) into
@@ -405,8 +418,18 @@ def _ensure_codex_session(agent) -> None:
     # narrower item/started-only bridge from #38835.
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
+        resume_thread_id=getattr(agent, "_codex_resume_thread_id", None),
+        prefer_desktop_control_socket=bridge_full_access,
+        model=getattr(agent, "_codex_model_override", None),
+        reasoning_effort=getattr(agent, "_codex_reasoning_effort_override", None),
+        resume_active_turn_mode=getattr(agent, "_codex_resume_active_turn_mode", "steer"),
+        approval_policy="never" if bridge_full_access else None,
+        sandbox_policy={"type": "dangerFullAccess"} if bridge_full_access else None,
+        client_user_message_id=getattr(agent, "_codex_client_user_message_id", None),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
+        on_turn_starting=getattr(agent, "_codex_turn_starting_callback", None),
+        on_turn_started=getattr(agent, "_codex_turn_started_callback", None),
     )
 
 
@@ -500,6 +523,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
+        codex_submission_started=turn.submitted_user_text is not None,
+        codex_should_retire=bool(turn.should_retire),
         **usage_result,
     )
 

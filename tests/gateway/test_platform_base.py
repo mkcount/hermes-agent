@@ -19,8 +19,11 @@ from gateway.platforms.base import (
     _log_safe_path,
     _prefix_within_utf16_limit,
     cache_audio_from_bytes,
+    SessionRouteRejected,
 )
+from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
@@ -1311,6 +1314,58 @@ class _CapturingAdapter(BasePlatformAdapter):
             "metadata": metadata,
         })
         return SendResult(success=True, message_id="m1")
+
+
+class TestTrustedSessionRouteResolver:
+    @pytest.mark.asyncio
+    async def test_unexpected_router_failure_is_visible_and_never_dispatches(self):
+        adapter = _CapturingAdapter()
+        dispatched = []
+
+        async def broken(_event):
+            raise RuntimeError("database unavailable")
+
+        async def handler(event):
+            dispatched.append(event)
+            return "must not run"
+
+        adapter.set_session_route_resolver(broken)
+        adapter.set_message_handler(handler)
+        event = MessageEvent(
+            text="do work",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm"),
+        )
+
+        await adapter.handle_message(event)
+
+        assert dispatched == []
+        assert event._gateway_accepted is True
+        assert len(adapter.sent) == 1
+        assert "실행하지 않았습니다" in adapter.sent[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_silent_duplicate_rejection_does_not_dispatch_or_send(self):
+        adapter = _CapturingAdapter()
+        dispatched = []
+
+        async def rejected(_event):
+            raise SessionRouteRejected("")
+
+        async def handler(event):
+            dispatched.append(event)
+
+        adapter.set_session_route_resolver(rejected)
+        adapter.set_message_handler(handler)
+        event = MessageEvent(
+            text="duplicate",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm"),
+        )
+
+        await adapter.handle_message(event)
+
+        assert dispatched == []
+        assert adapter.sent == []
+        assert event._gateway_accepted is True
 
 
 class TestMediaFallbackDoesNotLeakHostPath:

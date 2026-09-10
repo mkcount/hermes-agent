@@ -50,6 +50,12 @@ class TurnContext:
     event_message_id: Optional[str] = None
     # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
     inbound_message_id: Optional[str] = None
+    # Trusted Telegram ↔ Codex bridge grant. These are process-local turn
+    # inputs, never parsed from model text or persisted session-source fields.
+    codex_bridge_control_key: Optional[str] = None
+    codex_bridge_thread_id: Optional[str] = None
+    codex_bridge_generation: Optional[int] = None
+    codex_bridge_input_id: Optional[str] = None
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
