@@ -594,16 +594,13 @@ class CodexAppServerSession:
 
     def run_turn(
         self, user_input: Any, *, turn_timeout: float = 600.0,
-        notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
+        notification_poll_timeout: float = 0.25,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
-        post_tool_quiet_timeout: silence this long after a tool completes fast-fails and retires.
-
-        post_tool_quiet_timeout: if codex emits a tool completion and then goes quiet for this many seconds
-        without emitting another item or `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697) so a wedged codex doesn't burn the
-        full turn deadline.
+        ``turn_timeout`` is an inactivity deadline renewed by every in-scope app-server
+        notification or server request. Explicit interrupts, transport/process failure,
+        and the app-server's terminal ``turn/completed`` event remain authoritative.
         """
         result = TurnResult()
         if self._start_for(result):
@@ -639,15 +636,14 @@ class CodexAppServerSession:
                     "turn/start",
                 )
                 if ts is not None:
-                    self._run_started_turn(result, ts, turn_timeout, notification_poll_timeout, post_tool_quiet_timeout)
+                    self._run_started_turn(result, ts, turn_timeout, notification_poll_timeout)
         self._interrupt_event.clear()
         return result
 
     def _run_started_turn(
         self, result: TurnResult, ts: dict, turn_timeout: float, notification_poll_timeout: float,
-        post_tool_quiet_timeout: float,
     ) -> None:
-        """Drive an accepted ``turn/start`` to completion: watchdog, approvals, projection."""
+        """Drive an accepted ``turn/start`` to completion: approvals and event projection."""
         projector = CodexEventProjector()
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
@@ -656,19 +652,8 @@ class CodexAppServerSession:
         if self._on_turn_started is not None and result.turn_id is not None:
             with contextlib.suppress(Exception):
                 self._on_turn_started(str(self._thread_id), str(result.turn_id))
-        # Post-tool watchdog: armed on each tool completion, cleared by any other activity.
-        last_tool_completion_at: Optional[float] = None
-
-        def watchdog_tripped() -> bool:
-            if last_tool_completion_at is None or (time.monotonic() - last_tool_completion_at) <= post_tool_quiet_timeout:
-                return False
-            self._issue_interrupt(result.turn_id)
-            result.interrupted = True
-            self._retire(result, f"codex went silent for {post_tool_quiet_timeout:.0f}s after a tool result; retiring app-server session.")
-            return True
 
         def on_server_request(sreq: dict) -> bool:
-            nonlocal last_tool_completion_at
             # Drain pending notifications first (bounded) so _pending_file_changes is
             # current for the approval decision and display events still reach on_event.
             turn_complete = False
@@ -679,22 +664,13 @@ class CodexAppServerSession:
                 if not _notification_belongs_to_turn(pending, thread_id=self._thread_id, turn_id=result.turn_id):
                     logger.debug("ignoring foreign codex notification while draining server request: method=%s", pending.get("method"))
                     continue
-                proj, aborted = self._absorb_notification(result, projector, pending)
-                if proj.is_tool_iteration:
-                    last_tool_completion_at = time.monotonic()
+                _, aborted = self._absorb_notification(result, projector, pending)
                 turn_complete = turn_complete or aborted
             self._handle_server_request(sreq)
-            # An approval round-trip is live signal — don't let it trip the watchdog.
-            last_tool_completion_at = None
             return turn_complete
 
         def on_note(note: dict, method: str) -> bool:
-            nonlocal last_tool_completion_at
-            projection, aborted = self._absorb_notification(result, projector, note)
-            if projection.is_tool_iteration:
-                last_tool_completion_at = time.monotonic()
-            elif projection.messages or projection.final_text is not None:
-                last_tool_completion_at = None
+            _, aborted = self._absorb_notification(result, projector, note)
             if method != "turn/completed":
                 return aborted
             turn_obj = (note.get("params") or {}).get("turn") or {}
@@ -710,7 +686,7 @@ class CodexAppServerSession:
 
         self._drive_turn(
             result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
-            timeout_label="turn", before_poll=watchdog_tripped, on_server_request=on_server_request,
+            timeout_label="turn", on_server_request=on_server_request,
             on_note=on_note, accept_final_text_at_deadline=True,
         )
         with self._active_turn_lock:
@@ -719,17 +695,17 @@ class CodexAppServerSession:
     def _drive_turn(
         self, result: TurnResult, *, turn_timeout: float, notification_poll_timeout: float,
         timeout_label: str, on_server_request: Callable[[dict], bool],
-        on_note: Callable[[dict, str], bool], before_poll: Optional[Callable[[], bool]] = None,
+        on_note: Callable[[dict, str], bool],
         pre_scope_filter: Optional[Callable[[dict, str], bool]] = None,
         accept_final_text_at_deadline: bool = False,
     ) -> None:
         """Shared poll loop for run_turn / compact_thread until turn/completed or deadline.
 
-        Per iteration: interrupt -> subprocess death -> ``before_poll`` (watchdog) ->
-        server requests (answered first so codex isn't blocked) -> one notification,
-        filtered by ``pre_scope_filter`` then turn scope, handed to ``on_note``. Hooks
-        return True to complete the turn. Deadline without completion interrupts and
-        retires the session.
+        Per iteration: interrupt -> subprocess death -> server requests (answered first
+        so codex isn't blocked) -> one notification, filtered by ``pre_scope_filter``
+        then turn scope, handed to ``on_note``. In-scope requests and notifications
+        renew the inactivity deadline. Hooks return True to complete the turn. Deadline
+        without completion interrupts and retires the session.
         """
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
@@ -739,8 +715,6 @@ class CodexAppServerSession:
                 result.interrupted = True
                 break
             if self._subprocess_died(result):
-                break
-            if before_poll is not None and before_poll():
                 break
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:

@@ -127,6 +127,40 @@ class FakeClient:
         self._stderr_tail = list(lines)
 
 
+class VirtualClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class ScheduledNotificationClient(FakeClient):
+    """Deliver queued notifications on a virtual schedule, one bounded poll at a time."""
+
+    def __init__(self, clock: VirtualClock, delays: list[float]) -> None:
+        super().__init__()
+        self._clock = clock
+        self._notification_delays = list(delays)
+
+    def take_notification(self, timeout: float = 0.0):
+        if not self._notifications:
+            self._clock.advance(timeout)
+            return None
+        remaining = self._notification_delays[0] if self._notification_delays else 0.0
+        if remaining > timeout:
+            self._notification_delays[0] = remaining - timeout
+            self._clock.advance(timeout)
+            return None
+        self._clock.advance(remaining)
+        if self._notification_delays:
+            self._notification_delays.pop(0)
+        return self._notifications.pop(0)
+
+
 def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     return CodexAppServerSession(
         cwd="/tmp",
@@ -914,8 +948,7 @@ class TestApprovalPromptEnrichment:
 class TestSessionRetirement:
     """Mirrors openclaw beta.8's resilience fixes:
       - retire timed-out app-server clients (should_retire on deadline)
-      - post-tool completion watchdog (don't burn the full deadline after a
-        tool result if codex goes silent)
+      - use the shared app-server inactivity deadline after tool completion
       - <turn_aborted> raw marker as terminal (don't wait for turn/completed
         that never comes)
       - OAuth refresh failure classification (suggest `codex login` instead
@@ -953,8 +986,12 @@ class TestSessionRetirement:
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
 
-    def test_post_tool_watchdog_uses_monotonic_clock(self):
-        client = FakeClient()
+    def test_post_tool_silence_waits_for_app_server_terminal_event(self):
+        """There is no shorter post-tool deadline: a healthy quiet interval may
+        precede the app-server's authoritative turn/completed event.
+        """
+        clock = VirtualClock()
+        client = ScheduledNotificationClient(clock, [0.0, 120.0, 0.0])
         client.queue_notification(
             "item/completed",
             item={
@@ -964,28 +1001,36 @@ class TestSessionRetirement:
                 "exitCode": 0, "commandActions": [],
             },
             threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "finished after thinking"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 999.0, 1000.2])
-        with patch.object(
-            session_mod.time,
-            "monotonic",
-            side_effect=lambda: next(monotonic_values),
-        ):
+        with patch.object(session_mod.time, "monotonic", side_effect=clock):
             r = s.run_turn(
                 "tool then silence",
-                turn_timeout=5.0,
-                notification_poll_timeout=0.0,
-                post_tool_quiet_timeout=0.15,
+                turn_timeout=250.0,
+                notification_poll_timeout=10.0,
             )
-        assert r.interrupted is True
-        assert r.should_retire is True
-        assert r.error and "silent" in r.error
+        assert clock.value >= 120.0
+        assert r.tool_iterations == 1
+        assert r.final_text == "finished after thinking"
+        assert r.interrupted is False
+        assert r.should_retire is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
-    def test_post_tool_watchdog_resets_on_further_activity(self):
-        """A tool completion followed by an agent message should NOT trip
-        the watchdog — further activity = codex still alive."""
-        client = FakeClient()
+    def test_hidden_tool_events_renew_inactivity_deadline(self):
+        """Detailed tool events count as liveness even when no Telegram-facing
+        message is projected. Their total duration may exceed one timeout window.
+        """
+        clock = VirtualClock()
+        client = ScheduledNotificationClient(clock, [0.0, 35.0, 35.0, 35.0, 0.0])
         client.queue_notification(
             "item/completed",
             item={
@@ -996,7 +1041,14 @@ class TestSessionRetirement:
             },
             threadId="t", turnId="tu1",
         )
-        # Non-tool activity immediately after — resets watchdog.
+        client.queue_notification(
+            "item/commandExecution/outputDelta",
+            itemId="ex2", delta="working 1", threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/commandExecution/outputDelta",
+            itemId="ex2", delta="working 2", threadId="t", turnId="tu1",
+        )
         client.queue_notification(
             "item/completed",
             item={"type": "agentMessage", "id": "m1", "text": "tool finished"},
@@ -1007,13 +1059,12 @@ class TestSessionRetirement:
             turn={"id": "tu1", "status": "completed", "error": None},
         )
         s = make_session(client)
-        r = s.run_turn(
-            "tool then talk", turn_timeout=2.0,
-            notification_poll_timeout=0.01,
-            post_tool_quiet_timeout=0.05,
-        )
-        # Tool ran, then text reset the watchdog, then turn/completed.
-        # Should NOT be a retirement case.
+        with patch.object(session_mod.time, "monotonic", side_effect=clock):
+            r = s.run_turn(
+                "tool activity then talk", turn_timeout=60.0,
+                notification_poll_timeout=5.0,
+            )
+        assert clock.value >= 105.0
         assert r.tool_iterations == 1
         assert r.final_text == "tool finished"
         assert r.should_retire is False
