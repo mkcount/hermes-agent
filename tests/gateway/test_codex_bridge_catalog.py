@@ -30,7 +30,10 @@ class _FakeClient:
                 },
                 {
                     "id": "thread-a",
-                    "preview": "original task",
+                    "preview": (
+                        "[Note: model was just switched from old to new via OpenAI Codex. "
+                        "Adjust your self-identification accordingly.]\n\noriginal task"
+                    ),
                     "createdAt": 10,
                     "updatedAt": 20,
                     "cwd": "/old",

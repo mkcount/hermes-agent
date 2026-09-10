@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
@@ -10,6 +11,12 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
     find_codex_control_socket,
+)
+
+_MODEL_SWITCH_NOTE_RE = re.compile(
+    r"^\[Note:\s*model was just switched from [^\r\n]* via OpenAI Codex\.\s*"
+    r"Adjust your self-identification accordingly\.\]\s*",
+    re.IGNORECASE,
 )
 
 
@@ -41,7 +48,10 @@ def _thread_summary(value: object) -> Optional[CodexThreadSummary]:
         str(status_obj.get("type") or "unknown") if isinstance(status_obj, dict)
         else str(status_obj or "unknown")
     )
-    title = " ".join(str(value.get("name") or value.get("preview") or "Untitled").split())
+    title = str(value.get("name") or value.get("preview") or "")
+    if not str(value.get("name") or "").strip():
+        title = _MODEL_SWITCH_NOTE_RE.sub("", title)
+    title = " ".join((title or "Untitled").split())
     return CodexThreadSummary(
         thread_id=thread_id, title=title, cwd=str(value.get("cwd") or ""),
         updated_at=int(value.get("updatedAt") or value.get("recencyAt") or 0),
