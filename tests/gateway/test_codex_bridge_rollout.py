@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import gateway.codex_bridge.rollout as rollout_mod
@@ -41,6 +42,24 @@ def test_path_uses_session_meta_not_ambiguous_filename(tmp_path):
     assert resolve_rollout_path(
         THREAD, hinted_path=str(unrelated), codex_home=str(tmp_path),
     ) == continuation.resolve()
+
+
+def test_path_follows_state_index_when_a_valid_hint_is_an_old_incarnation(tmp_path):
+    root = tmp_path / "sessions" / "2026" / "09" / "10"
+    old = root / f"rollout-old-{THREAD}.jsonl"
+    current = root / f"rollout-current-{THREAD}_{OTHER}.jsonl"
+    _write(old, [_meta(THREAD)])
+    _write(current, [_meta(THREAD)])
+    with sqlite3.connect(tmp_path / "state_5.sqlite") as connection:
+        connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+            (THREAD, str(current)),
+        )
+
+    assert resolve_rollout_path(
+        THREAD, hinted_path=str(old), codex_home=str(tmp_path),
+    ) == current.resolve()
 
 
 def test_explicit_aborted_turn_continues_provenance_without_new_user_item(tmp_path):

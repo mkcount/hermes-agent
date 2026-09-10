@@ -786,9 +786,13 @@ class GatewayCodexBridgeMixin:
         key = (binding.control_session_key, binding.generation)
         tail = self._codex_bridge_tails.get(key)
         if tail is None or tail.path != path:
+            same_incarnation = binding.rollout_path == str(path)
             tail = RolloutTail(
-                binding.thread_id, path, device=binding.cursor_device, inode=binding.cursor_inode,
-                offset=binding.cursor_offset,
+                binding.thread_id,
+                path,
+                device=binding.cursor_device if same_incarnation else None,
+                inode=binding.cursor_inode if same_incarnation else None,
+                offset=binding.cursor_offset if same_incarnation else 0,
             )
             self._codex_bridge_tails[key] = tail
         events, next_offset, stat = await asyncio.to_thread(tail.scan)

@@ -1,6 +1,7 @@
 """Pre-guard routing tests for bound Telegram Codex lanes."""
 
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -171,6 +172,48 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
     assert "이미 연결된" in answer
     assert store.get_binding(build_session_key(source)).generation == current.generation
     assert store.input_state(input_id) == "routed"
+
+
+@pytest.mark.asyncio
+async def test_rollout_incarnation_change_starts_with_a_file_local_cursor(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    binding = store.bind(
+        build_session_key(source),
+        source,
+        thread_id="thread-123",
+        rollout_path="/old.jsonl",
+        cursor_device=11,
+        cursor_inode=22,
+        cursor_offset=33,
+    )
+    bridge = _Bridge(store)
+    bridge._adapter_for_source = lambda _source: object()
+    current = tmp_path / "current.jsonl"
+    current.write_text("", encoding="utf-8")
+    captured = {}
+
+    class Tail:
+        def __init__(self, thread_id, path, **kwargs):
+            captured.update(thread_id=thread_id, path=path, **kwargs)
+            self.path = Path(path)
+            self.offset = kwargs["offset"]
+
+        def scan(self):
+            return [], 0, current.stat()
+
+    monkeypatch.setattr("gateway.codex_bridge.mixin.resolve_rollout_path", lambda *_args, **_kwargs: current)
+    monkeypatch.setattr("gateway.codex_bridge.mixin.RolloutTail", Tail)
+
+    await bridge._codex_bridge_poll_binding_locked(store, binding)
+
+    assert captured == {
+        "thread_id": "thread-123",
+        "path": current,
+        "device": None,
+        "inode": None,
+        "offset": 0,
+    }
 
 
 @pytest.mark.asyncio

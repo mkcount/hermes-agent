@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
-from agent.transports.codex_app_server import CodexAppServerClient, find_codex_control_socket
+from agent.transports.codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    find_codex_control_socket,
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,80 @@ def _thread_summary(value: object) -> Optional[CodexThreadSummary]:
     )
 
 
+def _unique_thread_summaries(
+    values: Iterable[object], *, limit: int,
+) -> list[CodexThreadSummary]:
+    """Collapse recovered rollout rows into logical app-server threads.
+
+    A default ``thread/list`` may recover more than one paginated JSONL
+    incarnation for the same thread id.  Runtime fields belong to the newest
+    row, while an explicit name (or otherwise the oldest preview) is the
+    stable user-facing title rather than a continuation fragment's first
+    prompt.
+    """
+    merged: dict[str, tuple[CodexThreadSummary, bool, int]] = {}
+    for value in values:
+        summary = _thread_summary(value)
+        if summary is None:
+            continue
+        raw = value if isinstance(value, dict) else {}
+        named = bool(str(raw.get("name") or "").strip())
+        created_at = int(raw.get("createdAt") or 0)
+        current = merged.get(summary.thread_id)
+        if current is None:
+            merged[summary.thread_id] = (summary, named, created_at)
+            continue
+
+        newest, title_named, title_created_at = current
+        title = newest.title
+        if summary.updated_at > newest.updated_at:
+            newest = summary
+        if named and not title_named:
+            title, title_named, title_created_at = summary.title, True, created_at
+        elif named == title_named and created_at and (
+            not title_created_at or created_at < title_created_at
+        ):
+            title, title_created_at = summary.title, created_at
+        merged[summary.thread_id] = (
+            CodexThreadSummary(
+                thread_id=newest.thread_id,
+                title=title,
+                cwd=newest.cwd,
+                updated_at=newest.updated_at,
+                status=newest.status,
+                rollout_path=newest.rollout_path,
+            ),
+            title_named,
+            title_created_at,
+        )
+
+    rows = [entry[0] for entry in merged.values()]
+    rows.sort(key=lambda row: row.updated_at, reverse=True)
+    return rows[:max(1, int(limit))]
+
+
+def _list_thread_rows(client: CodexAppServerClient, *, limit: int) -> list[object]:
+    requested = max(1, min(int(limit), 100))
+    params = {
+        "limit": requested,
+        "archived": False,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        # The state database has one current row per logical thread.  The
+        # default JSONL recovery scan can expose each paginated incarnation as
+        # a separate picker item with a fragment-local preview.
+        "useStateDbOnly": True,
+    }
+    try:
+        result = client.request("thread/list", params, timeout=15)
+    except CodexAppServerError as exc:
+        if exc.code not in {-32601, -32602}:
+            raise
+        params.pop("useStateDbOnly")
+        result = client.request("thread/list", params, timeout=15)
+    return list(result.get("data") or [])
+
+
 def list_recent_threads(
     *, limit: int = 8, codex_home: Optional[str] = None,
     client_factory: Callable[..., CodexAppServerClient] = CodexAppServerClient,
@@ -62,14 +140,8 @@ def list_recent_threads(
                 client_name="hermes-codex-picker", client_title="Hermes Codex Session Picker",
                 client_version="1",
             )
-            result = client.request(
-                "thread/list",
-                {"limit": max(1, min(int(limit), 100)), "archived": False,
-                 "sortKey": "updated_at", "sortDirection": "desc"},
-                timeout=15,
-            )
-            rows = [_thread_summary(item) for item in result.get("data") or []]
-            return [row for row in rows if row is not None][:limit]
+            rows = _list_thread_rows(client, limit=limit)
+            return _unique_thread_summaries(rows, limit=limit)
         except Exception:
             if not socket_path:
                 raise

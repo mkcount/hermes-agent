@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -56,8 +57,9 @@ def resolve_rollout_path(
 
     Codex continuation files may contain both a logical thread id and a file
     incarnation id in their filename. Conversely, child files can contain a
-    parent's id as a filename substring. The first ``session_meta`` record is
-    therefore the authority; the filename is only a bounded candidate index.
+    parent's id as a filename substring. The state database identifies the
+    current incarnation, while the first ``session_meta`` record remains the
+    authority for accepting any candidate path.
     """
     cleaned = str(thread_id or "").strip()
     if not _THREAD_ID_RE.fullmatch(cleaned):
@@ -84,6 +86,18 @@ def resolve_rollout_path(
             return None
         return resolved if str(payload.get("id") or "") == cleaned else None
 
+    state_db = _codex_home(codex_home) / "state_5.sqlite"
+    if state_db.is_file():
+        try:
+            uri = f"{state_db.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+                row = connection.execute(
+                    "SELECT rollout_path FROM threads WHERE id=?", (cleaned,),
+                ).fetchone()
+            if row and (hit := accepted(Path(str(row[0])))) is not None:
+                return hit
+        except (OSError, sqlite3.Error, ValueError):
+            pass
     if hinted_path and (hit := accepted(Path(hinted_path))) is not None:
         return hit
     try:
