@@ -336,7 +336,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         # item through the interim callback creates a second Telegram bubble.
         # Keep the phase-less path for older Codex versions whose completed
         # agentMessage was the only live commentary signal.
-        phase = str(item.get("phase") or "").strip().lower().replace("_", "").replace("-", "")
+        phase = (
+            str(item.get("phase") or "")
+            .strip()
+            .lower()
+            .replace("_", "")
+            .replace("-", "")
+        )
         if phase and phase != "commentary":
             return
         # display.show_commentary=false keeps mid-turn narration off the interim path too (codex_responses contract).
