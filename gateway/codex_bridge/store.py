@@ -50,6 +50,9 @@ class DurableCodexInput:
     state: str
     final_text: Optional[str] = None
     codex_turn_id: Optional[str] = None
+    delivery_owner: str = "none"
+    turn_outcome: str = "unknown"
+    continuation_turn_id: Optional[str] = None
 
 
 class CodexBridgeStore:
@@ -109,6 +112,9 @@ class CodexBridgeStore:
                 updated_at REAL NOT NULL,
                 final_text TEXT,
                 codex_turn_id TEXT,
+                delivery_owner TEXT NOT NULL DEFAULT 'none',
+                turn_outcome TEXT NOT NULL DEFAULT 'unknown',
+                continuation_turn_id TEXT,
                 last_error TEXT
             )"""
         )
@@ -125,6 +131,26 @@ class CodexBridgeStore:
             conn.execute("ALTER TABLE codex_bridge_inputs ADD COLUMN owner_started_at INTEGER")
         if "codex_turn_id" not in input_columns:
             conn.execute("ALTER TABLE codex_bridge_inputs ADD COLUMN codex_turn_id TEXT")
+        if "delivery_owner" not in input_columns:
+            conn.execute(
+                "ALTER TABLE codex_bridge_inputs ADD COLUMN delivery_owner TEXT NOT NULL DEFAULT 'none'"
+            )
+            conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET delivery_owner=CASE
+                       WHEN state IN ('routed','pending','admitted','executing','submitting','running')
+                           THEN 'runner'
+                       WHEN state IN ('uncertain','continuation_pending') THEN 'rollout'
+                       WHEN state IN ('executed','recovery_output') THEN 'ledger'
+                       ELSE 'none'
+                   END"""
+            )
+        if "turn_outcome" not in input_columns:
+            conn.execute(
+                "ALTER TABLE codex_bridge_inputs ADD COLUMN turn_outcome TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if "continuation_turn_id" not in input_columns:
+            conn.execute("ALTER TABLE codex_bridge_inputs ADD COLUMN continuation_turn_id TEXT")
 
     @staticmethod
     def _owner_stamp() -> tuple[int, Optional[int]]:
@@ -218,11 +244,14 @@ class CodexBridgeStore:
                  last_event_id, int(bool(pending_new)), now, now),
             )
             conn.execute(
-                """UPDATE codex_bridge_inputs SET state='cancelled', updated_at=?,
-                          last_error='binding changed'
+                """UPDATE codex_bridge_inputs
+                   SET state='cancelled', delivery_owner='none', turn_outcome='cancelled',
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?,
+                       last_error='binding changed'
                    WHERE control_session_key=? AND generation<>?
                      AND state IN (
-                         'routed','pending','admitted','executing','submitting','running','uncertain'
+                         'routed','pending','admitted','executing','submitting','running','uncertain',
+                         'continuation_pending'
                      )""",
                 (now, control_session_key, generation),
             )
@@ -250,10 +279,13 @@ class CodexBridgeStore:
                 (control_session_key, generation, source_json, now, now),
             )
             conn.execute(
-                """UPDATE codex_bridge_inputs SET state='cancelled', updated_at=?,
-                          last_error='binding changed'
+                """UPDATE codex_bridge_inputs
+                   SET state='cancelled', delivery_owner='none', turn_outcome='cancelled',
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?,
+                       last_error='binding changed'
                    WHERE control_session_key=? AND state IN (
-                       'routed','pending','admitted','executing','submitting','running','uncertain'
+                       'routed','pending','admitted','executing','submitting','running','uncertain',
+                       'continuation_pending'
                    )""",
                 (now, control_session_key),
             )
@@ -278,7 +310,8 @@ class CodexBridgeStore:
                     """UPDATE codex_bridge_inputs SET thread_id=?, updated_at=?
                        WHERE control_session_key=? AND generation=? AND thread_id=?
                          AND state IN (
-                             'routed','pending','admitted','executing','submitting','running','uncertain'
+                             'routed','pending','admitted','executing','submitting','running','uncertain',
+                             'continuation_pending'
                          )""",
                     (cleaned, time.time(), binding.control_session_key, binding.generation, binding.thread_id),
                 )
@@ -367,8 +400,8 @@ class CodexBridgeStore:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO codex_bridge_inputs
                        (input_id, control_session_key, lane_session_key, thread_id, generation,
-                        event_json, state, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'routed', ?, ?)""",
+                        event_json, state, delivery_owner, turn_outcome, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'routed', 'runner', 'pending', ?, ?)""",
                 (input_id, binding.control_session_key, lane_session_key, binding.thread_id,
                  binding.generation, self._event_to_json(event), now, now),
             )
@@ -383,8 +416,10 @@ class CodexBridgeStore:
         owner_pid, owner_started_at = self._owner_stamp()
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
-                """UPDATE codex_bridge_inputs SET state='executing', owner_pid=?, owner_started_at=?,
-                          updated_at=?, last_error=NULL
+                """UPDATE codex_bridge_inputs
+                   SET state='executing', owner_pid=?, owner_started_at=?,
+                       delivery_owner='runner', turn_outcome='pending',
+                       updated_at=?, last_error=NULL
                    WHERE input_id=? AND state IN ('routed','pending')""",
                 (owner_pid, owner_started_at, time.time(), input_id),
             )
@@ -407,7 +442,9 @@ class CodexBridgeStore:
             return False
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
-                """UPDATE codex_bridge_inputs SET state='running', codex_turn_id=?, updated_at=?
+                """UPDATE codex_bridge_inputs
+                   SET state='running', codex_turn_id=?, continuation_turn_id=NULL,
+                       delivery_owner='runner', turn_outcome='running', updated_at=?
                    WHERE input_id=? AND state IN ('submitting','executing')""",
                 (cleaned, time.time(), input_id),
             )
@@ -417,24 +454,52 @@ class CodexBridgeStore:
         """Preserve an accepted-or-possibly-accepted request without replaying it."""
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
-                """UPDATE codex_bridge_inputs SET state='uncertain', updated_at=?, last_error=?
+                """UPDATE codex_bridge_inputs
+                   SET state='uncertain', delivery_owner='rollout', turn_outcome='unknown',
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?, last_error=?
                    WHERE input_id=? AND state IN ('submitting','running')""",
                 (time.time(), str(error or "submission result unknown")[:500], input_id),
             )
         return bool(cur.rowcount)
 
-    def mark_executed(self, input_id: str, final_text: str) -> bool:
+    def mark_continuation_pending(
+        self, input_id: str, error: str = "", *, continuation_turn_id: str = "",
+    ) -> bool:
+        """Release the live runner while an external owner continues the same Codex turn."""
+        continued = str(continuation_turn_id or "").strip() or None
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
-                """UPDATE codex_bridge_inputs SET state='executed', final_text=?, updated_at=?
-                   WHERE input_id=? AND state IN (
-                       'executing','submitting','running','uncertain'
-                   )""",
-                (final_text, time.time(), input_id),
+                """UPDATE codex_bridge_inputs
+                   SET state='continuation_pending', owner_pid=NULL, owner_started_at=NULL,
+                       delivery_owner='rollout', turn_outcome='continuing', final_text=NULL,
+                       continuation_turn_id=?,
+                       updated_at=?, last_error=?
+                   WHERE input_id=? AND state IN ('executing','submitting','running')""",
+                (
+                    continued, time.time(),
+                    str(error or "external continuation pending")[:500], input_id,
+                ),
             )
         return bool(cur.rowcount)
 
-    def capture_recovery_output(self, input_id: str, final_text: str) -> bool:
+    def mark_executed(
+        self, input_id: str, final_text: str, *, turn_outcome: str = "completed",
+    ) -> bool:
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='executed', final_text=?, delivery_owner='ledger',
+                       turn_outcome=?, updated_at=?
+                   WHERE input_id=? AND state IN (
+                       'executing','submitting','running','uncertain'
+                   )""",
+                (final_text, str(turn_outcome or "unknown"), time.time(), input_id),
+            )
+        return bool(cur.rowcount)
+
+    def capture_recovery_output(
+        self, input_id: str, final_text: str, *, turn_outcome: str = "completed",
+    ) -> bool:
         """Resolve an uncertain request from its exact rollout client id."""
         cleaned = str(final_text or "").strip()
         if not cleaned:
@@ -442,25 +507,34 @@ class CodexBridgeStore:
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
-                   SET state='recovery_output', final_text=?, updated_at=?, last_error=NULL
-                   WHERE input_id=? AND state IN ('submitting','running','uncertain')""",
-                (cleaned, time.time(), input_id),
+                   SET state='recovery_output', final_text=?, delivery_owner='ledger',
+                       turn_outcome=?, updated_at=?, last_error=NULL
+                   WHERE input_id=? AND state IN (
+                       'submitting','running','uncertain','continuation_pending'
+                   )""",
+                (cleaned, str(turn_outcome or "unknown"), time.time(), input_id),
             )
         return bool(cur.rowcount)
 
     def mark_completed(self, input_id: str) -> None:
         with self._lock, self._transaction() as conn:
             conn.execute(
-                """UPDATE codex_bridge_inputs SET state='completed', updated_at=?
-                   WHERE input_id=? AND state IN ('executing','executed','recovery_output')""",
+                """UPDATE codex_bridge_inputs
+                   SET state='completed', delivery_owner='none',
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?
+                   WHERE input_id=? AND state IN (
+                       'executing','executed','recovery_output','continuation_pending'
+                   )""",
                 (time.time(), input_id),
             )
 
     def release_for_retry(self, input_id: str, error: str = "") -> None:
         with self._lock, self._transaction() as conn:
             conn.execute(
-                """UPDATE codex_bridge_inputs SET state='pending', owner_pid=NULL, owner_started_at=NULL,
-                          updated_at=?, last_error=?
+                """UPDATE codex_bridge_inputs
+                   SET state='pending', owner_pid=NULL, owner_started_at=NULL,
+                       delivery_owner='runner', turn_outcome='pending',
+                       updated_at=?, last_error=?
                    WHERE input_id=? AND state='executing'""",
                 (time.time(), str(error or "")[:500] or None, input_id),
             )
@@ -469,8 +543,10 @@ class CodexBridgeStore:
         """Terminally reject an input that cannot enter the bounded FIFO."""
         with self._lock, self._transaction() as conn:
             conn.execute(
-                """UPDATE codex_bridge_inputs SET state='cancelled', owner_pid=NULL, owner_started_at=NULL,
-                          updated_at=?, last_error=?
+                """UPDATE codex_bridge_inputs
+                   SET state='cancelled', owner_pid=NULL, owner_started_at=NULL,
+                       delivery_owner='none', turn_outcome='cancelled',
+                       updated_at=?, last_error=?
                    WHERE input_id=? AND state IN ('routed','pending','admitted')""",
                 (time.time(), str(error or "cancelled")[:500], input_id),
             )
@@ -478,9 +554,13 @@ class CodexBridgeStore:
     def cancel_lane(self, lane_session_key: str) -> int:
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
-                """UPDATE codex_bridge_inputs SET state='cancelled', updated_at=?, last_error='cancelled by /stop'
+                """UPDATE codex_bridge_inputs
+                   SET state='cancelled', delivery_owner='none', turn_outcome='cancelled',
+                       owner_pid=NULL, owner_started_at=NULL,
+                       updated_at=?, last_error='cancelled by /stop'
                    WHERE lane_session_key=? AND state IN (
-                       'routed','pending','admitted','executing','submitting','running','uncertain'
+                       'routed','pending','admitted','executing','submitting','running','uncertain',
+                       'continuation_pending'
                    )""",
                 (time.time(), lane_session_key),
             )
@@ -497,11 +577,11 @@ class CodexBridgeStore:
         now = time.time()
         with self._lock, self._transaction() as conn:
             rows = conn.execute(
-                """SELECT input_id, state, owner_pid, owner_started_at
+                """SELECT input_id, state, owner_pid, owner_started_at, turn_outcome
                    FROM codex_bridge_inputs
                    WHERE state IN ('admitted','executing','submitting','running','executed')"""
             ).fetchall()
-            for input_id, state, owner_pid, owner_started_at in rows:
+            for input_id, state, owner_pid, owner_started_at, turn_outcome in rows:
                 if self._owner_alive(owner_pid, owner_started_at):
                     continue
                 recovered_state = (
@@ -509,11 +589,26 @@ class CodexBridgeStore:
                     else "uncertain" if state in {"submitting", "running"}
                     else "pending"
                 )
+                delivery_owner = {
+                    "recovery_output": "ledger",
+                    "uncertain": "rollout",
+                    "pending": "runner",
+                }[recovered_state]
+                recovered_outcome = (
+                    str(turn_outcome or "unknown")
+                    if recovered_state == "recovery_output"
+                    else "unknown" if recovered_state == "uncertain"
+                    else "pending"
+                )
                 conn.execute(
                     """UPDATE codex_bridge_inputs
-                       SET state=?, owner_pid=NULL, owner_started_at=NULL, updated_at=?
+                       SET state=?, delivery_owner=?, turn_outcome=?,
+                           owner_pid=NULL, owner_started_at=NULL, updated_at=?
                        WHERE input_id=? AND state=? AND owner_pid IS ? AND owner_started_at IS ?""",
-                    (recovered_state, now, input_id, state, owner_pid, owner_started_at),
+                    (
+                        recovered_state, delivery_owner, recovered_outcome, now,
+                        input_id, state, owner_pid, owner_started_at,
+                    ),
                 )
 
     def recoverable_inputs(self) -> list[DurableCodexInput]:
@@ -537,7 +632,8 @@ class CodexBridgeStore:
         with self._lock, self._transaction() as conn:
             rows = conn.execute(
                 """SELECT input_id, control_session_key, lane_session_key, thread_id,
-                          generation, event_json, state, final_text, codex_turn_id
+                          generation, event_json, state, final_text, codex_turn_id,
+                          delivery_owner, turn_outcome, continuation_turn_id
                    FROM codex_bridge_inputs
                    WHERE state='recovery_output' AND final_text IS NOT NULL
                    ORDER BY created_at"""
@@ -547,9 +643,98 @@ class CodexBridgeStore:
                 input_id=row[0], control_session_key=row[1], lane_session_key=row[2],
                 thread_id=row[3], generation=int(row[4]), event=self._event_from_json(row[5]),
                 state=row[6], final_text=row[7], codex_turn_id=row[8],
+                delivery_owner=row[9], turn_outcome=row[10], continuation_turn_id=row[11],
             )
             for row in rows
         ]
+
+    def continuation_pending_inputs(self) -> list[DurableCodexInput]:
+        """Return externally continued inputs awaiting their authoritative rollout final."""
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute(
+                """SELECT input_id, control_session_key, lane_session_key, thread_id,
+                          generation, event_json, state, final_text, codex_turn_id,
+                          delivery_owner, turn_outcome, continuation_turn_id
+                   FROM codex_bridge_inputs
+                   WHERE state='continuation_pending' ORDER BY created_at"""
+            ).fetchall()
+        return [
+            DurableCodexInput(
+                input_id=row[0], control_session_key=row[1], lane_session_key=row[2],
+                thread_id=row[3], generation=int(row[4]), event=self._event_from_json(row[5]),
+                state=row[6], final_text=row[7], codex_turn_id=row[8],
+                delivery_owner=row[9], turn_outcome=row[10], continuation_turn_id=row[11],
+            )
+            for row in rows
+        ]
+
+    def claim_rollout_event(self, input_id: str, turn_id: str) -> tuple[str, bool]:
+        """Resolve one rollout event's current delivery owner atomically.
+
+        Returns ``(disposition, transferred)`` where disposition is one of
+        ``unmanaged``, ``live``, ``rollout``, ``terminal``, or ``wait``.
+        Provenance inheritance alone never steals a live/ledger-owned event;
+        a replacement physical turn can take ownership after the interrupted
+        delivery attempt has settled.
+        """
+        cleaned_input = str(input_id or "").strip()
+        cleaned_turn = str(turn_id or "").strip()
+        if not cleaned_input or not cleaned_turn:
+            return "unmanaged", False
+        with self._lock, self._transaction() as conn:
+            row = conn.execute(
+                """SELECT state, codex_turn_id, delivery_owner, turn_outcome,
+                          continuation_turn_id
+                   FROM codex_bridge_inputs WHERE input_id=?""",
+                (cleaned_input,),
+            ).fetchone()
+            if row is None:
+                return "unmanaged", False
+            state = str(row[0] or "")
+            original_turn = str(row[1] or "").strip()
+            delivery_owner = str(row[2] or "none")
+            turn_outcome = str(row[3] or "unknown")
+            continuation_turn = str(row[4] or "").strip()
+            if state == "cancelled":
+                return "terminal", False
+            if not original_turn:
+                if delivery_owner != "rollout":
+                    return ("live" if delivery_owner == "runner" else "terminal"), False
+                cur = conn.execute(
+                    """UPDATE codex_bridge_inputs SET codex_turn_id=?, updated_at=?
+                       WHERE input_id=? AND codex_turn_id IS NULL AND delivery_owner='rollout'""",
+                    (cleaned_turn, time.time(), cleaned_input),
+                )
+                return ("rollout", False) if cur.rowcount else ("wait", False)
+            if cleaned_turn == original_turn:
+                if delivery_owner == "runner":
+                    return "live", False
+                if delivery_owner == "rollout" and state == "uncertain":
+                    return "rollout", False
+                return "terminal", False
+            if cleaned_turn == continuation_turn:
+                return ("rollout" if delivery_owner == "rollout" else "terminal"), False
+            if continuation_turn:
+                return "terminal", False
+            if turn_outcome not in {"interrupted", "unknown", "continuing"}:
+                return "terminal", False
+            if delivery_owner in {"runner", "ledger"}:
+                return "wait", False
+            if state not in {"completed", "uncertain", "continuation_pending"}:
+                return "terminal", False
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='continuation_pending', delivery_owner='rollout',
+                       turn_outcome='continuing', continuation_turn_id=?, final_text=NULL,
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?,
+                       last_error='resumed Codex turn claimed by rollout watcher'
+                   WHERE input_id=? AND state=? AND delivery_owner=? AND turn_outcome=?""",
+                (
+                    cleaned_turn, time.time(), cleaned_input,
+                    state, delivery_owner, turn_outcome,
+                ),
+            )
+        return ("rollout", True) if cur.rowcount else ("wait", False)
 
     def prune(self, *, retention_seconds: float = 7 * 24 * 60 * 60) -> int:
         """Bound terminal bridge history without touching recoverable work."""
@@ -568,3 +753,11 @@ class CodexBridgeStore:
                 "SELECT state FROM codex_bridge_inputs WHERE input_id=?", (input_id,)
             ).fetchone()
         return str(row[0]) if row else None
+
+    def input_turn_id(self, input_id: str) -> Optional[str]:
+        with self._lock, self._transaction() as conn:
+            row = conn.execute(
+                "SELECT codex_turn_id FROM codex_bridge_inputs WHERE input_id=?", (input_id,)
+            ).fetchone()
+        value = str(row[0] or "").strip() if row else ""
+        return value or None

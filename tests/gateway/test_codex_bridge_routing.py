@@ -1,5 +1,6 @@
 """Pre-guard routing tests for bound Telegram Codex lanes."""
 
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.codex_bridge import handoff as handoff_mod
+from gateway.codex_bridge import rollout as rollout_mod
 from gateway.codex_bridge.catalog import CodexThreadSummary
 from gateway.codex_bridge.mixin import GatewayCodexBridgeMixin
 from gateway.codex_bridge.rollout import RolloutEvent
@@ -240,6 +243,231 @@ async def test_ambiguous_turn_submission_is_not_replayed(tmp_path):
     assert "자동 재실행하지 않습니다" in result
     assert store.input_state(input_id) == "uncertain"
     assert store.recoverable_inputs() == []
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_handoff_intent_does_not_abandon_an_uncertain_turn(
+    tmp_path, monkeypatch,
+):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="continue", source=source, message_id="handoff-race"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.mark_submitting(input_id)
+    assert store.mark_running(input_id, "turn-old")
+    routed._codex_bridge_agent_result = {
+        "completed": False,
+        "interrupted": False,
+        "codex_should_retire": True,
+        "error": "app-server disconnected before an interrupt was observed",
+        "codex_thread_id": "thread-123",
+        "codex_turn_id": "turn-old",
+    }
+    handoff_path = tmp_path / "profile-monitor-state.json"
+    handoff_path.write_text(json.dumps({
+        "codex_turn_handoffs": {
+            "thread-123:turn-old": {
+                "thread_id": "thread-123",
+                "interrupted_turn_id": "turn-old",
+                "continued_turn_id": "",
+                "status": "interrupting",
+                "reason": "",
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(handoff_mod, "_STATE_PATH", handoff_path)
+
+    result = await bridge._codex_bridge_finalize_input(routed, "lane", "failure", 1)
+
+    assert "자동 재실행하지 않습니다" in result
+    assert store.input_state(input_id) == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_relogin_handoff_streams_resumed_progress_and_captures_one_final(
+    tmp_path, monkeypatch,
+):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    current = tmp_path / "rollout.jsonl"
+    current.write_text("", encoding="utf-8")
+    binding = store.bind(
+        build_session_key(source), source, thread_id="thread-123", rollout_path=str(current),
+    )
+    bridge = _Bridge(store)
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="continue", source=source, message_id="handoff-input"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.mark_submitting(input_id)
+    assert store.mark_running(input_id, "turn-old")
+    routed._codex_bridge_agent_result = {
+        "completed": False,
+        "error": "Codex 작업이 외부 요인으로 중단되어 완료되지 않았습니다.",
+        "codex_thread_id": "thread-123",
+        "codex_turn_id": "turn-old",
+    }
+    handoff_path = tmp_path / "profile-monitor-state.json"
+    handoff_path.write_text(json.dumps({
+        "codex_turn_handoffs": {
+            "thread-123:turn-old": {
+                "thread_id": "thread-123",
+                "interrupted_turn_id": "turn-old",
+                "continued_turn_id": "turn-new",
+                "status": "continued",
+                "reason": "continued",
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(handoff_mod, "_STATE_PATH", handoff_path)
+
+    assert await bridge._codex_bridge_finalize_input(routed, "lane", "failure", 1) is None
+    assert store.input_state(input_id) == "continuation_pending"
+
+    events = [
+        RolloutEvent(
+            event_id="unrelated-commentary", turn_id="turn-other", kind="commentary",
+            text="must stay local", offset=5, client_id=input_id,
+        ),
+        RolloutEvent(
+            event_id="continued-commentary", turn_id="turn-new", kind="commentary",
+            text="still working", offset=10, client_id=input_id,
+        ),
+        RolloutEvent(
+            event_id="continued-final", turn_id="turn-new", kind="final",
+            text="all done", offset=20, client_id=input_id,
+        ),
+    ]
+
+    class Tail:
+        def __init__(self, _thread_id, path, **kwargs):
+            self.path = Path(path)
+            self.offset = kwargs["offset"]
+
+        def scan(self):
+            return events, 20, current.stat()
+
+    adapter = SimpleNamespace(
+        supports_draft_streaming=lambda **_kwargs: True,
+        send_draft=AsyncMock(return_value=SimpleNamespace(success=True)),
+    )
+    bridge._adapter_for_source = lambda _source: adapter
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.resolve_rollout_path",
+        lambda *_args, **_kwargs: current,
+    )
+    monkeypatch.setattr("gateway.codex_bridge.mixin.RolloutTail", Tail)
+
+    await bridge._codex_bridge_poll_binding_locked(store, binding)
+
+    assert adapter.send_draft.await_count == 1, adapter.send_draft.await_args_list
+    assert "still working" in adapter.send_draft.await_args.args[2]
+    outputs = store.recoverable_outputs()
+    assert [(item.input_id, item.final_text) for item in outputs] == [(input_id, "all done")]
+
+
+@pytest.mark.asyncio
+async def test_completed_interruption_transfers_delivery_to_a_resumed_physical_turn(
+    tmp_path, monkeypatch,
+):
+    """Delivering an interruption notice completes that delivery attempt, not
+    the logical work. A later Codex turn inheriting its client id is watcher-owned.
+    """
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    thread_id = "01a00000-0000-7000-8000-000000000001"
+    current = (
+        tmp_path / "sessions" / "2026" / "09" / "12"
+        / f"rollout-{thread_id}.jsonl"
+    )
+    current.parent.mkdir(parents=True)
+    current.write_text("", encoding="utf-8")
+    binding = store.bind(
+        build_session_key(source), source, thread_id=thread_id, rollout_path=str(current),
+    )
+    bridge = _Bridge(store)
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="inspect everything", source=source, message_id="watchdog-input"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.mark_submitting(input_id)
+    assert store.mark_running(input_id, "turn-interrupted")
+    assert store.mark_executed(
+        input_id, "Turn aborted by liveness watchdog", turn_outcome="interrupted",
+    )
+    records = [
+        {"timestamp": "2026-09-12T05:16:00Z", "type": "session_meta",
+         "payload": {"id": thread_id}},
+        {"timestamp": "2026-09-12T05:16:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-interrupted"}},
+        {"timestamp": "2026-09-12T05:16:02Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "inspect everything"}],
+                     "internal_chat_message_metadata_passthrough": {
+                         "turn_id": "turn-interrupted",
+                     }}},
+        {"timestamp": "2026-09-12T05:16:03Z", "type": "event_msg",
+         "payload": {"type": "item_completed", "turn_id": "turn-interrupted",
+                     "item": {"type": "UserMessage", "client_id": input_id}}},
+        {"timestamp": "2026-09-12T05:26:16Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-interrupted",
+                     "reason": "interrupted"}},
+        {"timestamp": "2026-09-12T05:33:03Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-resumed"}},
+        {"timestamp": "2026-09-12T05:35:41Z", "type": "response_item",
+         "payload": {"type": "message", "role": "assistant", "phase": "commentary",
+                     "content": [{"type": "output_text", "text": "working again"}],
+                     "internal_chat_message_metadata_passthrough": {
+                         "turn_id": "turn-resumed",
+                     }}},
+        {"timestamp": "2026-09-12T05:38:26Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-resumed",
+                     "last_agent_message": "finished after resume"}},
+    ]
+    current.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8",
+    )
+
+    adapter = SimpleNamespace(
+        supports_draft_streaming=lambda **_kwargs: True,
+        send_draft=AsyncMock(return_value=SimpleNamespace(success=True)),
+    )
+    bridge._adapter_for_source = lambda _source: adapter
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.resolve_rollout_path",
+        lambda thread, hinted_path=None: rollout_mod.resolve_rollout_path(
+            thread, hinted_path=hinted_path, codex_home=str(tmp_path),
+        ),
+    )
+
+    await bridge._codex_bridge_poll_binding_locked(store, binding)
+
+    # The old turn's interruption notice is still ledger-owned. The watcher
+    # must wait without acknowledging the replacement turn's rollout bytes.
+    waiting = store.get_binding(binding.control_session_key)
+    assert waiting is not None
+    assert waiting.cursor_offset < current.stat().st_size
+    adapter.send_draft.assert_not_awaited()
+    assert store.recoverable_outputs() == []
+
+    store.mark_completed(input_id)
+    resumed = store.get_binding(binding.control_session_key)
+    assert resumed is not None
+    await bridge._codex_bridge_poll_binding_locked(store, resumed)
+
+    assert adapter.send_draft.await_count == 1, adapter.send_draft.await_args_list
+    assert "working again" in adapter.send_draft.await_args.args[2]
+    outputs = store.recoverable_outputs()
+    assert [(item.input_id, item.final_text) for item in outputs] == [
+        (input_id, "finished after resume"),
+    ]
 
 
 @pytest.mark.asyncio

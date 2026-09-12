@@ -48,9 +48,15 @@ def test_input_lifecycle_and_restart_recovery(tmp_path, monkeypatch):
     store.recover_after_restart()
     recovered = store.recoverable_outputs()
     assert [(row.input_id, row.final_text) for row in recovered] == [(input_id, "finished")]
+    assert (recovered[0].delivery_owner, recovered[0].turn_outcome) == ("ledger", "completed")
 
     store.mark_completed(input_id)
     assert store.input_state(input_id) == "completed"
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT delivery_owner, turn_outcome FROM codex_bridge_inputs WHERE input_id=?",
+            (input_id,),
+        ).fetchone() == ("none", "completed")
 
 
 def test_restart_does_not_steal_live_gateway_input(tmp_path, monkeypatch):

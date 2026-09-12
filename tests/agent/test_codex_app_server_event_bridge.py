@@ -379,6 +379,7 @@ class TestBridgeWiredInRuntime:
             _fire_stream_delta=MagicMock(),
             _fire_reasoning_delta=MagicMock(),
             _emit_interim_assistant_message=MagicMock(),
+            _touch_activity=MagicMock(),
             _iters_since_skill=0,
             _skill_nudge_interval=0,
             valid_tool_names=set(),
@@ -410,6 +411,13 @@ class TestBridgeWiredInRuntime:
         )
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
+        )
+        assert callable(captured["on_activity"]), (
+            "on_activity must connect scoped app-server progress to the outer watchdog"
+        )
+        captured["on_activity"]("item/completed")
+        agent._touch_activity.assert_called_once_with(
+            "codex app-server activity: item/completed"
         )
 
         # And the bridge must actually drive the agent's callbacks when

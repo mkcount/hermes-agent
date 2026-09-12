@@ -158,6 +158,7 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_activity: Optional[Callable[[str], None]] = None,
         on_turn_starting: Optional[Callable[[str, str], None]] = None,
         on_turn_started: Optional[Callable[[str, str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -179,6 +180,7 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_activity = on_activity
         self._on_turn_starting = on_turn_starting
         self._on_turn_started = on_turn_started
         self._routing = request_routing or _ServerRequestRouting()
@@ -206,6 +208,15 @@ class CodexAppServerSession:
         # approval params don't carry the changeset, so this feeds the prompt summary.
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+
+    def _record_activity(self, description: str) -> None:
+        """Forward transport-proven progress to the owning agent watchdog."""
+        if self._on_activity is None:
+            return
+        try:
+            self._on_activity(description)
+        except Exception:  # pragma: no cover - observational callback
+            logger.debug("on_activity callback raised", exc_info=True)
 
     def set_turn_callbacks(
         self, *, on_turn_starting: Optional[Callable[[str, str], None]],
@@ -484,6 +495,7 @@ class CodexAppServerSession:
 
         Returns (projection, aborted); aborted = agent text carried a terminal ``<turn_aborted>`` marker.
         """
+        self._record_activity(str(note.get("method") or "codex notification"))
         if self._on_event is not None:
             try:
                 self._on_event(note)
@@ -718,6 +730,7 @@ class CodexAppServerSession:
                 break
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                self._record_activity(str(sreq.get("method") or "codex server request"))
                 turn_complete = on_server_request(sreq)
                 deadline = time.monotonic() + turn_timeout
                 continue

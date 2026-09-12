@@ -1070,6 +1070,38 @@ class TestSessionRetirement:
         assert r.should_retire is False
         assert r.interrupted is False
 
+    def test_scoped_notifications_renew_the_outer_agent_activity_clock(self):
+        """The transport's proven in-scope progress must feed Hermes' outer
+        watchdog as well as the app-server session's private deadline.
+        """
+        client = FakeClient()
+        client._notifications.append({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "itemId": "foreign", "delta": "ignore me",
+                "threadId": "another-thread", "turnId": "another-turn",
+            },
+        })
+        client.queue_notification(
+            "item/commandExecution/outputDelta",
+            itemId="ex1", delta="working", threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        activity: list[str] = []
+
+        result = make_session(client, on_activity=activity.append).run_turn(
+            "keep both liveness clocks current", turn_timeout=1.0,
+        )
+
+        assert result.interrupted is False
+        assert activity == [
+            "item/commandExecution/outputDelta",
+            "turn/completed",
+        ]
+
 
 
 

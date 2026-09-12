@@ -443,6 +443,9 @@ def _ensure_codex_session(agent) -> None:
         client_user_message_id=getattr(agent, "_codex_client_user_message_id", None),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
+        on_activity=lambda description: agent._touch_activity(
+            f"codex app-server activity: {description}"
+        ),
         on_turn_starting=getattr(agent, "_codex_turn_starting_callback", None),
         on_turn_started=getattr(agent, "_codex_turn_started_callback", None),
     )

@@ -25,6 +25,7 @@ from gateway.codex_bridge.catalog import (
     list_recent_projects,
     list_recent_threads,
 )
+from gateway.codex_bridge.handoff import read_turn_handoff
 from gateway.codex_bridge.rollout import RolloutEvent, RolloutTail, inspect_rollout, resolve_rollout_path
 from gateway.codex_bridge.store import CodexBridgeBinding, CodexBridgeStore, DurableCodexInput
 from gateway.config import Platform
@@ -318,6 +319,32 @@ class GatewayCodexBridgeMixin:
         transport = transport if isinstance(transport, dict) else {}
         delivered_stream = str(getattr(event, "_streamed_final_response", "") or "").strip()
         current_state = store.input_state(input_id)
+        codex_turn_id = str(
+            transport.get("codex_turn_id") or store.input_turn_id(input_id) or ""
+        ).strip()
+        codex_thread_id = str(
+            transport.get("codex_thread_id") or binding.thread_id or ""
+        ).strip()
+        handoff = read_turn_handoff(codex_thread_id, codex_turn_id)
+        handoff_owns_continuation = handoff is not None and handoff.continues and (
+            handoff.status != "interrupting" or bool(transport.get("interrupted"))
+        )
+        if (
+            current_state in {"submitting", "running"}
+            and not bool(transport.get("completed"))
+            and not delivered_stream
+            and handoff_owns_continuation
+        ):
+            assert handoff is not None
+            # ReloginTool published continuation ownership before interrupting
+            # this exact turn. The live request ends here, while the rollout
+            # watcher remains the sole owner of its resumed progress and final.
+            store.mark_continuation_pending(
+                input_id,
+                str(transport.get("error") or "Codex profile switch continuation pending"),
+                continuation_turn_id=handoff.continued_turn_id,
+            )
+            return None
         if (
             current_state in {"submitting", "running"}
             and not bool(transport.get("completed"))
@@ -335,7 +362,13 @@ class GatewayCodexBridgeMixin:
         if not final_text:
             final_text = "Codex 작업이 답변을 만들기 전에 종료되었습니다. 같은 메시지를 다시 보내 주세요."
             result = final_text
-        if not store.mark_executed(input_id, final_text):
+        turn_outcome = (
+            "completed" if bool(transport.get("completed"))
+            else "interrupted" if bool(transport.get("interrupted"))
+            else "failed" if transport.get("error")
+            else "unknown"
+        )
+        if not store.mark_executed(input_id, final_text, turn_outcome=turn_outcome):
             return None
 
         # For ordinary (non-streamed) final delivery, persist the exact output
@@ -671,6 +704,7 @@ class GatewayCodexBridgeMixin:
             state["segments"].pop(0)
         content = "💻 Codex 진행\n\n" + "\n\n".join(state["segments"])
         metadata = self._thread_metadata_for_source(binding.source)
+        metadata["_interim_send"] = True
         supports = False
         with suppress(Exception):
             supports = bool(adapter.supports_draft_streaming(
@@ -773,6 +807,13 @@ class GatewayCodexBridgeMixin:
         async with self._codex_bridge_binding_lock(binding.control_session_key):
             await self._codex_bridge_poll_binding_locked(store, binding)
 
+    @staticmethod
+    def _codex_bridge_reconcile_continuation(store: CodexBridgeStore, item: DurableCodexInput) -> None:
+        """Close a handoff that ReloginTool proved needed no replacement turn."""
+        handoff = read_turn_handoff(item.thread_id, item.codex_turn_id or "")
+        if handoff is not None and handoff.status == "terminal":
+            store.mark_completed(item.input_id)
+
     async def _codex_bridge_poll_binding_locked(
         self, store: CodexBridgeStore, binding: CodexBridgeBinding,
     ) -> None:
@@ -822,6 +863,7 @@ class GatewayCodexBridgeMixin:
                 raise RuntimeError("Codex binding changed while committing its rollout cursor")
 
         pending_commentary: dict[str, list[RolloutEvent]] = {}
+        deferred = False
 
         async def _flush_commentary() -> None:
             if not pending_commentary:
@@ -846,37 +888,68 @@ class GatewayCodexBridgeMixin:
                 await _commit(last)
 
         for event in events:
-            # Telegram-originated turns use the app-server event bridge and
-            # normal gateway final-delivery path. The rollout watcher is only
-            # crash recovery for those ids, never a concurrent second sender.
-            input_state = store.input_state(event.client_id) if event.client_id else None
-            managed = input_state in {
-                "admitted", "executing", "submitting", "running", "uncertain",
-                "executed", "recovery_output", "completed", "cancelled",
-            }
-            if event.kind != "commentary" or managed:
+            # The live app-server runner owns its physical turn. The rollout
+            # watcher may atomically take over only for crash recovery or a
+            # later physical turn that continues an interrupted logical input.
+            disposition, transferred = (
+                store.claim_rollout_event(event.client_id, event.turn_id)
+                if event.client_id else ("unmanaged", False)
+            )
+            if transferred:
+                logger.info(
+                    "Codex rollout delivery ownership transferred: input=%s turn=%s binding=%s",
+                    event.client_id, event.turn_id, binding.control_session_key,
+                )
+            if disposition == "wait":
                 await _flush_commentary()
-            if managed:
-                # A final rollout event is the durable answer for a request
-                # whose turn/start acknowledgement or live stream was lost.
-                # Persist it before advancing the rollout cursor; the regular
-                # recovery ledger owns the one-and-only Telegram delivery.
-                if event.kind in {"final", "error"} and input_state in {
-                    "submitting", "running", "uncertain",
-                }:
-                    store.capture_recovery_output(
-                        event.client_id,
-                        event.text or "Codex 작업이 오류로 종료되었습니다.",
-                    )
-            elif event.kind == "commentary":
+                logger.debug(
+                    "Deferring Codex rollout event until live delivery ownership settles: "
+                    "input=%s turn=%s kind=%s",
+                    event.client_id, event.turn_id, event.kind,
+                )
+                deferred = True
+                break
+            watcher_owned = disposition in {"unmanaged", "rollout"}
+            if event.kind != "commentary" or not watcher_owned:
+                await _flush_commentary()
+            if disposition == "rollout" and event.kind == "commentary":
                 identity = self._codex_bridge_mirror_identity(event)
                 pending_commentary.setdefault(identity, []).append(event)
                 continue
-            elif event.kind in {"final", "error"}:
+            if disposition == "rollout" and event.kind in {"final", "error"}:
+                captured = store.capture_recovery_output(
+                    event.client_id,
+                    event.text or "Codex 작업이 오류로 종료되었습니다.",
+                    turn_outcome="failed" if event.kind == "error" else "completed",
+                )
+                if not captured:
+                    raise RuntimeError(
+                        f"Codex rollout final lost delivery ownership: input={event.client_id}"
+                    )
+            elif disposition == "unmanaged" and event.kind == "commentary":
+                identity = self._codex_bridge_mirror_identity(event)
+                pending_commentary.setdefault(identity, []).append(event)
+                continue
+            elif disposition == "unmanaged" and event.kind in {"final", "error"}:
                 await self._codex_bridge_mirror_final(binding, event, adapter)
+            elif disposition in {"live", "terminal"}:
+                log_suppression = (
+                    logger.info if event.kind in {"final", "error"} else logger.debug
+                )
+                log_suppression(
+                    "Suppressing Codex rollout event owned by %s delivery: "
+                    "input=%s turn=%s kind=%s",
+                    disposition, event.client_id, event.turn_id, event.kind,
+                )
             await _commit(event)
         await _flush_commentary()
-        if next_offset > committed_offset and store.update_cursor(
+        if deferred:
+            # ``scan`` projected through the whole read window before delivery
+            # ownership was known. Rebuild that projection from the durable
+            # cursor next time; neither the blocked event nor later records may
+            # be acknowledged by the end-of-window cursor catch-up below.
+            self._codex_bridge_tails.pop(key, None)
+        elif next_offset > committed_offset and store.update_cursor(
             binding, rollout_path=str(path), device=stat.st_dev, inode=stat.st_ino,
             offset=next_offset, last_event_id=last_event_id,
         ):
@@ -903,6 +976,10 @@ class GatewayCodexBridgeMixin:
                                 "Codex bridge watcher failed for %s: %s",
                                 binding.control_session_key, result,
                             )
+                    for item in await asyncio.to_thread(store.continuation_pending_inputs):
+                        await asyncio.to_thread(
+                            self._codex_bridge_reconcile_continuation, store, item,
+                        )
                     await asyncio.to_thread(store.prune)
                 except asyncio.CancelledError:
                     raise
