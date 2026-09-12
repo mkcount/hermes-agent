@@ -5,7 +5,7 @@ import sqlite3
 from gateway.codex_bridge.store import CodexBridgeStore
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 
 def _source(**kwargs) -> SessionSource:
@@ -32,6 +32,22 @@ def test_binding_generation_fences_a_to_b_to_a(tmp_path):
 
     assert (first.generation, second.generation, third.generation) == (1, 2, 3)
     assert third.thread_id == "thread-a"
+
+
+def test_telegram_topics_keep_independent_codex_bindings(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    first_source = _source(thread_id="topic-10")
+    second_source = _source(thread_id="topic-20")
+    first_key = build_session_key(first_source)
+    second_key = build_session_key(second_source)
+
+    store.bind(first_key, first_source, thread_id="codex-a")
+    store.bind(second_key, second_source, thread_id="codex-b")
+
+    assert first_key != second_key
+    assert {
+        (row.source.thread_id, row.thread_id) for row in store.list_bindings()
+    } == {("topic-10", "codex-a"), ("topic-20", "codex-b")}
 
 
 def test_input_lifecycle_and_restart_recovery(tmp_path, monkeypatch):

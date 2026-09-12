@@ -44,7 +44,6 @@ class _Bridge(GatewayCodexBridgeMixin):
         self.async_session_store = SimpleNamespace(get_or_create_session=AsyncMock())
         self._codex_bridge_binding_locks = {}
         self._codex_bridge_tails = {}
-        self._codex_bridge_mirror_ui = {}
 
     @staticmethod
     def _session_key_for_source(source):
@@ -57,8 +56,8 @@ class _Bridge(GatewayCodexBridgeMixin):
         return self.profile_home
 
     @staticmethod
-    def _thread_metadata_for_source(_source):
-        return {}
+    def _thread_metadata_for_source(source):
+        return {"message_thread_id": source.thread_id} if source.thread_id else None
 
     @staticmethod
     def _peek_session_state(_session_key):
@@ -137,6 +136,40 @@ async def test_selection_command_stays_on_control_lane(tmp_path):
     )
     assert routed.source.trusted_local_lane is None
     assert "codex_bridge_input_id" not in routed.metadata
+
+
+@pytest.mark.asyncio
+async def test_codex_session_status_reports_active_turn_and_pending_progress(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    binding = store.bind(
+        build_session_key(source), source, thread_id="thread-123", cwd="/project",
+        rollout_path="/rollout.jsonl", cursor_device=1, cursor_inode=2, cursor_offset=75,
+    )
+    progress = store.upsert_progress(binding, "turn-1", ["working"])
+    store.mark_progress_failed(progress, "network unavailable")
+    bridge = _Bridge(store)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.inspect_rollout",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            path="/rollout.jsonl", device=1, inode=2, size=100,
+            active_turn_id="turn-1", active_start_offset=20,
+        ),
+    )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.list_recent_threads",
+        lambda **_kwargs: pytest.fail("status must not require the app-server thread list"),
+    )
+
+    answer = await bridge._handle_codex_session_command(
+        MessageEvent(text="/codex_session status", source=source, message_id="status-1"),
+    )
+
+    assert "thread-123" in answer
+    assert "턴 진행 중" in answer
+    assert "25 bytes" in answer
+    assert "대기 1" in answer
+    assert "network unavailable" in answer
 
 
 def test_surviving_bound_prompt_without_durable_id_fails_closed(tmp_path):
@@ -354,8 +387,8 @@ async def test_relogin_handoff_streams_resumed_progress_and_captures_one_final(
             return events, 20, current.stat()
 
     adapter = SimpleNamespace(
-        supports_draft_streaming=lambda **_kwargs: True,
-        send_draft=AsyncMock(return_value=SimpleNamespace(success=True)),
+        send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="501")),
+        edit_message=AsyncMock(),
     )
     bridge._adapter_for_source = lambda _source: adapter
     monkeypatch.setattr(
@@ -366,8 +399,8 @@ async def test_relogin_handoff_streams_resumed_progress_and_captures_one_final(
 
     await bridge._codex_bridge_poll_binding_locked(store, binding)
 
-    assert adapter.send_draft.await_count == 1, adapter.send_draft.await_args_list
-    assert "still working" in adapter.send_draft.await_args.args[2]
+    assert adapter.send.await_count == 1, adapter.send.await_args_list
+    assert "still working" in adapter.send.await_args.args[1]
     outputs = store.recoverable_outputs()
     assert [(item.input_id, item.final_text) for item in outputs] == [(input_id, "all done")]
 
@@ -436,8 +469,8 @@ async def test_completed_interruption_transfers_delivery_to_a_resumed_physical_t
     )
 
     adapter = SimpleNamespace(
-        supports_draft_streaming=lambda **_kwargs: True,
-        send_draft=AsyncMock(return_value=SimpleNamespace(success=True)),
+        send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="502")),
+        edit_message=AsyncMock(),
     )
     bridge._adapter_for_source = lambda _source: adapter
     monkeypatch.setattr(
@@ -454,7 +487,7 @@ async def test_completed_interruption_transfers_delivery_to_a_resumed_physical_t
     waiting = store.get_binding(binding.control_session_key)
     assert waiting is not None
     assert waiting.cursor_offset < current.stat().st_size
-    adapter.send_draft.assert_not_awaited()
+    adapter.send.assert_not_awaited()
     assert store.recoverable_outputs() == []
 
     store.mark_completed(input_id)
@@ -462,8 +495,8 @@ async def test_completed_interruption_transfers_delivery_to_a_resumed_physical_t
     assert resumed is not None
     await bridge._codex_bridge_poll_binding_locked(store, resumed)
 
-    assert adapter.send_draft.await_count == 1, adapter.send_draft.await_args_list
-    assert "working again" in adapter.send_draft.await_args.args[2]
+    assert adapter.send.await_count == 1, adapter.send.await_args_list
+    assert "working again" in adapter.send.await_args.args[1]
     outputs = store.recoverable_outputs()
     assert [(item.input_id, item.final_text) for item in outputs] == [
         (input_id, "finished after resume"),
@@ -537,14 +570,13 @@ async def test_background_ledger_write_uses_binding_profile(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_progress_burst_is_coalesced_into_one_draft_update(tmp_path):
-    bridge = _Bridge(CodexBridgeStore(tmp_path / "state.db"))
-    bridge._codex_bridge_mirror_ui = {}
-    binding = bridge.store.bind("control", _source(), thread_id="thread-123")
-    adapter = SimpleNamespace(
-        supports_draft_streaming=lambda **_kwargs: True,
-        send_draft=AsyncMock(return_value=SimpleNamespace(success=True)),
-    )
+async def test_progress_is_durable_across_restart_then_edits_one_persistent_message(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "state.db"
+    store = CodexBridgeStore(db_path)
+    bridge = _Bridge(store)
+    binding = store.bind("control", _source(), thread_id="thread-123")
     events = [
         RolloutEvent(
             event_id=f"event-{index}", turn_id="turn-1", kind="commentary",
@@ -552,9 +584,55 @@ async def test_progress_burst_is_coalesced_into_one_draft_update(tmp_path):
         )
         for index in range(3)
     ]
+    failed_adapter = SimpleNamespace(
+        supports_draft_streaming=lambda **_kwargs: True,
+        send_draft=AsyncMock(),
+        send=AsyncMock(return_value=SimpleNamespace(success=False, error="temporary")),
+        edit_message=AsyncMock(),
+    )
+    progress = bridge._codex_bridge_stage_commentary(store, binding, events)
 
-    await bridge._codex_bridge_mirror_commentary_batch(binding, events, adapter)
+    with pytest.raises(RuntimeError, match="temporary"):
+        await bridge._codex_bridge_deliver_progress(store, binding, progress, failed_adapter)
 
-    adapter.send_draft.assert_awaited_once()
-    sent_text = adapter.send_draft.await_args.args[2]
+    pending = store.list_progress(binding, pending_only=True)
+    assert len(pending) == 1
+    failed_adapter.send_draft.assert_not_awaited()
+    retry_at = pending[0].next_attempt_at + 1
+    monkeypatch.setattr("gateway.codex_bridge.store.time.time", lambda: retry_at)
+
+    restarted_store = CodexBridgeStore(db_path)
+    restarted_bridge = _Bridge(restarted_store)
+    restarted_binding = restarted_store.get_binding("control")
+    assert restarted_binding is not None
+    adapter = SimpleNamespace(
+        supports_draft_streaming=lambda **_kwargs: True,
+        send_draft=AsyncMock(),
+        send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="900")),
+        edit_message=AsyncMock(return_value=SimpleNamespace(success=True, message_id="900")),
+    )
+
+    await restarted_bridge._codex_bridge_retry_progress(
+        restarted_store, restarted_binding, adapter,
+    )
+
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
     assert all(event.text in sent_text for event in events)
+    assert adapter.send.await_args.kwargs["metadata"]["_interim_send"] is True
+    adapter.send_draft.assert_not_awaited()
+
+    update = RolloutEvent(
+        event_id="event-4", turn_id="turn-1", kind="commentary",
+        text="progress 4", offset=4,
+    )
+    revised = restarted_bridge._codex_bridge_stage_commentary(
+        restarted_store, restarted_binding, [update],
+    )
+    await restarted_bridge._codex_bridge_deliver_progress(
+        restarted_store, restarted_binding, revised, adapter,
+    )
+
+    adapter.edit_message.assert_awaited_once()
+    assert adapter.edit_message.await_args.args[1] == "900"
+    assert "progress 4" in adapter.edit_message.await_args.args[2]

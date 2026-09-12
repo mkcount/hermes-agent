@@ -55,6 +55,21 @@ class DurableCodexInput:
     continuation_turn_id: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class DurableCodexProgress:
+    control_session_key: str
+    generation: int
+    logical_turn_id: str
+    segments: tuple[str, ...]
+    content: str
+    message_id: Optional[str]
+    state: str
+    last_error: Optional[str]
+    attempt_count: int
+    next_attempt_at: float
+    updated_at: float
+
+
 class CodexBridgeStore:
     """Small SQLite authority colocated with Hermes' profile state database."""
 
@@ -121,6 +136,27 @@ class CodexBridgeStore:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_codex_bridge_inputs_state ON codex_bridge_inputs(state, created_at)"
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS codex_bridge_progress (
+                control_session_key TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                logical_turn_id TEXT NOT NULL,
+                segments_json TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_id TEXT,
+                state TEXT NOT NULL,
+                last_error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (control_session_key, generation, logical_turn_id)
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_bridge_progress_state "
+            "ON codex_bridge_progress(state, updated_at)"
+        )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(codex_bridge_bindings)")}
         if "pending_new" not in columns:
             conn.execute(
@@ -151,6 +187,19 @@ class CodexBridgeStore:
             )
         if "continuation_turn_id" not in input_columns:
             conn.execute("ALTER TABLE codex_bridge_inputs ADD COLUMN continuation_turn_id TEXT")
+        progress_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(codex_bridge_progress)")
+        }
+        if "attempt_count" not in progress_columns:
+            conn.execute(
+                "ALTER TABLE codex_bridge_progress "
+                "ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "next_attempt_at" not in progress_columns:
+            conn.execute(
+                "ALTER TABLE codex_bridge_progress "
+                "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _owner_stamp() -> tuple[int, Optional[int]]:
@@ -208,6 +257,210 @@ class CodexBridgeStore:
             ).fetchall()
         return [self._binding_from_row(row) for row in rows]
 
+    @staticmethod
+    def _progress_from_row(row: tuple[Any, ...]) -> DurableCodexProgress:
+        try:
+            segments = tuple(str(value) for value in json.loads(row[3]) if str(value).strip())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            segments = ()
+        return DurableCodexProgress(
+            control_session_key=str(row[0]), generation=int(row[1]),
+            logical_turn_id=str(row[2]), segments=segments, content=str(row[4]),
+            message_id=str(row[5]) if row[5] is not None else None,
+            state=str(row[6]), last_error=str(row[7]) if row[7] is not None else None,
+            attempt_count=int(row[8] or 0), next_attempt_at=float(row[9] or 0),
+            updated_at=float(row[10]),
+        )
+
+    @staticmethod
+    def _truncate_progress(value: str, max_units: int) -> str:
+        """Keep one progress bubble within a UTF-16 based transport limit."""
+        limit = max(1, int(max_units))
+        if len(value.encode("utf-16-le")) // 2 <= limit:
+            return value
+        kept: list[str] = []
+        used = 0
+        for character in value:
+            width = 2 if ord(character) > 0xFFFF else 1
+            if used + width >= limit:
+                break
+            kept.append(character)
+            used += width
+        return "".join(kept).rstrip() + "…"
+
+    def upsert_progress(
+        self, binding: CodexBridgeBinding, logical_turn_id: str, segments: list[str],
+        *, max_segments: int = 8, max_chars: int = 12_000,
+    ) -> DurableCodexProgress:
+        """Durably stage rolling commentary before its rollout cursor is acknowledged."""
+        identity = str(logical_turn_id or "").strip()
+        if not identity:
+            raise ValueError("logical_turn_id is required")
+        candidates = [str(value).strip() for value in segments if value and str(value).strip()]
+        if not candidates:
+            raise ValueError("at least one progress segment is required")
+        now = time.time()
+        with self._lock, self._transaction() as conn:
+            current = conn.execute(
+                "SELECT thread_id, generation FROM codex_bridge_bindings WHERE control_session_key=?",
+                (binding.control_session_key,),
+            ).fetchone()
+            if (
+                current is None
+                or str(current[0] or "") != str(binding.thread_id or "")
+                or int(current[1]) != binding.generation
+            ):
+                raise RuntimeError("Codex binding changed while staging progress")
+            previous = conn.execute(
+                """SELECT segments_json, message_id, state, last_error,
+                          attempt_count, next_attempt_at
+                   FROM codex_bridge_progress
+                   WHERE control_session_key=? AND generation=? AND logical_turn_id=?""",
+                (binding.control_session_key, binding.generation, identity),
+            ).fetchone()
+            try:
+                accumulated = list(json.loads(previous[0])) if previous is not None else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                accumulated = []
+            changed = False
+            for candidate in candidates:
+                if candidate not in accumulated:
+                    accumulated.append(candidate)
+                    changed = True
+            while len(accumulated) > max(1, int(max_segments)):
+                accumulated.pop(0)
+                changed = True
+            while (
+                len("\n\n".join(accumulated).encode("utf-16-le")) // 2
+                > max(1, int(max_chars))
+                and len(accumulated) > 1
+            ):
+                accumulated.pop(0)
+                changed = True
+            if accumulated:
+                trimmed = self._truncate_progress(accumulated[0], max_chars)
+                if trimmed != accumulated[0]:
+                    accumulated[0] = trimmed
+                    changed = True
+            content = "💻 Codex 진행\n\n" + "\n\n".join(accumulated)
+            state = "pending" if previous is None or changed else str(previous[2])
+            last_error = None if previous is None or changed else previous[3]
+            attempt_count = 0 if previous is None or changed else int(previous[4] or 0)
+            next_attempt_at = 0.0 if previous is None or changed else float(previous[5] or 0)
+            conn.execute(
+                """INSERT INTO codex_bridge_progress (
+                       control_session_key, generation, logical_turn_id, segments_json,
+                       content, message_id, state, last_error, attempt_count,
+                       next_attempt_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(control_session_key, generation, logical_turn_id) DO UPDATE SET
+                       segments_json=excluded.segments_json, content=excluded.content,
+                       state=excluded.state, last_error=excluded.last_error,
+                       attempt_count=excluded.attempt_count,
+                       next_attempt_at=excluded.next_attempt_at,
+                       updated_at=excluded.updated_at""",
+                (
+                    binding.control_session_key, binding.generation, identity,
+                    json.dumps(accumulated, ensure_ascii=False, separators=(",", ":")),
+                    content, previous[1] if previous is not None else None,
+                    state, last_error, attempt_count, next_attempt_at, now, now,
+                ),
+            )
+            row = conn.execute(
+                """SELECT control_session_key, generation, logical_turn_id, segments_json,
+                          content, message_id, state, last_error, attempt_count,
+                          next_attempt_at, updated_at
+                   FROM codex_bridge_progress
+                   WHERE control_session_key=? AND generation=? AND logical_turn_id=?""",
+                (binding.control_session_key, binding.generation, identity),
+            ).fetchone()
+        return self._progress_from_row(row)
+
+    def list_progress(
+        self, binding: CodexBridgeBinding, *, pending_only: bool = False,
+        ready_only: bool = False,
+    ) -> list[DurableCodexProgress]:
+        state_filter = " AND state='pending'" if pending_only else ""
+        ready_filter = " AND next_attempt_at<=?" if ready_only else ""
+        params: tuple[Any, ...] = (binding.control_session_key, binding.generation)
+        if ready_only:
+            params += (time.time(),)
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute(
+                """SELECT control_session_key, generation, logical_turn_id, segments_json,
+                          content, message_id, state, last_error, attempt_count,
+                          next_attempt_at, updated_at
+                   FROM codex_bridge_progress
+                   WHERE control_session_key=? AND generation=?""" + state_filter + ready_filter +
+                " ORDER BY updated_at",
+                params,
+            ).fetchall()
+        return [self._progress_from_row(row) for row in rows]
+
+    def mark_progress_delivered(
+        self, progress: DurableCodexProgress, message_id: Optional[str],
+    ) -> bool:
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_progress
+                   SET message_id=?, state='delivered', last_error=NULL,
+                       attempt_count=0, next_attempt_at=0, updated_at=?
+                   WHERE control_session_key=? AND generation=? AND logical_turn_id=?
+                     AND content=?""",
+                (
+                    str(message_id) if message_id is not None else progress.message_id,
+                    time.time(), progress.control_session_key, progress.generation,
+                    progress.logical_turn_id, progress.content,
+                ),
+            )
+        return bool(cur.rowcount)
+
+    def mark_progress_failed(self, progress: DurableCodexProgress, error: str) -> None:
+        attempt_count = progress.attempt_count + 1
+        next_attempt_at = time.time() + min(300.0, 1.5 * (2 ** min(progress.attempt_count, 8)))
+        with self._lock, self._transaction() as conn:
+            conn.execute(
+                """UPDATE codex_bridge_progress
+                   SET state='pending', last_error=?, attempt_count=?,
+                       next_attempt_at=?, updated_at=?
+                   WHERE control_session_key=? AND generation=? AND logical_turn_id=?
+                     AND content=?""",
+                (
+                    str(error or "progress delivery failed")[:500], attempt_count,
+                    next_attempt_at, time.time(),
+                    progress.control_session_key, progress.generation,
+                    progress.logical_turn_id, progress.content,
+                ),
+            )
+
+    def clear_progress_message(self, progress: DurableCodexProgress, error: str) -> None:
+        attempt_count = progress.attempt_count + 1
+        next_attempt_at = time.time() + min(30.0, 1.5 * (2 ** min(progress.attempt_count, 4)))
+        with self._lock, self._transaction() as conn:
+            conn.execute(
+                """UPDATE codex_bridge_progress
+                   SET message_id=NULL, state='pending', last_error=?, attempt_count=?,
+                       next_attempt_at=?, updated_at=?
+                   WHERE control_session_key=? AND generation=? AND logical_turn_id=?
+                     AND content=?""",
+                (
+                    str(error or "progress message is no longer editable")[:500],
+                    attempt_count, next_attempt_at, time.time(),
+                    progress.control_session_key, progress.generation,
+                    progress.logical_turn_id, progress.content,
+                ),
+            )
+
+    def complete_progress(self, binding: CodexBridgeBinding, logical_turn_id: str) -> None:
+        """Forget a delivered preview after its final; failed previews remain retryable."""
+        with self._lock, self._transaction() as conn:
+            conn.execute(
+                """DELETE FROM codex_bridge_progress
+                   WHERE control_session_key=? AND generation=? AND logical_turn_id=?
+                     AND state='delivered'""",
+                (binding.control_session_key, binding.generation, logical_turn_id),
+            )
+
     def bind(
         self, control_session_key: str, source: SessionSource, *, thread_id: str, cwd: str = "",
         rollout_path: Optional[str] = None, cursor_device: Optional[int] = None,
@@ -255,6 +508,10 @@ class CodexBridgeStore:
                      )""",
                 (now, control_session_key, generation),
             )
+            conn.execute(
+                "DELETE FROM codex_bridge_progress WHERE control_session_key=? AND generation<>?",
+                (control_session_key, generation),
+            )
         return self.get_binding(control_session_key)  # type: ignore[return-value]
 
     def unbind(self, control_session_key: str, source: SessionSource) -> int:
@@ -288,6 +545,10 @@ class CodexBridgeStore:
                        'continuation_pending'
                    )""",
                 (now, control_session_key),
+            )
+            conn.execute(
+                "DELETE FROM codex_bridge_progress WHERE control_session_key=?",
+                (control_session_key,),
             )
         return generation
 
@@ -745,7 +1006,11 @@ class CodexBridgeStore:
                    WHERE state IN ('routed','uncertain','completed','cancelled') AND updated_at < ?""",
                 (cutoff,),
             )
-        return int(cur.rowcount)
+            progress_cur = conn.execute(
+                "DELETE FROM codex_bridge_progress WHERE state='delivered' AND updated_at < ?",
+                (cutoff,),
+            )
+        return int(cur.rowcount) + int(progress_cur.rowcount)
 
     def input_state(self, input_id: str) -> Optional[str]:
         with self._lock, self._transaction() as conn:

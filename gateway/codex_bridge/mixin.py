@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
 import logging
 import os
 import time
@@ -27,7 +26,12 @@ from gateway.codex_bridge.catalog import (
 )
 from gateway.codex_bridge.handoff import read_turn_handoff
 from gateway.codex_bridge.rollout import RolloutEvent, RolloutTail, inspect_rollout, resolve_rollout_path
-from gateway.codex_bridge.store import CodexBridgeBinding, CodexBridgeStore, DurableCodexInput
+from gateway.codex_bridge.store import (
+    CodexBridgeBinding,
+    CodexBridgeStore,
+    DurableCodexInput,
+    DurableCodexProgress,
+)
 from gateway.config import Platform
 from gateway.platforms.base import SessionRouteRejected
 from gateway.platforms.event import MessageEvent
@@ -42,7 +46,9 @@ _INPUT_KEY = "codex_bridge_input_id"
 _LANE_KEY = "codex_bridge_lane_key"
 _SELECTION_COMMANDS = frozenset({"codex-session", "ns"})
 _MIRROR_PROGRESS_MAX_SEGMENTS = 8
-_MIRROR_PROGRESS_MAX_CHARS = 12_000
+# Leave ample room for Telegram's Markdown escaping while keeping one editable
+# message below its 4,096 UTF-16-unit ceiling.
+_MIRROR_PROGRESS_MAX_CHARS = 1_800
 
 
 class GatewayCodexBridgeMixin:
@@ -51,7 +57,6 @@ class GatewayCodexBridgeMixin:
     def _init_codex_bridge(self) -> None:
         self._codex_bridge_stores: dict[str, CodexBridgeStore] = {}
         self._codex_bridge_tails: dict[tuple[str, int], RolloutTail] = {}
-        self._codex_bridge_mirror_ui: dict[tuple[str, int, str], dict[str, Any]] = {}
         self._codex_bridge_binding_locks: dict[str, asyncio.Lock] = {}
         # Create/recover the primary authority before any adapter can accept an
         # event. Secondary profile stores are recovered lazily on first use.
@@ -412,11 +417,9 @@ class GatewayCodexBridgeMixin:
         return self._codex_bridge_store_for_source(source).cancel_lane(lane_key)
 
     def _codex_bridge_forget_binding_runtime(self, binding: CodexBridgeBinding) -> None:
-        """Drop process-local tail/UI caches when a durable grant rotates."""
+        """Drop the process-local tail when a durable grant rotates."""
         key = (binding.control_session_key, binding.generation)
         self._codex_bridge_tails.pop(key, None)
-        for ui_key in [candidate for candidate in self._codex_bridge_mirror_ui if candidate[:2] == key]:
-            self._codex_bridge_mirror_ui.pop(ui_key, None)
 
     async def _codex_bridge_store_binding(
         self, source: SessionSource, summary: Optional[CodexThreadSummary],
@@ -470,8 +473,19 @@ class GatewayCodexBridgeMixin:
         answer = (
             f"{'✅ 이미 연결된' if unchanged else '✅ Codex 세션 연결됨:'} {summary.title[:100]}\n"
             "이 채팅의 일반 메시지는 승인 요청 없이 전체 액세스로 같은 Codex 세션에 이어집니다. "
-            "데스크톱에서 시작한 진행 보고와 최종 답변도 이 채팅으로 전달됩니다. "
+            "데스크톱에서 시작한 진행 보고는 Telegram에 남는 메시지로 전달되고 새 보고 때 갱신되며, "
+            "최종 답변은 별도 메시지로 전달됩니다. "
             "데스크톱 작업이 쓰기 권한을 사용 중이면 Telegram 입력은 그 작업이 끝날 때까지 순서대로 기다립니다."
+        )
+        answer += (
+            "\n현재 Codex 턴이 진행 중이므로 이후 진행 보고부터 전달합니다."
+            if snapshot is not None and snapshot.active_turn_id
+            else "\n현재 실행 중인 Codex 턴은 없습니다. 새 턴이 시작되기 전에는 추가 보고가 없습니다."
+        )
+        answer += (
+            "\n이 Telegram 토픽에는 한 세션만 연결되며, 다른 토픽은 별도로 연결할 수 있습니다."
+            if source.thread_id
+            else "\n이 Telegram 대화에는 한 세션만 연결됩니다. 새 세션을 고르면 기존 연결을 교체합니다."
         )
         if rotated:
             answer += "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
@@ -479,6 +493,61 @@ class GatewayCodexBridgeMixin:
             answer += f"\n\n🧾 마지막 답변\n\n{snapshot.latest_final_text}"
         logger.info("Bound Codex thread %s to %s generation=%s", summary.thread_id, control_key, binding.generation)
         return answer
+
+    async def _codex_bridge_status(
+        self, store: CodexBridgeStore, control_key: str, source: SessionSource,
+    ) -> str:
+        binding = store.get_binding(control_key)
+        scope = "이 Telegram 토픽" if source.thread_id else "이 Telegram 대화"
+        if binding is None or not binding.active:
+            return (
+                f"📱 Codex 연결 상태\n\n{scope}: 연결 없음\n"
+                "/codex_session으로 최근 세션을 선택할 수 있습니다."
+            )
+        if binding.pending_new:
+            return (
+                f"📱 Codex 연결 상태\n\n{scope}: 새 세션의 첫 입력 대기 중\n"
+                f"프로젝트: {binding.cwd or '-'}\n세대: {binding.generation}\n"
+                "다음 일반 메시지가 새 Codex 세션의 첫 지시가 됩니다."
+            )
+        try:
+            snapshot = await asyncio.to_thread(
+                inspect_rollout, binding.thread_id, hinted_path=binding.rollout_path,
+            )
+        except Exception:
+            logger.warning("Codex rollout status inspection failed", exc_info=True)
+            snapshot = None
+        progress = store.list_progress(binding)
+        pending = [row for row in progress if row.state == "pending"]
+        if snapshot is None:
+            state = "rollout 파일을 찾지 못함"
+            lag = "확인 불가"
+        else:
+            state = "턴 진행 중" if snapshot.active_turn_id else "대기/완료"
+            same_incarnation = (
+                binding.rollout_path == snapshot.path
+                and binding.cursor_device == snapshot.device
+                and binding.cursor_inode == snapshot.inode
+            )
+            cursor = binding.cursor_offset if same_incarnation else 0
+            lag = f"{max(0, snapshot.size - cursor):,} bytes"
+        lines = [
+            "📱 Codex 연결 상태",
+            "",
+            f"범위: {scope}",
+            f"세션: {binding.thread_id}",
+            f"상태: {state}",
+            f"프로젝트: {binding.cwd or '-'}",
+            f"세대: {binding.generation}",
+            f"rollout 미처리량: {lag}",
+            f"진행 보고 outbox: 대기 {len(pending)} / 전체 {len(progress)}",
+        ]
+        if pending and pending[-1].last_error:
+            lines.append(f"최근 전송 오류: {pending[-1].last_error[:300]}")
+        lines.append(
+            "연결 규칙: 현재 대화/토픽당 1개 세션이며, Telegram 토픽은 각각 독립적으로 연결됩니다."
+        )
+        return "\n".join(lines)
 
     def _codex_bridge_lane_key(self, source: SessionSource, binding: CodexBridgeBinding) -> str:
         lane = dataclasses.replace(
@@ -497,6 +566,8 @@ class GatewayCodexBridgeMixin:
         arg = raw.lower()
         if arg in {"off", "detach", "disconnect", "해제"}:
             return await self._codex_bridge_store_binding(source, None)
+        if arg in {"status", "상태"}:
+            return await self._codex_bridge_status(store, control_key, source)
         try:
             threads = await asyncio.to_thread(list_recent_threads, limit=8)
         except Exception:
@@ -508,7 +579,7 @@ class GatewayCodexBridgeMixin:
         if arg and arg not in {"refresh", "새로고침"}:
             selected = threads[int(arg) - 1] if arg.isdigit() and 1 <= int(arg) <= len(threads) else by_id.get(raw)
             if selected is None:
-                return "사용법: /codex-session, /codex-session 1, 또는 /codex-session off"
+                return "사용법: /codex-session, /codex-session 1, /codex-session status, 또는 /codex-session off"
             return await self._codex_bridge_store_binding(source, selected)
 
         current = store.get_binding(control_key)
@@ -671,72 +742,90 @@ class GatewayCodexBridgeMixin:
                         str(getattr(result, "error", ""))[:500],
                     )
         store.mark_completed(item.input_id)
-
-    @staticmethod
-    def _codex_bridge_draft_id(control_key: str, generation: int, logical_turn_id: str) -> int:
-        raw = hashlib.sha256(
-            f"{control_key}\0{generation}\0{logical_turn_id}".encode()
-        ).digest()[:6]
-        return max(1, int.from_bytes(raw, "big"))
+        binding = store.get_binding(item.control_session_key)
+        if (
+            binding is not None
+            and binding.generation == item.generation
+            and binding.thread_id == item.thread_id
+        ):
+            store.complete_progress(binding, item.input_id)
 
     @staticmethod
     def _codex_bridge_mirror_identity(event: RolloutEvent) -> str:
         # Automatic Codex continuation turns inherit the originating client id
-        # from the explicit turn_aborted→task_started boundary. Keep one draft
-        # across that transition while unrelated turns remain isolated.
+        # from the explicit turn_aborted→task_started boundary. Keep one
+        # persistent progress message across that transition.
         return event.client_id or event.turn_id
 
-    async def _codex_bridge_mirror_commentary_batch(
-        self, binding: CodexBridgeBinding, events: list[RolloutEvent], adapter: Any,
-    ) -> None:
+    @staticmethod
+    def _codex_bridge_stage_commentary(
+        store: CodexBridgeStore, binding: CodexBridgeBinding, events: list[RolloutEvent],
+    ) -> DurableCodexProgress:
+        """Commit commentary to the outbox before acknowledging rollout bytes."""
         if not events:
-            return
+            raise ValueError("events are required")
         event = events[-1]
-        logical_turn_id = self._codex_bridge_mirror_identity(event)
-        key = (binding.control_session_key, binding.generation, logical_turn_id)
-        state = self._codex_bridge_mirror_ui.setdefault(key, {"segments": [], "message_id": None})
-        for candidate in events:
-            if candidate.text not in state["segments"]:
-                state["segments"].append(candidate.text)
-        while len(state["segments"]) > _MIRROR_PROGRESS_MAX_SEGMENTS:
-            state["segments"].pop(0)
-        while len("\n\n".join(state["segments"])) > _MIRROR_PROGRESS_MAX_CHARS and len(state["segments"]) > 1:
-            state["segments"].pop(0)
-        content = "💻 Codex 진행\n\n" + "\n\n".join(state["segments"])
-        metadata = self._thread_metadata_for_source(binding.source)
+        return store.upsert_progress(
+            binding,
+            GatewayCodexBridgeMixin._codex_bridge_mirror_identity(event),
+            [candidate.text for candidate in events],
+            max_segments=_MIRROR_PROGRESS_MAX_SEGMENTS,
+            max_chars=_MIRROR_PROGRESS_MAX_CHARS,
+        )
+
+    async def _codex_bridge_deliver_progress(
+        self, store: CodexBridgeStore, binding: CodexBridgeBinding,
+        progress: DurableCodexProgress, adapter: Any,
+    ) -> None:
+        """Send once, then edit; failures stay pending in SQLite for restart recovery."""
+        metadata = dict(self._thread_metadata_for_source(binding.source) or {})
         metadata["_interim_send"] = True
-        supports = False
-        with suppress(Exception):
-            supports = bool(adapter.supports_draft_streaming(
-                chat_id=binding.source.chat_id, chat_type=binding.source.chat_type, metadata=metadata,
-            ))
-        if supports:
-            result = await asyncio.wait_for(
-                adapter.send_draft(
-                    binding.source.chat_id,
-                    self._codex_bridge_draft_id(binding.control_session_key, binding.generation, logical_turn_id),
-                    content, metadata=metadata,
-                ), timeout=20.0,
-            )
-            if not getattr(result, "success", False):
-                raise RuntimeError(f"Codex draft delivery failed: {getattr(result, 'error', '')}")
-            return
-        message_id = state.get("message_id")
-        if message_id and hasattr(adapter, "edit_message"):
-            result = await asyncio.wait_for(
-                adapter.edit_message(binding.source.chat_id, message_id, content, metadata=metadata), timeout=20.0,
-            )
-        else:
-            result = await asyncio.wait_for(
-                adapter.send(binding.source.chat_id, content, metadata=metadata), timeout=20.0,
-            )
-        if getattr(result, "success", False) and getattr(result, "message_id", None):
-            state["message_id"] = str(result.message_id)
-        elif not getattr(result, "success", False):
-            raise RuntimeError(f"Codex progress delivery failed: {getattr(result, 'error', '')}")
+        try:
+            if progress.message_id:
+                result = await asyncio.wait_for(
+                    adapter.edit_message(
+                        binding.source.chat_id, progress.message_id,
+                        progress.content, metadata=metadata,
+                    ),
+                    timeout=20.0,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    adapter.send(
+                        binding.source.chat_id, progress.content, metadata=metadata,
+                    ),
+                    timeout=20.0,
+                )
+        except Exception as exc:
+            store.mark_progress_failed(progress, str(exc))
+            raise
+        if not getattr(result, "success", False):
+            error = str(getattr(result, "error", "") or "progress delivery failed")
+            if progress.message_id and getattr(result, "error_kind", None) == "not_found":
+                store.clear_progress_message(progress, error)
+            else:
+                store.mark_progress_failed(progress, error)
+            raise RuntimeError(f"Codex progress delivery failed: {error}")
+        message_id = getattr(result, "message_id", None) or progress.message_id
+        if not store.mark_progress_delivered(progress, message_id):
+            raise RuntimeError("Codex progress changed while delivery was in flight")
+
+    async def _codex_bridge_retry_progress(
+        self, store: CodexBridgeStore, binding: CodexBridgeBinding, adapter: Any,
+    ) -> None:
+        for progress in store.list_progress(binding, pending_only=True, ready_only=True):
+            try:
+                await self._codex_bridge_deliver_progress(store, binding, progress, adapter)
+            except Exception:
+                logger.warning(
+                    "Codex progress retry failed for %s turn=%s",
+                    binding.control_session_key, progress.logical_turn_id,
+                    exc_info=True,
+                )
 
     async def _codex_bridge_mirror_final(
-        self, binding: CodexBridgeBinding, event: RolloutEvent, adapter: Any,
+        self, store: CodexBridgeStore, binding: CodexBridgeBinding,
+        event: RolloutEvent, adapter: Any,
     ) -> None:
         from gateway.delivery_ledger import (
             compute_obligation_id,
@@ -761,14 +850,7 @@ class GatewayCodexBridgeMixin:
             adapter_profile=getattr(adapter, "_owner_profile", None),
         )
         if not inserted:
-            self._codex_bridge_mirror_ui.pop(
-                (
-                    binding.control_session_key,
-                    binding.generation,
-                    self._codex_bridge_mirror_identity(event),
-                ),
-                None,
-            )
+            store.complete_progress(binding, self._codex_bridge_mirror_identity(event))
             return
         await self._codex_bridge_ledger_call(
             binding.source, mark_attempting, obligation_id,
@@ -794,14 +876,7 @@ class GatewayCodexBridgeMixin:
                     binding.source, mark_failed, obligation_id,
                     str(getattr(result, "error", ""))[:500],
                 )
-        self._codex_bridge_mirror_ui.pop(
-            (
-                binding.control_session_key,
-                binding.generation,
-                self._codex_bridge_mirror_identity(event),
-            ),
-            None,
-        )
+        store.complete_progress(binding, self._codex_bridge_mirror_identity(event))
 
     async def _codex_bridge_poll_binding(self, store: CodexBridgeStore, binding: CodexBridgeBinding) -> None:
         async with self._codex_bridge_binding_lock(binding.control_session_key):
@@ -819,6 +894,20 @@ class GatewayCodexBridgeMixin:
     ) -> None:
         if binding.pending_new:
             return
+        adapter = self._adapter_for_source(binding.source)
+        if adapter is None:
+            return
+        current = store.get_binding(binding.control_session_key)
+        if (
+            current is None
+            or current.generation != binding.generation
+            or current.thread_id != binding.thread_id
+        ):
+            self._codex_bridge_tails.pop(
+                (binding.control_session_key, binding.generation), None,
+            )
+            return
+        await self._codex_bridge_retry_progress(store, binding, adapter)
         path = await asyncio.to_thread(
             resolve_rollout_path, binding.thread_id, hinted_path=binding.rollout_path,
         )
@@ -837,17 +926,6 @@ class GatewayCodexBridgeMixin:
             )
             self._codex_bridge_tails[key] = tail
         events, next_offset, stat = await asyncio.to_thread(tail.scan)
-        adapter = self._adapter_for_source(binding.source)
-        if adapter is None:
-            return
-        current = store.get_binding(binding.control_session_key)
-        if (
-            current is None
-            or current.generation != binding.generation
-            or current.thread_id != binding.thread_id
-        ):
-            self._codex_bridge_tails.pop(key, None)
-            return
         last_event_id = binding.last_event_id
         committed_offset = tail.offset
 
@@ -870,12 +948,16 @@ class GatewayCodexBridgeMixin:
                 return
             last: Optional[RolloutEvent] = None
             for grouped in pending_commentary.values():
+                progress = self._codex_bridge_stage_commentary(store, binding, grouped)
                 try:
-                    await self._codex_bridge_mirror_commentary_batch(binding, grouped, adapter)
+                    if progress.state == "pending":
+                        await self._codex_bridge_deliver_progress(
+                            store, binding, progress, adapter,
+                        )
                 except Exception:
-                    # Progress is replaceable UI state. Keep the accumulated
-                    # segments for the next update but never let a transient or
-                    # permanent progress-send failure starve a durable final.
+                    # The outbox is committed already, so a transient failure
+                    # cannot erase progress even though the rollout cursor
+                    # advances to keep a durable final from starving.
                     logger.warning(
                         "Codex progress delivery failed for %s",
                         binding.control_session_key,
@@ -931,7 +1013,7 @@ class GatewayCodexBridgeMixin:
                 pending_commentary.setdefault(identity, []).append(event)
                 continue
             elif disposition == "unmanaged" and event.kind in {"final", "error"}:
-                await self._codex_bridge_mirror_final(binding, event, adapter)
+                await self._codex_bridge_mirror_final(store, binding, event, adapter)
             elif disposition in {"live", "terminal"}:
                 log_suppression = (
                     logger.info if event.kind in {"final", "error"} else logger.debug
