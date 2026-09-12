@@ -489,7 +489,7 @@ class GatewayCodexBridgeMixin:
         )
         if rotated:
             answer += "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
-        if snapshot is not None and snapshot.latest_final_text:
+        if not unchanged and snapshot is not None and snapshot.latest_final_text:
             answer += f"\n\n🧾 마지막 답변\n\n{snapshot.latest_final_text}"
         logger.info("Bound Codex thread %s to %s generation=%s", summary.thread_id, control_key, binding.generation)
         return answer

@@ -195,7 +195,12 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
         current, "lane", MessageEvent(text="continue", source=source, message_id="current-work"),
     )
     bridge = _Bridge(store)
-    monkeypatch.setattr("gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.inspect_rollout",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            active_turn_id=None, latest_final_text="must not repeat",
+        ),
+    )
 
     answer = await bridge._codex_bridge_store_binding(
         source,
@@ -206,6 +211,7 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
     )
 
     assert "이미 연결된" in answer
+    assert "must not repeat" not in answer
     assert store.get_binding(build_session_key(source)).generation == current.generation
     assert store.input_state(input_id) == "routed"
 
