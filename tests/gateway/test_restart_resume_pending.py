@@ -639,14 +639,20 @@ async def test_drain_timeout_marks_resume_pending():
     running_agent = MagicMock()
     session_key_one = "agent:main:telegram:dm:A"
     session_key_two = "agent:main:telegram:dm:B"
+    bridge_session_key = "agent:main:telegram:dm:A:lane:bridge"
     runner._running_agents = {
         session_key_one: running_agent,
         session_key_two: MagicMock(),
+        bridge_session_key: MagicMock(),
     }
 
     # Plug a mock session_store that records marks.
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.lookup_by_session_key.side_effect = lambda key: SimpleNamespace(
+        session_key=key,
+        metadata={"codex_bridge_execution_owner": key == bridge_session_key},
+    )
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -654,12 +660,53 @@ async def test_drain_timeout_marks_resume_pending():
     ):
         await runner.stop()
 
-    # Both active sessions were marked with the shutdown_timeout reason.
+    # Generic sessions are marked. The bridge lane is recovered exclusively
+    # from its durable input journal and must not receive a generic marker.
     calls = session_store.mark_resume_pending.call_args_list
     marked = {args[0][0] for args in calls}
     assert marked == {session_key_one, session_key_two}
     for args in calls:
         assert args[0][1] == "shutdown_timeout"
+    session_store.clear_resume_pending.assert_called_with(bridge_session_key)
+
+
+@pytest.mark.asyncio
+async def test_startup_clears_legacy_bridge_marker_without_synthesizing_input(tmp_path):
+    """A marker written by an older gateway cannot become a Codex user turn."""
+    from gateway.codex_bridge.store import CodexBridgeStore
+
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="bridge-chat")
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", source, thread_id="desktop-thread")
+    lane_key = runner._codex_bridge_lane_key(source, binding)
+    store.enqueue_input(
+        binding,
+        lane_key,
+        MessageEvent(text="owned input", message_type=MessageType.TEXT, source=source),
+    )
+    runner._codex_bridge_stores = {"test": store}
+    pending_entry = SessionEntry(
+        session_key=lane_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {lane_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    runner.session_store.clear_resume_pending.assert_called_once_with(lane_key)
+    adapter.handle_message.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1310,4 +1357,3 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-

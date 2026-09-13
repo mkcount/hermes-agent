@@ -50,6 +50,7 @@ _THREAD_KEY = "codex_bridge_thread_id"
 _GENERATION_KEY = "codex_bridge_generation"
 _INPUT_KEY = "codex_bridge_input_id"
 _LANE_KEY = "codex_bridge_lane_key"
+_SESSION_EXECUTION_OWNER_KEY = "codex_bridge_execution_owner"
 _SELECTION_COMMANDS = frozenset({"codex-session", "ns"})
 _MIRROR_PROGRESS_MAX_SEGMENTS = 8
 # Leave ample room for Telegram's Markdown escaping while keeping one editable
@@ -113,6 +114,59 @@ class GatewayCodexBridgeMixin:
 
     def _codex_bridge_control_key(self, source: SessionSource) -> str:
         return self._session_key_for_source(self._codex_bridge_control_source(source))
+
+    def _codex_bridge_owns_restart_recovery(self, entry_or_key: Any) -> bool:
+        """True when durable bridge state, rather than generic session replay, owns recovery.
+
+        A binding grants Telegram both output mirroring and explicit input
+        submission, but it does not transfer ownership of arbitrary desktop
+        turns.  Replaying a generic ``resume_pending`` event through a bound
+        lane would manufacture a new Codex user input.  Bridge lanes therefore
+        recover only through ``codex_bridge_inputs`` and rollout observation.
+        """
+        entry = entry_or_key if hasattr(entry_or_key, "session_key") else None
+        session_key = str(
+            getattr(entry, "session_key", "") if entry is not None else entry_or_key or ""
+        ).strip()
+        if not session_key:
+            return False
+        lookup_failed = False
+        if entry is None:
+            lookup = getattr(getattr(self, "session_store", None), "lookup_by_session_key", None)
+            if callable(lookup):
+                try:
+                    entry = lookup(session_key)
+                except Exception:
+                    lookup_failed = True
+                    logger.warning(
+                        "Codex bridge session ownership metadata lookup failed for %s",
+                        session_key,
+                        exc_info=True,
+                    )
+        metadata = getattr(entry, "metadata", None)
+        if isinstance(metadata, dict) and metadata.get(_SESSION_EXECUTION_OWNER_KEY) is True:
+            return True
+
+        for store in list(getattr(self, "_codex_bridge_stores", {}).values()):
+            try:
+                if store.has_lane_session(session_key):
+                    return True
+                if any(
+                    self._codex_bridge_lane_key(binding.source, binding) == session_key
+                    for binding in store.list_bindings()
+                ):
+                    return True
+            except Exception:
+                lookup_failed = True
+                logger.warning(
+                    "Codex bridge lane ownership lookup failed for %s; generic resume is suppressed",
+                    session_key,
+                    exc_info=True,
+                )
+        # Trusted local lanes currently belong exclusively to this bridge.
+        # When its authority store is unreadable, fail closed instead of
+        # risking a synthetic user input in a desktop-owned Codex turn.
+        return lookup_failed and ":lane:" in session_key
 
     @staticmethod
     def _codex_bridge_canonical_command(event: MessageEvent) -> Optional[str]:
@@ -215,6 +269,12 @@ class GatewayCodexBridgeMixin:
             trusted_local_lane=f"codex-binding:{control_key}:{binding.generation}",
         )
         lane_key = adapter._event_session_key(dataclasses.replace(event, source=lane_source))
+        # A stale generic marker must not prepend restart-recovery text to an
+        # explicit Telegram input that is already journaled by this bridge.
+        # This also closes the narrow reconnect race before the startup sweep.
+        clear_resume_pending = getattr(self.session_store, "clear_resume_pending", None)
+        if callable(clear_resume_pending):
+            clear_resume_pending(lane_key)
         metadata = dict(event.metadata or {})
         metadata.update({
             _CONTROL_KEY: control_key,
@@ -272,6 +332,14 @@ class GatewayCodexBridgeMixin:
         generation = int(getattr(ctx, "codex_bridge_generation", 0) or 0)
         if binding is None or binding.generation != generation or not binding.active:
             raise RuntimeError("Codex bridge binding changed before turn start")
+
+        try:
+            self.session_store.set_session_metadata(
+                ctx.session_key, _SESSION_EXECUTION_OWNER_KEY, True,
+            )
+        except Exception:
+            # The durable input row still identifies the lane on recovery.
+            logger.debug("Failed to persist Codex bridge execution owner", exc_info=True)
 
         agent.api_mode = "codex_app_server"
         agent._gateway_codex_full_access = True

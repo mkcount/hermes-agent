@@ -371,7 +371,11 @@ session that was mid-turn when the drain timeout fired. Reasons:
 - `"shutdown_timeout"` — killed during shutdown drain
 - `"restart_interrupted"` — crash recovery (from `suspend_recently_active`)
 
-All three reasons are in `_AUTO_RESUME_REASONS` and eligible for startup auto-resume.
+All three reasons are in `_AUTO_RESUME_REASONS` and eligible for startup auto-resume for
+ordinary Hermes sessions. Codex bridge lanes are excluded: their explicit input journal and
+rollout observer own restart recovery. Treating a bridge's output binding as generic execution
+ownership would synthesize a new Codex input when the selected task was actually being driven
+from Desktop. Startup also clears bridge-lane markers left by older gateway versions.
 
 ### Auto-Resume on Next Access
 

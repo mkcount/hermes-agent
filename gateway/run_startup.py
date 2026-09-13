@@ -466,7 +466,7 @@ class GatewayStartupMixin:
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
+                marked = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
@@ -477,6 +477,23 @@ class GatewayStartupMixin:
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
+        # Old binaries may already have persisted a generic restart marker for
+        # a Codex bridge lane. Remove it before scheduling: durable bridge input
+        # recovery and rollout delivery own these lanes, while the generic path
+        # would create an unsolicited Codex input.
+        candidates = []
+        for entry in marked:
+            if self._codex_bridge_owns_restart_recovery(entry):
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception:
+                    logger.warning(
+                        "Failed to clear stale Codex bridge resume marker for %s",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                continue
+            candidates.append(entry)
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
         # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
         if candidates:

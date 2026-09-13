@@ -781,7 +781,7 @@ class GatewayShutdownMixin:
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
-        """Mark every non-pending running session resume_pending; returns the keys marked."""
+        """Mark generic running sessions resume_pending; bridge lanes use their own journal."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
@@ -790,6 +790,16 @@ class GatewayShutdownMixin:
         # recover in-flight sessions (#27856).
         for _sk, _agent in list(self._running_agents.items()):
             if _agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if self._codex_bridge_owns_restart_recovery(_sk):
+                # codex_bridge_inputs is the sole execution/recovery owner for
+                # this lane. A generic marker would later synthesize an empty
+                # MessageEvent and route it into the selected Codex thread as
+                # a brand-new user input.
+                with _log_suppressed(
+                    logging.DEBUG, "clear stale bridge resume_pending failed for %s: %s", _sk,
+                ):
+                    await self.async_session_store.clear_resume_pending(_sk)
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 await self.async_session_store.mark_resume_pending(_sk, reason)

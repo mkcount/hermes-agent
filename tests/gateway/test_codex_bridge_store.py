@@ -59,6 +59,8 @@ def test_input_lifecycle_and_restart_recovery(tmp_path, monkeypatch):
 
     assert state == "routed"
     assert inserted is True
+    assert store.has_lane_session("lane-a") is True
+    assert store.has_lane_session("lane-missing") is False
     assert store.mark_executing(input_id)
     assert store.mark_executed(input_id, "finished")
 

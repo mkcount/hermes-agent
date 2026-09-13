@@ -155,6 +155,9 @@ class CodexBridgeStore:
             "CREATE INDEX IF NOT EXISTS idx_codex_bridge_inputs_state ON codex_bridge_inputs(state, created_at)"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_bridge_inputs_lane ON codex_bridge_inputs(lane_session_key)"
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS codex_bridge_progress (
                 control_session_key TEXT NOT NULL,
                 generation INTEGER NOT NULL,
@@ -1045,6 +1048,18 @@ class CodexBridgeStore:
                 (time.time(), lane_session_key),
             )
         return int(cur.rowcount)
+
+    def has_lane_session(self, lane_session_key: str) -> bool:
+        """Whether this store has ever owned execution for a gateway lane."""
+        cleaned = str(lane_session_key or "").strip()
+        if not cleaned:
+            return False
+        with self._lock, self._transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM codex_bridge_inputs WHERE lane_session_key=? LIMIT 1",
+                (cleaned,),
+            ).fetchone()
+        return row is not None
 
     def recover_after_restart(self) -> None:
         """Make crash-owned rows recoverable before any gateway task can claim them.
