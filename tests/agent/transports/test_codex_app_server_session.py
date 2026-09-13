@@ -958,14 +958,21 @@ class TestSessionRetirement:
 
 
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
-        """
+    def test_final_item_without_turn_completed_requires_stored_turn_confirmation(self):
+        """A completed item is promoted only after exact turn reconciliation."""
         client = FakeClient()
+        original_handler = client._request_handler
+        def handle(method, params):
+            if method == "thread/read":
+                return {"thread": {"turns": [{"id": "turn-fake-001", "status": "completed"}]}}
+            return original_handler(method, params) if original_handler else (
+                {"thread": {"id": "thread-fake-001"}} if method == "thread/start"
+                else {"turn": {"id": "turn-fake-001"}} if method == "turn/start" else {}
+            )
+        client._request_handler = handle
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            item={"type": "agentMessage", "id": "m1", "phase": "final_answer", "text": "done"},
             threadId="t",
             turnId="tu1",
         )
@@ -984,6 +991,29 @@ class TestSessionRetirement:
             for msg in r.projected_messages
         )
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_commentary_without_turn_completed_times_out_uncertain(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "phase": "commentary", "text": "working"},
+            threadId="t", turnId="tu1",
+        )
+        client._request_handler = lambda method, params: (
+            {"thread": {"id": "thread-fake-001"}} if method == "thread/start"
+            else {"turn": {"id": "turn-fake-001"}} if method == "turn/start"
+            else {"thread": {"turns": [{"id": "turn-fake-001", "status": "inProgress"}]}}
+            if method == "thread/read" else {}
+        )
+
+        result = make_session(client).run_turn(
+            "hi", turn_timeout=0.05, notification_poll_timeout=0.01,
+        )
+
+        assert result.final_text == ""
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert "timed out" in str(result.error)
 
 
     def test_post_tool_silence_waits_for_app_server_terminal_event(self):

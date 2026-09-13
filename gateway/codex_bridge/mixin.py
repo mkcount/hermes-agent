@@ -24,8 +24,14 @@ from gateway.codex_bridge.catalog import (
     list_recent_projects,
     list_recent_threads,
 )
-from gateway.codex_bridge.handoff import read_turn_handoff
-from gateway.codex_bridge.rollout import RolloutEvent, RolloutTail, inspect_rollout, resolve_rollout_path
+from gateway.codex_bridge.handoff import read_thread_handoff_graph, read_turn_handoff
+from gateway.codex_bridge.rollout import (
+    RolloutEvent,
+    RolloutTail,
+    find_terminal_for_client_id,
+    inspect_rollout,
+    resolve_rollout_path,
+)
 from gateway.codex_bridge.store import (
     CodexBridgeBinding,
     CodexBridgeStore,
@@ -317,7 +323,7 @@ class GatewayCodexBridgeMixin:
         store = self._codex_bridge_store_for_source(event.source)
         binding = store.get_binding(str(metadata.get(_CONTROL_KEY) or ""))
         if binding is None or binding.generation != int(metadata.get(_GENERATION_KEY) or 0):
-            store.mark_completed(input_id)
+            store.cancel_active_input(input_id, "binding changed before terminal delivery")
             return None
 
         transport = getattr(event, "_codex_bridge_agent_result", {})
@@ -330,14 +336,18 @@ class GatewayCodexBridgeMixin:
         codex_thread_id = str(
             transport.get("codex_thread_id") or binding.thread_id or ""
         ).strip()
+        observed_physical_status = (
+            str(transport.get("codex_turn_status") or "").strip().lower()
+            if transport.get("codex_turn_status_confirmed")
+            else "interrupted" if transport.get("interrupted")
+            else "unknown"
+        )
         handoff = read_turn_handoff(codex_thread_id, codex_turn_id)
-        handoff_owns_continuation = handoff is not None and handoff.continues and (
-            handoff.status != "interrupting" or bool(transport.get("interrupted"))
+        handoff_owns_continuation = bool(
+            handoff is not None and handoff.owns_continuation(observed_physical_status)
         )
         if (
             current_state in {"submitting", "running"}
-            and not bool(transport.get("completed"))
-            and not delivered_stream
             and handoff_owns_continuation
         ):
             assert handoff is not None
@@ -348,6 +358,8 @@ class GatewayCodexBridgeMixin:
                 input_id,
                 str(transport.get("error") or "Codex profile switch continuation pending"),
                 continuation_turn_id=handoff.continued_turn_id,
+                continuation_turn_ids=handoff.continuation_turn_ids,
+                physical_turn_status=observed_physical_status,
             )
             return None
         if (
@@ -367,41 +379,93 @@ class GatewayCodexBridgeMixin:
         if not final_text:
             final_text = "Codex 작업이 답변을 만들기 전에 종료되었습니다. 같은 메시지를 다시 보내 주세요."
             result = final_text
+        status_confirmed = bool(transport.get("codex_turn_status_confirmed"))
+        confirmed_status = (
+            str(transport.get("codex_turn_status") or "").strip().lower()
+            if status_confirmed else ""
+        )
         turn_outcome = (
-            "completed" if bool(transport.get("completed"))
+            confirmed_status if confirmed_status in {"completed", "interrupted", "failed"}
             else "interrupted" if bool(transport.get("interrupted"))
             else "failed" if transport.get("error")
             else "unknown"
         )
-        if not store.mark_executed(input_id, final_text, turn_outcome=turn_outcome):
+        output_kind = (
+            "final_answer"
+            if turn_outcome == "completed" and status_confirmed
+            else "terminal_notice"
+        )
+        adapter = self._adapter_for_source(event.source)
+        obligation_id = store.stage_terminal_output(
+            input_id, final_text, physical_turn_status=turn_outcome,
+            output_kind=output_kind,
+            adapter_profile=getattr(adapter, "_owner_profile", None),
+        )
+        if not obligation_id:
             return None
 
-        # For ordinary (non-streamed) final delivery, persist the exact output
-        # before returning to BasePlatformAdapter. Base records/attempts the
-        # same stable id; this closes the handler-return → ledger-write gap.
-        if not delivered_stream:
-            with suppress(Exception):
-                from gateway.delivery_ledger import compute_obligation_id, ensure_obligation
+        # BasePlatformAdapter must claim the exact row staged in the same
+        # transaction as the logical terminal transition.  This metadata is
+        # process-local and never serialized back into the inbound event.
+        metadata.update({
+            "_delivery_obligation_id": obligation_id,
+            "_delivery_logical_key": f"codex-input:{input_id}",
+            "_delivery_output_kind": output_kind,
+            "_delivery_sequence": 1,
+            "_delivery_ledger_db_path": str(store.path),
+        })
+        event.metadata = metadata
 
-                message_ref = event.ledger_message_id or event.message_id or input_id
-                obligation_id = compute_obligation_id(lane_key, str(message_ref), final_text)
+        if delivered_stream:
+            # Streaming already received a positive platform ACK before this
+            # reducer ran. Bracket that fact in the canonical row now; a crash
+            # before this point remains visibly at-least-once on recovery.
+            from gateway.delivery_ledger import mark_attempting, mark_delivered
+
+            claimed = await self._codex_bridge_ledger_call(
+                event.source, mark_attempting, obligation_id,
+            )
+            if claimed:
                 await self._codex_bridge_ledger_call(
-                    event.source,
-                    ensure_obligation,
-                    obligation_id=obligation_id, session_key=lane_key,
-                    platform=event.source.platform.value, chat_id=event.source.chat_id,
-                    thread_id=event.source.thread_id, content=final_text,
-                    adapter_profile=getattr(self._adapter_for_source(event.source), "_owner_profile", None),
+                    event.source, mark_delivered, obligation_id,
+                )
+            await self._codex_bridge_settle_input_delivery(
+                store, event.source, input_id, obligation_id,
+            )
+            store.complete_progress(binding, input_id)
+            return result
+
+        if adapter is not None and hasattr(adapter, "register_post_delivery_callback"):
+            async def _settle_delivery() -> None:
+                await self._codex_bridge_settle_input_delivery(
+                    store, event.source, input_id, obligation_id,
                 )
 
-        adapter = self._adapter_for_source(event.source)
-        if adapter is not None and hasattr(adapter, "register_post_delivery_callback"):
             adapter.register_post_delivery_callback(
-                lane_key, lambda: store.mark_completed(input_id), generation=run_generation,
+                lane_key, _settle_delivery, generation=run_generation,
             )
-        elif delivered_stream:
-            store.mark_completed(input_id)
+        else:
+            # No platform owner means returning text would bypass the durable
+            # state machine. The watcher will retry after the adapter exists.
+            store.mark_delivery_pending(input_id, "delivery adapter unavailable")
+            return None
         return result
+
+    async def _codex_bridge_settle_input_delivery(
+        self, store: CodexBridgeStore, source: SessionSource,
+        input_id: str, obligation_id: str,
+    ) -> bool:
+        from gateway.delivery_ledger import obligation_state
+
+        state = await self._codex_bridge_ledger_call(
+            source, obligation_state, obligation_id,
+        )
+        if state == "delivered":
+            return store.mark_completed(input_id)
+        store.mark_delivery_pending(
+            input_id, f"delivery obligation is {state or 'missing'}",
+        )
+        return False
 
     def _codex_bridge_release_input(self, event: MessageEvent, error: str = "") -> None:
         input_id = str((event.metadata or {}).get(_INPUT_KEY) or "").strip()
@@ -692,56 +756,23 @@ class GatewayCodexBridgeMixin:
         if adapter is None or not item.final_text:
             return
         from gateway.delivery_ledger import (
-            compute_obligation_id,
-            ensure_obligation,
             mark_attempting,
             mark_delivered,
             mark_failed,
+            obligation_state,
         )
 
-        message_ref = item.event.ledger_message_id or item.event.message_id or item.input_id
-        obligation_id = compute_obligation_id(item.lane_session_key, str(message_ref), item.final_text)
-        # Startup redelivery may already have claimed or delivered this row.
-        # INSERT OR IGNORE preserves that state; the bridge never becomes a
-        # second sender for an output the shared ledger already owns.
-        inserted = await self._codex_bridge_ledger_call(
-            item.event.source,
-            ensure_obligation,
-            obligation_id=obligation_id, session_key=item.lane_session_key,
-            platform=item.event.source.platform.value, chat_id=item.event.source.chat_id,
-            thread_id=item.event.source.thread_id, content=item.final_text,
+        obligation_id = item.delivery_obligation_id or store.stage_terminal_output(
+            item.input_id, item.final_text,
+            physical_turn_status=item.physical_turn_status or item.turn_outcome,
+            output_kind=item.output_kind if item.output_kind != "none" else (
+                "final_answer" if item.turn_outcome == "completed" else "terminal_notice"
+            ),
             adapter_profile=getattr(adapter, "_owner_profile", None),
+            recovery=True,
         )
-        # A row first reconstructed here did not exist during the startup
-        # sweep, and no prior send was attempted. Deliver it once under the
-        # same ledger id; pre-existing rows remain exclusively ledger-owned.
-        if inserted:
-            await self._codex_bridge_ledger_call(
-                item.event.source, mark_attempting, obligation_id,
-            )
-            try:
-                result = await asyncio.wait_for(
-                    adapter.send(
-                        item.event.source.chat_id, item.final_text,
-                        metadata=self._thread_metadata_for_source(item.event.source),
-                    ),
-                    timeout=20.0,
-                )
-            except Exception as exc:
-                await self._codex_bridge_ledger_call(
-                    item.event.source, mark_failed, obligation_id, str(exc)[:500],
-                )
-            else:
-                if getattr(result, "success", False):
-                    await self._codex_bridge_ledger_call(
-                        item.event.source, mark_delivered, obligation_id,
-                    )
-                else:
-                    await self._codex_bridge_ledger_call(
-                        item.event.source, mark_failed, obligation_id,
-                        str(getattr(result, "error", ""))[:500],
-                    )
-        store.mark_completed(item.input_id)
+        if not obligation_id:
+            raise RuntimeError(f"Codex recovery output has no durable obligation: {item.input_id}")
         binding = store.get_binding(item.control_session_key)
         if (
             binding is not None
@@ -749,6 +780,50 @@ class GatewayCodexBridgeMixin:
             and binding.thread_id == item.thread_id
         ):
             store.complete_progress(binding, item.input_id)
+        state = await self._codex_bridge_ledger_call(
+            item.event.source, obligation_state, obligation_id,
+        )
+        if state == "delivered":
+            store.mark_completed(item.input_id)
+            return
+        # An attempting row is ACK-ambiguous and may already be owned by the
+        # global startup sweep. Never create an unmarked competing sender.
+        if state != "pending":
+            store.mark_delivery_pending(item.input_id, f"delivery obligation is {state or 'missing'}")
+            return
+        claimed = await self._codex_bridge_ledger_call(
+            item.event.source, mark_attempting, obligation_id,
+        )
+        if not claimed:
+            store.mark_delivery_pending(item.input_id, "delivery claim lost")
+            return
+        try:
+            result = await asyncio.wait_for(
+                adapter.send(
+                    item.event.source.chat_id, item.final_text,
+                    metadata=self._thread_metadata_for_source(item.event.source),
+                ),
+                timeout=20.0,
+            )
+        except Exception as exc:
+            await self._codex_bridge_ledger_call(
+                item.event.source, mark_failed, obligation_id, str(exc)[:500],
+            )
+            store.mark_delivery_pending(item.input_id, str(exc))
+            return
+        if not getattr(result, "success", False):
+            error = str(getattr(result, "error", "") or "delivery failed")[:500]
+            await self._codex_bridge_ledger_call(
+                item.event.source, mark_failed, obligation_id, error,
+            )
+            store.mark_delivery_pending(item.input_id, error)
+            return
+        await self._codex_bridge_ledger_call(
+            item.event.source, mark_delivered, obligation_id,
+        )
+        await self._codex_bridge_settle_input_delivery(
+            store, item.event.source, item.input_id, obligation_id,
+        )
 
     @staticmethod
     def _codex_bridge_mirror_identity(event: RolloutEvent) -> str:
@@ -828,33 +903,46 @@ class GatewayCodexBridgeMixin:
         event: RolloutEvent, adapter: Any,
     ) -> None:
         from gateway.delivery_ledger import (
-            compute_obligation_id,
+            compute_semantic_obligation_id,
             ensure_obligation,
             mark_attempting,
             mark_delivered,
             mark_failed,
+            obligation_state,
         )
 
         label = "💻 Codex 오류" if event.kind == "error" else "💻 Codex 답변"
         content = f"{label}\n\n{event.text}"
-        obligation_id = compute_obligation_id(
-            self._codex_bridge_lane_key(binding.source, binding), event.event_id, content,
-        )
-        inserted = await self._codex_bridge_ledger_call(
+        lane_key = self._codex_bridge_lane_key(binding.source, binding)
+        identity = self._codex_bridge_mirror_identity(event)
+        logical_key = f"codex-rollout:{binding.thread_id}:{identity}"
+        output_kind = "terminal_notice" if event.kind == "error" else "final_answer"
+        obligation_id = compute_semantic_obligation_id(lane_key, logical_key, output_kind)
+        await self._codex_bridge_ledger_call(
             binding.source,
             ensure_obligation,
             obligation_id=obligation_id,
-            session_key=self._codex_bridge_lane_key(binding.source, binding),
+            session_key=lane_key,
             platform=binding.source.platform.value, chat_id=binding.source.chat_id,
             thread_id=binding.source.thread_id, content=content,
             adapter_profile=getattr(adapter, "_owner_profile", None),
+            logical_key=logical_key, output_kind=output_kind, delivery_sequence=1,
         )
-        if not inserted:
-            store.complete_progress(binding, self._codex_bridge_mirror_identity(event))
+        # Freeze the progress row as soon as final intent is durable, not only
+        # after Telegram ACK. Late commentary can no longer overwrite it.
+        store.complete_progress(binding, identity)
+        state = await self._codex_bridge_ledger_call(
+            binding.source, obligation_state, obligation_id,
+        )
+        if state in {"delivered", "attempting", "failed", "manual_review"}:
             return
-        await self._codex_bridge_ledger_call(
+        if state != "pending":
+            raise RuntimeError(f"Codex mirror obligation is {state or 'missing'}")
+        claimed = await self._codex_bridge_ledger_call(
             binding.source, mark_attempting, obligation_id,
         )
+        if not claimed:
+            return
         try:
             result = await asyncio.wait_for(
                 adapter.send(
@@ -876,7 +964,6 @@ class GatewayCodexBridgeMixin:
                     binding.source, mark_failed, obligation_id,
                     str(getattr(result, "error", ""))[:500],
                 )
-        store.complete_progress(binding, self._codex_bridge_mirror_identity(event))
 
     async def _codex_bridge_poll_binding(self, store: CodexBridgeStore, binding: CodexBridgeBinding) -> None:
         async with self._codex_bridge_binding_lock(binding.control_session_key):
@@ -884,10 +971,25 @@ class GatewayCodexBridgeMixin:
 
     @staticmethod
     def _codex_bridge_reconcile_continuation(store: CodexBridgeStore, item: DurableCodexInput) -> None:
-        """Close a handoff that ReloginTool proved needed no replacement turn."""
+        """Project ReloginTool's formal handoff state into bridge ownership."""
         handoff = read_turn_handoff(item.thread_id, item.codex_turn_id or "")
-        if handoff is not None and handoff.status == "terminal":
-            store.mark_completed(item.input_id)
+        if handoff is None:
+            return
+        if handoff.continuation_turn_ids:
+            store.update_continuation_chain(
+                item.input_id, handoff.continuation_turn_ids,
+                reason=f"handoff {handoff.operation_id or handoff.status}",
+            )
+        if handoff.no_successor_required:
+            store.reopen_for_rollout_reconciliation(
+                item.input_id, handoff.reason or "original turn completed during handoff",
+            )
+        elif handoff.status == "aborted":
+            store.capture_recovery_output(
+                item.input_id,
+                "Codex 프로필 전환 중 작업 재개가 취소되었습니다. 같은 지시를 다시 보내 주세요.",
+                turn_outcome="interrupted",
+            )
 
     async def _codex_bridge_poll_binding_locked(
         self, store: CodexBridgeStore, binding: CodexBridgeBinding,
@@ -914,6 +1016,7 @@ class GatewayCodexBridgeMixin:
         if path is None:
             return
         key = (binding.control_session_key, binding.generation)
+        handoff_graph = read_thread_handoff_graph(binding.thread_id)
         tail = self._codex_bridge_tails.get(key)
         if tail is None or tail.path != path:
             same_incarnation = binding.rollout_path == str(path)
@@ -923,8 +1026,11 @@ class GatewayCodexBridgeMixin:
                 device=binding.cursor_device if same_incarnation else None,
                 inode=binding.cursor_inode if same_incarnation else None,
                 offset=binding.cursor_offset if same_incarnation else 0,
+                handoff_graph=handoff_graph,
             )
             self._codex_bridge_tails[key] = tail
+        else:
+            tail.set_handoff_graph(handoff_graph)
         events, next_offset, stat = await asyncio.to_thread(tail.scan)
         last_event_id = binding.last_event_id
         committed_offset = tail.offset
@@ -1008,6 +1114,7 @@ class GatewayCodexBridgeMixin:
                     raise RuntimeError(
                         f"Codex rollout final lost delivery ownership: input={event.client_id}"
                     )
+                store.complete_progress(binding, self._codex_bridge_mirror_identity(event))
             elif disposition == "unmanaged" and event.kind == "commentary":
                 identity = self._codex_bridge_mirror_identity(event)
                 pending_commentary.setdefault(identity, []).append(event)
@@ -1043,6 +1150,45 @@ class GatewayCodexBridgeMixin:
             stores = list(getattr(self, "_codex_bridge_stores", {}).values())
             for store in stores:
                 try:
+                    # One-way repair for rows closed by the old
+                    # "interruption notice == logical completion" contract.
+                    for item in await asyncio.to_thread(store.legacy_completed_handoff_candidates):
+                        handoff = read_turn_handoff(item.thread_id, item.codex_turn_id or "")
+                        if handoff is not None and handoff.continuation_turn_ids:
+                            store.reopen_legacy_handoff(
+                                item.input_id, handoff.continuation_turn_ids,
+                            )
+                    for item in await asyncio.to_thread(store.pending_legacy_rollout_recovery):
+                        binding = store.get_binding(item.control_session_key)
+                        graph = read_thread_handoff_graph(item.thread_id)
+                        predecessor_turn_id = str(item.codex_turn_id or "")
+                        handoff = read_turn_handoff(item.thread_id, predecessor_turn_id)
+                        # A migrated row may predate the successor edge by
+                        # minutes. Full rollout scans are intentionally delayed
+                        # until ReloginTool either binds the exact successor or
+                        # proves that the original turn completed and no
+                        # successor is required. This keeps the watcher cheap and
+                        # prevents an unrelated later turn being adopted while a
+                        # handoff is still only intent/reconciliation.
+                        if (
+                            not graph.successor_for(predecessor_turn_id)
+                            and not (handoff is not None and handoff.no_successor_required)
+                        ):
+                            continue
+                        terminal = await asyncio.to_thread(
+                            find_terminal_for_client_id,
+                            item.thread_id,
+                            item.input_id,
+                            hinted_path=binding.rollout_path if binding else None,
+                            handoff_graph=graph,
+                        )
+                        if terminal is not None:
+                            store.capture_recovery_output(
+                                item.input_id,
+                                terminal.text or "Codex 작업이 오류로 종료되었습니다.",
+                                turn_outcome="failed" if terminal.kind == "error" else "completed",
+                            )
+                        store.finish_legacy_recovery_scan(item.input_id)
                     for item in await asyncio.to_thread(store.recoverable_outputs):
                         await self._codex_bridge_recover_output(store, item)
                     for item in await asyncio.to_thread(store.recoverable_inputs):

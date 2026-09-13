@@ -1,13 +1,11 @@
-"""Durable delivery-obligation ledger for gateway final responses (rows in the shared ``state.db``;
-WAL, owner pid + process-start liveness, bounded retention) so a crash between finalize and
-platform ACK cannot lose a response silently. Checkpoints: record_obligation() 'pending' before
-any send | mark_attempting() 'attempting' right before the await | mark_delivered() 'delivered'
-only on SendResult.success | mark_failed() 'failed' on a definitive rejection. Crash semantics
-(never silently resend an ambiguous send): pending = never started, redeliver plainly; attempting
-= crashed mid-await, platform MAY have it, redeliver WITH a visible recovered marker; failed =
-rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
-and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
-best-effort: ledger failures must never block a send; callers wrap every call in try/except.
+"""Durable delivery-obligation ledger for gateway final responses.
+
+``pending`` is known-unsent, ``attempting`` is ACK-ambiguous after a crash,
+``failed`` is a platform rejection, and only ``delivered`` is retention-prunable.
+Exhausted obligations become ``manual_review`` and are retained: unresolved
+user output must never disappear merely because a timer or row cap elapsed.
+Generic gateway callers remain best-effort; correctness-sensitive producers
+such as the Codex bridge pre-stage their row transactionally and fail closed.
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing, contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -30,7 +29,6 @@ _DB_LOCK = threading.Lock()
 # Redelivery policy knobs (deliberately not config — the ledger is gated by
 # ``gateway.delivery_ledger`` and these only matter in the rare recovery path).
 MAX_ATTEMPTS = 3
-STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
@@ -138,12 +136,14 @@ def _runtime_retryable(last_error: Any) -> bool:
     return text in _RUNTIME_RETRYABLE_ERRORS or is_flood_error(text)
 
 
-def _db_path():
-    return get_hermes_home() / "state.db"
+def _db_path(path: Optional[Path | str] = None) -> Path:
+    return Path(path) if path is not None else get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(db_path: Optional[Path | str] = None) -> sqlite3.Connection:
+    # Preserve the zero-argument seam used by existing embedders/tests while
+    # allowing correctness-sensitive producers to select an exact profile DB.
+    path = _db_path() if db_path is None else Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -154,7 +154,8 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
+def initialize_delivery_schema(conn: sqlite3.Connection) -> None:
+    """Create/migrate the shared outbox schema on an existing transaction."""
     from hermes_state_wal import apply_wal_with_fallback
     apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
     conn.execute(
@@ -172,20 +173,47 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            logical_key TEXT,
+            output_kind TEXT NOT NULL DEFAULT 'final',
+            delivery_sequence INTEGER NOT NULL DEFAULT 0
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    additions = {
+        "adapter_profile": "TEXT",
+        "logical_key": "TEXT",
+        "output_kind": "TEXT NOT NULL DEFAULT 'final'",
+        "delivery_sequence": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name in columns:
+            continue
         try:
-            conn.execute("ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT")
+            conn.execute(f"ALTER TABLE delivery_obligations ADD COLUMN {name} {declaration}")
         except sqlite3.OperationalError as exc:
-            # Concurrent first-use connections can both observe the old schema.
             if "duplicate column" not in str(exc).lower():
                 raise
+    # One logical input may legitimately emit an interruption notice and,
+    # after a bound successor, one final answer. Path duplicates converge on
+    # the same kind while those two semantic outputs remain distinct.
+    # Multiple gateway processes can perform first-use migration together.
+    # Make the obsolete-index removal itself idempotent instead of using a
+    # check-then-drop race across SQLite connections.
+    conn.execute("DROP INDEX IF EXISTS idx_delivery_obligations_logical")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_obligations_semantic
+           ON delivery_obligations(session_key, logical_key, output_kind)
+           WHERE logical_key IS NOT NULL"""
+    )
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    initialize_delivery_schema(conn)
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(db_path: Optional[Path | str] = None) -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, and ALWAYS close it: ``sqlite3.Connection`` as a
     context manager only commits/rolls back, so ``with _connect()`` alone leaks a connection (and its
     WAL/SHM fds) per call — ``record_obligation`` runs on every final response; exhausts RLIMIT_NOFILE.
@@ -194,7 +222,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     #69567 / PR #69594). ``record_obligation`` runs on every outbound final response, so this ledger is the
     highest-frequency leaker.
     """
-    conn = _connect()
+    conn = _connect(db_path)
     with closing(conn), conn:
         yield conn
 
@@ -251,57 +279,109 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
-def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+def compute_semantic_obligation_id(session_key: str, logical_key: str, output_kind: str) -> str:
+    """Path-independent identity for one logical output."""
+    raw = f"semantic\0{session_key}\0{logical_key}\0{output_kind}"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def stage_obligation_in_transaction(
+    conn: sqlite3.Connection, *, obligation_id: str, session_key: str, platform: str,
+    chat_id: str, thread_id: Optional[str], content: str,
+    adapter_profile: Optional[str] = None, logical_key: Optional[str] = None,
+    output_kind: str = "final", delivery_sequence: int = 0,
+) -> bool:
+    """Insert one immutable send intent using the caller's SQLite transaction."""
     now, (pid, started) = time.time(), _owner_stamp()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
-               (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
-    _prune()
+    cursor = conn.execute(
+        """INSERT OR IGNORE INTO delivery_obligations
+           (obligation_id, session_key, platform, chat_id, thread_id,
+            content, state, attempts, created_at, updated_at,
+            owner_pid, owner_started_at, adapter_profile, logical_key,
+            output_kind, delivery_sequence)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            obligation_id, session_key, platform, str(chat_id),
+            str(thread_id) if thread_id else None, content, now, now, pid, started,
+            str(adapter_profile).strip() if adapter_profile else "default",
+            str(logical_key) if logical_key else None, str(output_kind or "final"),
+            max(0, int(delivery_sequence)),
+        ),
+    )
+    row = conn.execute(
+        """SELECT session_key, platform, chat_id, thread_id, content,
+                  COALESCE(logical_key, ''), output_kind, delivery_sequence
+           FROM delivery_obligations WHERE obligation_id=?""",
+        (obligation_id,),
+    ).fetchone()
+    expected = (
+        session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+        content, str(logical_key or ""), str(output_kind or "final"),
+        max(0, int(delivery_sequence)),
+    )
+    if row is None or tuple(row) != expected:
+        raise RuntimeError("delivery obligation identity collision")
+    return bool(cursor.rowcount)
+
+
+def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      logical_key: Optional[str] = None, output_kind: str = "final",
+                      delivery_sequence: int = 0,
+                      db_path: Optional[Path | str] = None) -> None:
+    """Record a final response as owed to the platform (state='pending')."""
+    with _DB_LOCK, _transaction(db_path) as conn:
+        stage_obligation_in_transaction(
+            conn, obligation_id=obligation_id, session_key=session_key,
+            platform=platform, chat_id=chat_id, thread_id=thread_id, content=content,
+            adapter_profile=adapter_profile, logical_key=logical_key,
+            output_kind=output_kind, delivery_sequence=delivery_sequence,
+        )
+    _prune(db_path=db_path)
 
 
 def ensure_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str,
-                      adapter_profile: Optional[str] = None) -> bool:
+                      adapter_profile: Optional[str] = None,
+                      logical_key: Optional[str] = None, output_kind: str = "final",
+                      delivery_sequence: int = 0,
+                      db_path: Optional[Path | str] = None) -> bool:
     """Create an obligation only when its stable id has no existing state.
 
     Recovery paths use this instead of ``record_obligation`` so observing an
     already-delivered or concurrently-attempting row can never reset it to
     pending and duplicate a reply. Returns whether this call inserted it.
     """
-    now, (pid, started) = time.time(), _owner_stamp()
-    with _DB_LOCK, _transaction() as conn:
-        cursor = conn.execute(
-            """INSERT OR IGNORE INTO delivery_obligations
-               (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id),
-             str(thread_id) if thread_id else None, content, now, now, pid, started,
-             str(adapter_profile).strip() if adapter_profile else "default"),
+    with _DB_LOCK, _transaction(db_path) as conn:
+        inserted = stage_obligation_in_transaction(
+            conn, obligation_id=obligation_id, session_key=session_key,
+            platform=platform, chat_id=chat_id, thread_id=thread_id, content=content,
+            adapter_profile=adapter_profile, logical_key=logical_key,
+            output_kind=output_kind, delivery_sequence=delivery_sequence,
         )
-    _prune()
-    return bool(cursor.rowcount)
+    _prune(db_path=db_path)
+    return inserted
 
 
-def mark_attempting(obligation_id: str) -> None:
-    _update_state(obligation_id, "attempting")
+def mark_attempting(obligation_id: str, *, db_path: Optional[Path | str] = None) -> bool:
+    return _update_state(
+        obligation_id, "attempting", from_states=("pending", "failed"), db_path=db_path,
+    )
 
 
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+def mark_delivered(obligation_id: str, *, db_path: Optional[Path | str] = None) -> bool:
+    return _update_state(
+        obligation_id, "delivered", from_states=("pending", "attempting"), db_path=db_path,
+    )
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+def mark_failed(
+    obligation_id: str, error: str = "", *, db_path: Optional[Path | str] = None,
+) -> bool:
+    return _update_state(
+        obligation_id, "failed", error=error, from_states=("pending", "attempting", "failed"),
+        db_path=db_path,
+    )
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -325,13 +405,28 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     return bool(cursor.rowcount)
 
 
-def _update_state(obligation_id: str, state: str, error: str = "") -> None:
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+def _update_state(
+    obligation_id: str, state: str, error: str = "", *, from_states: tuple[str, ...] = (),
+    db_path: Optional[Path | str] = None,
+) -> bool:
+    with _DB_LOCK, _transaction(db_path) as conn:
+        where = " AND state IN ({})".format(",".join("?" for _ in from_states)) if from_states else ""
+        cursor = conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id))
+               WHERE obligation_id=?""" + where,
+            (state, time.time(), error[:500] if error else None, obligation_id, *from_states))
+    return bool(cursor.rowcount)
+
+
+def obligation_state(
+    obligation_id: str, *, db_path: Optional[Path | str] = None,
+) -> Optional[str]:
+    with _DB_LOCK, _transaction(db_path) as conn:
+        row = conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (obligation_id,),
+        ).fetchone()
+    return str(row[0]) if row else None
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
@@ -356,10 +451,10 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
 
     Claiming atomically re-stamps the owner to THIS process and increments ``attempts`` (the UPDATE is
     guarded on the previous owner stamp, so a second gateway racing the same sweep cannot double-claim).
-    Rows over the attempts cap or stale cutoff become 'abandoned'. ``deliverable_platforms`` restricts
+    Rows over the attempts cap become retained ``manual_review`` records. ``deliverable_platforms`` restricts
     claiming to platforms the caller can send on this boot: ``attempts`` is the redelivery budget and
     must only be spent on a real send, else a platform that failed to connect burns one attempt per boot
-    and hits the cap having never been sent once (the stale cutoff still bounds untouched rows).
+    and hits the cap having never been sent once.
     ``deliverable_targets`` further scopes multiplexed gateways by exact ``(platform, adapter_profile)``
     so one connected bot cannot spend another disconnected bot's retry budget.
 
@@ -383,10 +478,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if attempts >= MAX_ATTEMPTS:
                 conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
+                       SET state='manual_review', updated_at=?,
+                           last_error=COALESCE(last_error, 'delivery attempts exhausted')
+                       WHERE obligation_id=?""", (now, oid))
                 continue
             if ((deliverable_platforms is not None and platform not in deliverable_platforms)
                     or (deliverable_targets is not None and (platform, adapter_profile) not in deliverable_targets)):
@@ -414,10 +511,9 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1, updated_at=?,
                        adapter_profile=COALESCE(adapter_profile, 'default'),
-                       state=CASE WHEN ? THEN 'attempting' ELSE state END,
-                       last_error=CASE WHEN ? THEN NULL ELSE last_error END
+                       state='attempting', last_error=NULL
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, oid, owner_pid, owner_pid))
+                (pid, started, now, oid, owner_pid, owner_pid))
             if cursor.rowcount:
                 # pending = never started, redeliver plainly; anything else (crashed mid-await, other
                 # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries
@@ -437,7 +533,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     startup/dead-owner sweep. Startup recovery ignores rows owned by a live gateway, so a response
     rejected with ``send_path_degraded`` would stay stranded when only the adapter reconnects; this closes
     that gap without weakening ownership: only rows stamped to this exact process instance, only
-    allowlisted transient errors, same attempts/staleness bounds, every update guarded by the prior owner
+    allowlisted transient errors, the same attempts bound, every update guarded by the prior owner
     stamp and ``failed`` state. Claimed rows always carry a marker (the failed send's ack is not safe to
     infer): the reconnect one, or the rate-limit one for a flood-refused row."""
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
@@ -459,10 +555,11 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                     or not _runtime_retryable(last_error)):
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if attempts >= MAX_ATTEMPTS:
                 conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=?
+                       SET state='manual_review', updated_at=?,
+                           last_error=COALESCE(last_error, 'delivery attempts exhausted')
                        WHERE obligation_id=? AND state='failed'
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
@@ -489,7 +586,7 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
     """This process's flood-refused rows that still await redelivery, one entry per adapter identity
     with the earliest deadline (``not_before``). The runner arms one redelivery timer per entry, so a
     row adopted at boot, skipped because its wait had not passed, or refused again is never stranded.
-    Rows past the attempts cap or stale cutoff are left for the sweeps to abandon."""
+    Rows past the attempts cap are retained by the sweeps for manual review."""
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
     if started is None:
         return []
@@ -500,7 +597,7 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
                WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
     earliest: Dict[tuple, float] = {}
     for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
-        if not is_flood_error(last_error) or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+        if not is_flood_error(last_error) or attempts >= MAX_ATTEMPTS:
             continue
         due = flood_not_before(updated_at, last_error)
         key = (platform, adapter_profile or "default")
@@ -510,10 +607,12 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
             for (platform, profile), due in sorted(earliest.items())]
 
 
-def _prune(now: Optional[float] = None) -> None:
+def _prune(
+    now: Optional[float] = None, *, db_path: Optional[Path | str] = None,
+) -> None:
     now = now if now is not None else time.time()
     try:
-        with _transaction() as conn:
+        with _transaction(db_path) as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
                    WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
@@ -522,11 +621,8 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered', 'abandoned')
+                         ORDER BY updated_at ASC
                          LIMIT ?)""", (total - _MAX_ROWS,))
     except Exception:
         logger.debug("delivery ledger prune failed", exc_info=True)

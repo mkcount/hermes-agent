@@ -4,7 +4,7 @@ obligations around the final send (gateway/platforms/base.py).
 Contract: obligation recorded (pending→attempting) BEFORE the send await,
 delivered/failed by SendResult afterward; slash commands, ephemeral
 replies, and empty responses are never recorded; ledger failures never
-block the send.
+block generic sends. Pre-staged correctness-sensitive outputs fail closed.
 """
 
 import asyncio
@@ -211,3 +211,57 @@ class TestProducerHook:
         claimed = dl.sweep_recoverable()
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is True
+
+    @pytest.mark.asyncio
+    async def test_required_pre_staged_output_never_falls_through_to_a_bare_send(self):
+        adapter = _Adapter()
+        event = _event()
+        event.metadata.update({
+            "_delivery_obligation_id": "required-output",
+            "_delivery_logical_key": "codex-input:1",
+            "_delivery_output_kind": "final_answer",
+            "_delivery_sequence": 1,
+        })
+        with patch(
+            "gateway.delivery_ledger.record_obligation",
+            side_effect=OSError("state.db unavailable"),
+        ):
+            with pytest.raises(OSError, match="state.db unavailable"):
+                await adapter.send_final_ledgered(
+                    event, "lane", "final answer", {}, reply_to=None,
+                )
+
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_required_output_uses_its_profile_database_for_ack(self, tmp_path):
+        adapter = _Adapter()
+        event = _event()
+        profile_db = tmp_path / "profile" / "state.db"
+        dl.record_obligation(
+            obligation_id="profile-output",
+            session_key="lane",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="final answer",
+            logical_key="codex-input:profile-1",
+            output_kind="final_answer",
+            delivery_sequence=1,
+            db_path=profile_db,
+        )
+        event.metadata.update({
+            "_delivery_obligation_id": "profile-output",
+            "_delivery_logical_key": "codex-input:profile-1",
+            "_delivery_output_kind": "final_answer",
+            "_delivery_sequence": 1,
+            "_delivery_ledger_db_path": str(profile_db),
+        })
+
+        await adapter.send_final_ledgered(
+            event, "lane", "final answer", {}, reply_to=None,
+        )
+
+        assert adapter.sent == ["final answer"]
+        assert dl.obligation_state("profile-output", db_path=profile_db) == "delivered"
+        assert dl.obligation_state("profile-output") is None

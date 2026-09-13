@@ -549,10 +549,21 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             response_previewed = bool(agent._interim_text_was_delivered(turn.final_text))
         except Exception:
             logger.debug("codex app-server final preview comparison failed", exc_info=True)
+    # Older transport doubles used by plugins/tests predate explicit status
+    # fields. Real TurnResult instances always carry them; retain compatibility
+    # without weakening the production completion contract.
+    turn_status = str(getattr(
+        turn, "turn_status",
+        "interrupted" if turn.interrupted else "failed" if turn.error else "completed",
+    ) or "unknown")
+    turn_status_confirmed = bool(getattr(turn, "turn_status_confirmed", True))
+    completed = turn_status_confirmed and turn_status == "completed" and not turn.interrupted and turn.error is None
     return _turn_result(
-        interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
+        interrupt, messages, api_calls=1, completed=completed, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
+        codex_turn_status=turn_status,
+        codex_turn_status_confirmed=turn_status_confirmed,
         response_previewed=response_previewed,
         codex_submission_started=turn.submitted_user_text is not None,
         codex_should_retire=bool(turn.should_retire),

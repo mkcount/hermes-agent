@@ -45,6 +45,9 @@ class TurnResult:
     """Result of one user→assistant→tool turn through the codex app-server."""
 
     final_text: str = ""
+    # A phase-less legacy agentMessage is not final until the exact physical
+    # turn is authoritatively observed as completed.
+    terminal_candidate: str = ""
     projected_messages: list[dict] = field(default_factory=list)
     tool_iterations: int = 0
     interrupted: bool = False
@@ -58,6 +61,8 @@ class TurnResult:
     compacted: bool = False
     # Codex likely wedged (turn timeout, watchdog, token refresh failure): caller respawns next turn.
     should_retire: bool = False
+    turn_status: str = "unknown"
+    turn_status_confirmed: bool = False
 
 
 # Some codex versions stream ``<turn_aborted>`` as raw agentMessage text when an
@@ -509,6 +514,8 @@ class CodexAppServerSession:
         if projection.is_tool_iteration:
             result.tool_iterations += 1
         aborted = False
+        if projection.terminal_candidate is not None:
+            result.terminal_candidate = projection.terminal_candidate
         if projection.final_text is not None:
             # Multiple agentMessage items per turn: the last one is canonical.
             result.final_text = projection.final_text
@@ -517,6 +524,66 @@ class CodexAppServerSession:
                 result.interrupted = True
                 result.error = result.error or "codex reported turn_aborted"
         return projection, aborted
+
+    @staticmethod
+    def _normalized_turn_status(turn_obj: Any) -> str:
+        if not isinstance(turn_obj, dict):
+            return ""
+        raw = turn_obj.get("status")
+        raw = raw.get("type") if isinstance(raw, dict) else raw
+        return str(raw or "").replace("_", "").strip().lower()
+
+    def _apply_terminal_turn(self, result: TurnResult, turn_obj: Any) -> bool:
+        """Apply an authoritative stored/event turn terminal status."""
+        status = self._normalized_turn_status(turn_obj)
+        canonical = {
+            "completed": "completed", "interrupted": "interrupted",
+            "failed": "failed", "cancelled": "interrupted",
+        }.get(status)
+        if canonical is None:
+            return False
+        result.turn_status = canonical
+        result.turn_status_confirmed = True
+        if canonical == "completed":
+            if not result.final_text and result.terminal_candidate:
+                result.final_text = result.terminal_candidate
+            return True
+        # Text emitted before a failed/interrupted boundary is never the
+        # logical final answer.  The caller may produce a terminal notice.
+        result.final_text = ""
+        if canonical == "interrupted":
+            result.interrupted = True
+            if not self._interrupt_event.is_set():
+                result.error = result.error or "Codex 작업이 외부 요인으로 중단되어 완료되지 않았습니다."
+        else:
+            error = turn_obj.get("error") if isinstance(turn_obj, dict) else None
+            message = _format_responses_error(error, canonical) if error else "Codex turn failed"
+            self._set_classified_error(result, f"turn ended status={canonical}", message, message)
+        return True
+
+    def _reconcile_turn_at_deadline(self, result: TurnResult) -> bool:
+        """Read the exact stored turn before classifying a missing terminal event."""
+        if self._client is None or not self._thread_id or not result.turn_id:
+            return False
+        try:
+            response = self._client.request(
+                "thread/read", {"threadId": self._thread_id, "includeTurns": True}, timeout=10,
+            )
+        except (CodexAppServerError, TimeoutError, RuntimeError, OSError):
+            logger.warning(
+                "codex app-server deadline reconciliation failed for thread=%s turn=%s",
+                self._thread_id, result.turn_id, exc_info=True,
+            )
+            return False
+        thread = response.get("thread") or response
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+        if not isinstance(turns, list):
+            return False
+        turn = next(
+            (item for item in turns if isinstance(item, dict) and str(item.get("id") or "") == str(result.turn_id)),
+            None,
+        )
+        return self._apply_terminal_turn(result, turn)
 
     def _turn_start_params(self, user_text: str, client_message_id: str) -> dict[str, Any]:
         """Build the stable per-turn app-server policy and idempotency payload."""
@@ -686,20 +753,14 @@ class CodexAppServerSession:
             if method != "turn/completed":
                 return aborted
             turn_obj = (note.get("params") or {}).get("turn") or {}
-            turn_status = turn_obj.get("status")
-            if turn_status == "interrupted":
-                result.interrupted = True
-                if not self._interrupt_event.is_set():
-                    result.error = result.error or "Codex 작업이 외부 요인으로 중단되어 완료되지 않았습니다."
-            elif turn_status and turn_status != "completed" and turn_obj.get("error"):
-                err_msg = _format_responses_error(turn_obj["error"], str(turn_status))
-                self._set_classified_error(result, f"turn ended status={turn_status}", err_msg, err_msg)
+            if not self._apply_terminal_turn(result, turn_obj):
+                result.error = result.error or "Codex turn/completed event had no supported terminal status"
             return True
 
         self._drive_turn(
             result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
             timeout_label="turn", on_server_request=on_server_request,
-            on_note=on_note, accept_final_text_at_deadline=True,
+            on_note=on_note, reconcile_turn_at_deadline=True,
         )
         with self._active_turn_lock:
             self._active_turn_id = None
@@ -709,7 +770,7 @@ class CodexAppServerSession:
         timeout_label: str, on_server_request: Callable[[dict], bool],
         on_note: Callable[[dict, str], bool],
         pre_scope_filter: Optional[Callable[[dict, str], bool]] = None,
-        accept_final_text_at_deadline: bool = False,
+        reconcile_turn_at_deadline: bool = False,
     ) -> None:
         """Shared poll loop for run_turn / compact_thread until turn/completed or deadline.
 
@@ -748,12 +809,8 @@ class CodexAppServerSession:
             deadline = time.monotonic() + turn_timeout
             turn_complete = on_note(note, method)
 
-        if accept_final_text_at_deadline and not turn_complete and not result.interrupted and result.final_text and result.error is None:
-            logger.warning(
-                "codex app-server turn reached deadline after a completed assistant message but before "
-                "turn/completed; accepting the assistant text as the terminal response"
-            )
-            turn_complete = True
+        if reconcile_turn_at_deadline and not turn_complete and not result.interrupted:
+            turn_complete = self._reconcile_turn_at_deadline(result)
 
         if not turn_complete and not result.interrupted:
             self._issue_interrupt(result.turn_id)
@@ -805,13 +862,8 @@ class CodexAppServerSession:
             result.turn_id = turn_obj.get("id") or result.turn_id
             if method == "turn/started":
                 return aborted
-            turn_status = turn_obj.get("status")
-            if turn_status == "interrupted":
-                result.interrupted = True
-                result.error = result.error or "compact turn interrupted"
-            elif turn_status and turn_status != "completed":
-                err_msg = _format_responses_error(turn_obj.get("error"), str(turn_status))
-                self._set_classified_error(result, f"compact turn ended status={turn_status}", err_msg, err_msg)
+            if not self._apply_terminal_turn(result, turn_obj):
+                result.error = result.error or "Codex compact turn had no supported terminal status"
             return True
 
         def on_server_request(sreq: dict) -> bool:

@@ -36,7 +36,12 @@ class ProjectionResult:
 
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
-    final_text: Optional[str] = None  # Set when an agentMessage completes
+    # Only an explicit final_answer item is authoritative before the enclosing
+    # turn completes.  Phase-less messages are retained as legacy candidates
+    # and may be promoted only after a confirmed turn/completed status.
+    final_text: Optional[str] = None
+    terminal_candidate: Optional[str] = None
+    message_phase: Optional[str] = None
 
 
 class CodexEventProjector:
@@ -75,7 +80,13 @@ class CodexEventProjector:
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""
-        return ProjectionResult(messages=[self._assistant_message(text)], final_text=text)
+        phase = str(item.get("phase") or "").strip().lower() or None
+        return ProjectionResult(
+            messages=[self._assistant_message(text)],
+            final_text=text if phase in {"final", "final_answer"} else None,
+            terminal_candidate=text if phase is None else None,
+            message_phase=phase,
+        )
 
     @staticmethod
     def _project_user_message(item: dict) -> ProjectionResult:

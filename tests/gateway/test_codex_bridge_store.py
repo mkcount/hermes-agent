@@ -2,6 +2,8 @@
 
 import sqlite3
 
+import pytest
+
 from gateway.codex_bridge.store import CodexBridgeStore
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
@@ -66,7 +68,14 @@ def test_input_lifecycle_and_restart_recovery(tmp_path, monkeypatch):
     assert [(row.input_id, row.final_text) for row in recovered] == [(input_id, "finished")]
     assert (recovered[0].delivery_owner, recovered[0].turn_outcome) == ("ledger", "completed")
 
-    store.mark_completed(input_id)
+    obligation_id = recovered[0].delivery_obligation_id
+    assert obligation_id
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET state='delivered' WHERE obligation_id=?",
+            (obligation_id,),
+        )
+    assert store.mark_completed(input_id)
     assert store.input_state(input_id) == "completed"
     with sqlite3.connect(store.path) as conn:
         assert conn.execute(
@@ -135,3 +144,90 @@ def test_queue_capacity_rejection_can_cancel_routed_input(tmp_path):
     input_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source))
     store.cancel_input(input_id, "busy queue at capacity")
     assert store.input_state(input_id) == "cancelled"
+
+
+def test_terminal_output_and_send_intent_commit_atomically_and_stay_immutable(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    input_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source))
+    assert store.mark_executing(input_id)
+
+    obligation_id = store.stage_terminal_output(
+        input_id, "the final answer", physical_turn_status="completed",
+        output_kind="final_answer",
+    )
+
+    assert obligation_id
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT state, content FROM delivery_obligations WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone() == ("pending", "the final answer")
+    assert store.mark_completed(input_id) is False
+    with pytest.raises(RuntimeError, match="identity collision"):
+        store.stage_terminal_output(
+            input_id, "a conflicting late answer", physical_turn_status="completed",
+            output_kind="final_answer", recovery=True,
+        )
+
+
+def test_failed_work_and_completed_delivery_are_independent_dimensions(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    input_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source))
+    assert store.mark_executing(input_id)
+    obligation_id = store.stage_terminal_output(
+        input_id, "the turn failed", physical_turn_status="failed",
+        output_kind="terminal_notice",
+    )
+    assert obligation_id
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET state='delivered' WHERE obligation_id=?",
+            (obligation_id,),
+        )
+    assert store.mark_completed(input_id)
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            """SELECT state, physical_turn_status, logical_input_status,
+                      output_kind, delivery_status
+               FROM codex_bridge_inputs WHERE input_id=?""",
+            (input_id,),
+        ).fetchone() == (
+            "completed", "failed", "failed", "terminal_notice", "delivered",
+        )
+
+
+def test_finalized_progress_is_not_reopened_by_late_commentary(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    first = store.upsert_progress(binding, "logical-1", ["working"])
+    assert store.mark_progress_delivered(first, "message-1")
+    store.complete_progress(binding, "logical-1")
+
+    late = store.upsert_progress(binding, "logical-1", ["late commentary"])
+
+    assert late.state == "finalized"
+    assert "late commentary" not in late.content
+
+
+def test_prune_never_removes_uncertain_or_continuation_work(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    uncertain_id, _, _ = store.enqueue_input(
+        binding, "lane-a", _event(binding.source, "uncertain"),
+    )
+    assert store.mark_executing(uncertain_id)
+    assert store.mark_submitting(uncertain_id)
+    assert store.mark_uncertain(uncertain_id)
+    continuation_id, _, _ = store.enqueue_input(
+        binding, "lane-a", _event(binding.source, "continuation"),
+    )
+    assert store.mark_executing(continuation_id)
+    assert store.mark_continuation_pending(continuation_id)
+    monkeypatch.setattr("gateway.codex_bridge.store.time.time", lambda: 1_000_000_000_000.0)
+
+    store.prune(retention_seconds=1)
+
+    assert store.input_state(uncertain_id) == "uncertain"
+    assert store.input_state(continuation_id) == "continuation_pending"

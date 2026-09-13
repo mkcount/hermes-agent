@@ -3694,16 +3694,24 @@ class BasePlatformAdapter(ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
-        """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
-        next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
-        or None."""
+        """Ledger the final response before send.
+
+        Most replies keep the historical best-effort policy.  A producer that
+        transactionally pre-staged ``_delivery_obligation_id`` is fail-closed:
+        losing that durable bracket must never fall through to a bare send.
+        """
+        event_metadata = event.metadata or {}
+        required_id = str(event_metadata.get("_delivery_obligation_id") or "").strip()
+        required_db_path = str(event_metadata.get("_delivery_ledger_db_path") or "").strip() or None
         if is_ephemeral_response or str(event.text or "").lstrip().startswith(
             ("/", self.typed_command_prefix or "!")):
+            if required_id:
+                raise RuntimeError("a required durable output cannot use an ephemeral/command send path")
             return None
         try:
             from gateway.delivery_ledger import (
                 compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
-            if not await asyncio.to_thread(ledger_enabled):
+            if not required_id and not await asyncio.to_thread(ledger_enabled):
                 return None
             source = event.source
             # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
@@ -3711,17 +3719,27 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
-            obligation_id = compute_obligation_id(
+            obligation_id = required_id or compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                logical_key=event_metadata.get("_delivery_logical_key"),
+                output_kind=str(event_metadata.get("_delivery_output_kind") or "final"),
+                delivery_sequence=int(event_metadata.get("_delivery_sequence") or 0),
+                db_path=required_db_path)
+            claimed = await asyncio.to_thread(
+                mark_attempting, obligation_id, db_path=required_db_path,
+            )
+            if required_id and not claimed:
+                raise RuntimeError("required durable output is not pending for delivery")
             return obligation_id
         except Exception:
+            if required_id:
+                raise
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
@@ -3735,11 +3753,16 @@ class BasePlatformAdapter(ABC):
         of waiting for the next restart."""
         try:
             from gateway.delivery_ledger import is_flood_error, mark_delivered, mark_failed
+            ledger_db_path = str(
+                (event.metadata or {}).get("_delivery_ledger_db_path") or ""
+            ).strip() or None
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+                await asyncio.to_thread(mark_delivered, obligation_id, db_path=ledger_db_path)
                 return
             error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
+            await asyncio.to_thread(
+                mark_failed, obligation_id, error, db_path=ledger_db_path,
+            )
             if error == "send_path_degraded":
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)

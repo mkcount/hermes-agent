@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from gateway.codex_bridge.handoff import CodexHandoffGraph
+
 _THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _RUNTIME_PREFIXES = (
     "<recommended_plugins>", "# agents.md instructions", "<environment_context>",
@@ -168,6 +170,7 @@ class RolloutTail:
     def __init__(
         self, thread_id: str, path: Path, *, device: Optional[int] = None,
         inode: Optional[int] = None, offset: int = 0,
+        handoff_graph: Optional[CodexHandoffGraph] = None,
     ) -> None:
         self.thread_id, self.path = str(thread_id), Path(path)
         self.device, self.inode, self.offset = device, inode, max(0, int(offset))
@@ -176,10 +179,14 @@ class RolloutTail:
         self.turns: dict[str, dict[str, Any]] = {}
         self.latest_final_text = ""
         self._continuation_seed: Optional[_ContinuationSeed] = None
+        self._handoff_graph = handoff_graph or CodexHandoffGraph({}, {})
         self._bad_line: Optional[tuple[int, str]] = None
         self._bad_line_attempts = 0
         if self.offset:
             self._prime(self.offset)
+
+    def set_handoff_graph(self, graph: CodexHandoffGraph) -> None:
+        self._handoff_graph = graph
 
     def _reset_for_replacement(self, stat: os.stat_result) -> None:
         self.device, self.inode = stat.st_dev, stat.st_ino
@@ -261,12 +268,34 @@ class RolloutTail:
                     continue
                 self._bad_line = None
                 self._bad_line_attempts = 0
+                if self._defer_for_unbound_successor(record):
+                    # prepare/reconciling is an ownership claim, not proof of
+                    # which physical turn is the successor. Keep the cursor at
+                    # this task boundary until ReloginTool commits the edge.
+                    next_offset = line_start
+                    break
                 next_offset = handle.tell()
                 self._consume(record, line_start, next_offset, events)
                 if next_offset - self.offset >= _SCAN_BYTES:
                     break
         self._expire_continuation(events, time.time())
         return events, next_offset, stat
+
+    def _defer_for_unbound_successor(self, record: object) -> bool:
+        if self._continuation_seed is None or not isinstance(record, dict):
+            return False
+        payload = record.get("payload")
+        if (
+            record.get("type") != "event_msg"
+            or not isinstance(payload, dict)
+            or payload.get("type") != "task_started"
+        ):
+            return False
+        predecessor = self._continuation_seed.turn_id
+        return (
+            self._handoff_graph.is_pending(predecessor)
+            and not self._handoff_graph.successor_for(predecessor)
+        )
 
     def _event(
         self, turn_id: str, kind: str, text: str, offset: int, client_id: Optional[str] = None,
@@ -280,7 +309,7 @@ class RolloutTail:
     def _turn(self, turn_id: str) -> dict[str, Any]:
         return self.turns.setdefault(turn_id, {
             "user_seen": False, "user_text": "", "client_id": None, "final": "", "start": None,
-            "pending_commentary": [],
+            "pending_commentary": [], "formal_continuation": False,
         })
 
     def _expire_continuation(
@@ -288,6 +317,19 @@ class RolloutTail:
     ) -> None:
         seed_info = self._continuation_seed
         if seed_info is None or observed_at is None:
+            return
+        if self._handoff_graph.is_managed(seed_info.turn_id):
+            status = self._handoff_graph.status_for(seed_info.turn_id)
+            if self._handoff_graph.is_pending(seed_info.turn_id) or self._handoff_graph.successor_for(seed_info.turn_id):
+                return
+            self._continuation_seed = None
+            if status != "aborted":
+                return
+            if events is not None and seed_info.turn.get("user_seen"):
+                events.append(self._event(
+                    seed_info.turn_id, "error", "Codex 작업 재개가 취소되었습니다.",
+                    max(seed_info.offset, self.offset), seed_info.turn.get("client_id"),
+                ))
             return
         if observed_at - seed_info.aborted_at < _CONTINUATION_WINDOW_SECONDS:
             return
@@ -361,7 +403,10 @@ class RolloutTail:
             if role == "user":
                 text = _content(payload, "input_text")
                 if text and _is_user_authored(payload, text):
-                    turn.update(user_seen=True, user_text=text, client_id=_client_id(payload) or turn.get("client_id"))
+                    correlated = _client_id(payload)
+                    turn.update(user_seen=True, user_text=text)
+                    if not turn.get("formal_continuation"):
+                        turn["client_id"] = correlated or turn.get("client_id")
                     self._emit(events, turn_id, "user", text, offset)
             elif role == "assistant":
                 text = _content(payload, "output_text")
@@ -382,22 +427,32 @@ class RolloutTail:
                 if self._continuation_seed is not None:
                     seed = self._continuation_seed
                     started_at = self._record_time(record)
-                    if (
-                        seed.interrupted
-                        or (
-                            started_at is not None
-                            and 0 <= started_at - seed.aborted_at <= _CONTINUATION_WINDOW_SECONDS
-                        )
-                    ):
-                        inherited = seed.turn
+                    expected_successor = self._handoff_graph.successor_for(seed.turn_id)
+                    managed = self._handoff_graph.is_managed(seed.turn_id)
+                    if managed:
+                        if expected_successor == turn_id:
+                            inherited = seed.turn
                     else:
-                        self._expire_continuation(events, started_at or float("inf"))
-                self._continuation_seed = None
+                        if (
+                            seed.interrupted
+                            or (
+                                started_at is not None
+                                and 0 <= started_at - seed.aborted_at <= _CONTINUATION_WINDOW_SECONDS
+                            )
+                        ):
+                            inherited = seed.turn
+                        else:
+                            self._expire_continuation(events, started_at or float("inf"))
+                    # A formal but mismatched successor is another user turn;
+                    # retain the seed so a later exact edge can still bind.
+                    if inherited is not None or not managed:
+                        self._continuation_seed = None
                 self.turns[turn_id] = {
                     "user_seen": bool(inherited and inherited.get("user_seen")),
                     "user_text": str(inherited.get("user_text") or "") if inherited else "",
                     "client_id": inherited.get("client_id") if inherited else None,
                     "final": "", "start": line_start, "pending_commentary": [],
+                    "formal_continuation": bool(inherited and managed),
                 }
             return
         turn_id = str(payload.get("turn_id") or self.active_turn_id or "").strip()
@@ -407,13 +462,16 @@ class RolloutTail:
         if event_type == "item_completed":
             item = payload.get("item")
             if isinstance(item, dict) and str(item.get("type") or "").replace("_", "").lower() == "usermessage":
-                turn["client_id"] = _client_id(item) or turn.get("client_id")
+                if not turn.get("formal_continuation"):
+                    turn["client_id"] = _client_id(item) or turn.get("client_id")
                 if turn.get("client_id"):
                     self._flush_pending_commentary(events, turn_id, offset)
             return
         if event_type == "user_message":
             text = str(payload.get("message") or "").strip()
-            turn.update(user_seen=True, user_text=text, client_id=_client_id(payload) or turn.get("client_id"))
+            turn.update(user_seen=True, user_text=text)
+            if not turn.get("formal_continuation"):
+                turn["client_id"] = _client_id(payload) or turn.get("client_id")
             self._emit(events, turn_id, "user", text, offset)
         elif event_type == "agent_message":
             text = str(payload.get("message") or "").strip()
@@ -447,6 +505,35 @@ class RolloutTail:
             if self.active_turn_id == turn_id:
                 self.active_turn_id = self.active_start_offset = None
             self.turns.pop(turn_id, None)
+
+
+def find_terminal_for_client_id(
+    thread_id: str, client_id: str, *, hinted_path: Optional[str] = None,
+    codex_home: Optional[str] = None, handoff_graph: Optional[CodexHandoffGraph] = None,
+) -> Optional[RolloutEvent]:
+    """One-shot full-history recovery for cursors advanced by legacy code."""
+    cleaned_client = str(client_id or "").strip()
+    path = resolve_rollout_path(thread_id, hinted_path=hinted_path, codex_home=codex_home)
+    if not cleaned_client or path is None:
+        return None
+    tail = RolloutTail(thread_id, path, handoff_graph=handoff_graph)
+    terminal: Optional[RolloutEvent] = None
+    stalled = 0
+    while True:
+        events, next_offset, stat = tail.scan()
+        for event in events:
+            if event.client_id == cleaned_client and event.kind in {"final", "error"}:
+                terminal = event
+        if next_offset >= stat.st_size:
+            break
+        if next_offset <= tail.offset:
+            stalled += 1
+            if stalled >= 3:
+                break
+        else:
+            stalled = 0
+            tail.offset = next_offset
+    return terminal
 
 
 def inspect_rollout(

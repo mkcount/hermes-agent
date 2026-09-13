@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 import gateway.codex_bridge.rollout as rollout_mod
+from gateway.codex_bridge.handoff import CodexHandoffGraph
 from gateway.codex_bridge.rollout import RolloutTail, inspect_rollout, resolve_rollout_path
 
 
@@ -95,6 +96,77 @@ def test_explicit_aborted_turn_continues_provenance_without_new_user_item(tmp_pa
         ("commentary", "still working", "desktop-client"),
         ("final", "all done", "desktop-client"),
     ]
+
+
+def test_formal_handoff_defers_until_successor_edge_is_bound(tmp_path):
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    records = [
+        _meta(THREAD),
+        {"timestamp": "2026-09-10T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-one"}},
+        {"timestamp": "2026-09-10T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "turn-one", "message": "old work",
+                     "client_id": "input-1"}},
+        {"timestamp": "2026-09-10T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-one", "reason": "interrupted"}},
+        {"timestamp": "2026-09-10T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-two"}},
+        {"timestamp": "2026-09-10T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "turn-two",
+                     "message": "continue after switch", "client_id": "handoff-operation-id"}},
+        {"timestamp": "2026-09-10T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-two",
+                     "last_agent_message": "done"}},
+    ]
+    _write(path, records)
+    tail = RolloutTail(
+        THREAD, path,
+        handoff_graph=CodexHandoffGraph({}, {"turn-one": "reconciling"}),
+    )
+
+    first, blocked_offset, _ = tail.scan()
+
+    assert [(event.kind, event.text) for event in first] == [("user", "old work")]
+    assert blocked_offset < path.stat().st_size
+    tail.offset = blocked_offset
+    tail.set_handoff_graph(CodexHandoffGraph(
+        {"turn-one": "turn-two"}, {"turn-one": "successor_bound"},
+    ))
+    resumed, next_offset, _ = tail.scan()
+    assert [(event.kind, event.client_id) for event in resumed] == [
+        ("user", "input-1"),
+        ("final", "input-1"),
+    ]
+    assert next_offset == path.stat().st_size
+
+
+def test_formal_handoff_never_inherits_into_a_mismatched_turn(tmp_path):
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    records = [
+        _meta(THREAD),
+        {"timestamp": "2026-09-10T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-one"}},
+        {"timestamp": "2026-09-10T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "turn-one", "message": "old work",
+                     "client_id": "input-1"}},
+        {"timestamp": "2026-09-10T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-one", "reason": "interrupted"}},
+        {"timestamp": "2026-09-10T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "unrelated"}},
+        {"timestamp": "2026-09-10T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "unrelated",
+                     "last_agent_message": "must stay local"}},
+    ]
+    _write(path, records)
+
+    events, _, _ = RolloutTail(
+        THREAD, path,
+        handoff_graph=CodexHandoffGraph(
+            {"turn-one": "turn-two"}, {"turn-one": "successor_bound"},
+        ),
+    ).scan()
+
+    assert [(event.kind, event.text) for event in events] == [("user", "old work")]
 
 
 def test_persisted_interrupted_turn_resumes_after_long_idle_without_new_user_item(tmp_path):

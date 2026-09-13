@@ -1,12 +1,12 @@
 """Tests for the gateway delivery-obligation ledger (gateway/delivery_ledger.py).
 
-State machine, dead-owner claiming, attempts cap, stale cutoff, retention,
+State machine, dead-owner claiming, attempts cap, terminal retention,
 id stability, and the startup redelivery sweep's contract:
 - pending rows redeliver plainly (send never started, no dup risk)
 - attempting/failed rows carry the recovered-reply marker (honest
   at-least-once; ambiguity is labeled, never silently resent)
 - rows owned by a LIVE process are never claimed
-- poison rows abandon at the attempts cap / stale cutoff
+- unresolved poison rows remain visible for manual review
 """
 
 import os
@@ -288,7 +288,7 @@ class TestRuntimeFailedSweep:
         assert claimed[0]["profile"] == "reviewer"
         assert _row("ob-1")["state"] == "failed"
 
-    def test_current_owner_row_at_attempt_cap_is_abandoned(self):
+    def test_current_owner_row_at_attempt_cap_is_retained_for_manual_review(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
         with dl._connect() as conn:
@@ -298,7 +298,7 @@ class TestRuntimeFailedSweep:
             )
 
         assert dl.sweep_failed_for_runtime("telegram") == []
-        assert _row("ob-1")["state"] == "abandoned"
+        assert _row("ob-1")["state"] == "manual_review"
 
     def test_delivered_row_is_never_reclaimed_by_reconnect_sweep(self):
         """Idempotency: once delivered, a reconnect sweep must not re-send.
@@ -329,18 +329,19 @@ class TestRuntimeFailedSweep:
         assert row["state"] == "delivered"
         assert row["attempts"] == 1
 
-    def test_current_owner_stale_row_is_abandoned(self):
+    def test_current_owner_stale_row_is_not_abandoned(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
         now = time.time()
         with dl._connect() as conn:
             conn.execute(
                 "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
-                (now - dl.STALE_AFTER_SECONDS - 1, "ob-1"),
+                (now - 30 * 24 * 60 * 60, "ob-1"),
             )
 
-        assert dl.sweep_failed_for_runtime("telegram", now=now) == []
-        assert _row("ob-1")["state"] == "abandoned"
+        claimed = dl.sweep_failed_for_runtime("telegram", now=now)
+        assert len(claimed) == 1
+        assert _row("ob-1")["state"] == "attempting"
 
 
 class TestPrune:

@@ -255,6 +255,7 @@ async def test_rollout_incarnation_change_starts_with_a_file_local_cursor(tmp_pa
         "device": None,
         "inode": None,
         "offset": 0,
+        "handoff_graph": handoff_mod.CodexHandoffGraph({}, {}),
     }
 
 
@@ -496,7 +497,16 @@ async def test_completed_interruption_transfers_delivery_to_a_resumed_physical_t
     adapter.send.assert_not_awaited()
     assert store.recoverable_outputs() == []
 
-    store.mark_completed(input_id)
+    with sqlite3.connect(store.path) as conn:
+        obligation_id = conn.execute(
+            "SELECT delivery_obligation_id FROM codex_bridge_inputs WHERE input_id=?",
+            (input_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE delivery_obligations SET state='delivered' WHERE obligation_id=?",
+            (obligation_id,),
+        )
+    assert store.mark_completed(input_id)
     resumed = store.get_binding(binding.control_session_key)
     assert resumed is not None
     await bridge._codex_bridge_poll_binding_locked(store, resumed)

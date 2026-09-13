@@ -53,6 +53,13 @@ class DurableCodexInput:
     delivery_owner: str = "none"
     turn_outcome: str = "unknown"
     continuation_turn_id: Optional[str] = None
+    continuation_turn_ids: tuple[str, ...] = ()
+    physical_turn_status: str = "unknown"
+    logical_input_status: str = "open"
+    output_kind: str = "none"
+    delivery_status: str = "none"
+    delivery_obligation_id: Optional[str] = None
+    legacy_recovery_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,9 @@ class CodexBridgeStore:
 
     @staticmethod
     def _initialize(conn: sqlite3.Connection) -> None:
+        from gateway.delivery_ledger import initialize_delivery_schema
+
+        initialize_delivery_schema(conn)
         conn.execute(
             """CREATE TABLE IF NOT EXISTS codex_bridge_bindings (
                 control_session_key TEXT PRIMARY KEY,
@@ -130,6 +140,14 @@ class CodexBridgeStore:
                 delivery_owner TEXT NOT NULL DEFAULT 'none',
                 turn_outcome TEXT NOT NULL DEFAULT 'unknown',
                 continuation_turn_id TEXT,
+                continuation_turn_ids_json TEXT NOT NULL DEFAULT '[]',
+                physical_turn_status TEXT NOT NULL DEFAULT 'unknown',
+                logical_input_status TEXT NOT NULL DEFAULT 'open',
+                output_kind TEXT NOT NULL DEFAULT 'none',
+                delivery_status TEXT NOT NULL DEFAULT 'none',
+                delivery_obligation_id TEXT,
+                finalized_at REAL,
+                legacy_recovery_required INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
             )"""
         )
@@ -187,6 +205,57 @@ class CodexBridgeStore:
             )
         if "continuation_turn_id" not in input_columns:
             conn.execute("ALTER TABLE codex_bridge_inputs ADD COLUMN continuation_turn_id TEXT")
+        semantic_columns = {
+            "continuation_turn_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "physical_turn_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "logical_input_status": "TEXT NOT NULL DEFAULT 'open'",
+            "output_kind": "TEXT NOT NULL DEFAULT 'none'",
+            "delivery_status": "TEXT NOT NULL DEFAULT 'none'",
+            "delivery_obligation_id": "TEXT",
+            "finalized_at": "REAL",
+            "legacy_recovery_required": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, declaration in semantic_columns.items():
+            if name not in input_columns:
+                conn.execute(f"ALTER TABLE codex_bridge_inputs ADD COLUMN {name} {declaration}")
+                if name == "legacy_recovery_required":
+                    conn.execute(
+                        """UPDATE codex_bridge_inputs SET legacy_recovery_required=1
+                           WHERE state='continuation_pending'"""
+                    )
+        # Translate legacy overloaded states once.  These columns are the
+        # durable contract going forward; ``state`` remains the scheduler's
+        # compact index and is no longer asked to encode every dimension.
+        conn.execute(
+            """UPDATE codex_bridge_inputs SET
+                   physical_turn_status=CASE
+                       WHEN physical_turn_status='unknown' AND turn_outcome IN
+                            ('running','completed','interrupted','failed','cancelled')
+                           THEN turn_outcome ELSE physical_turn_status END,
+                   logical_input_status=CASE
+                       WHEN logical_input_status!='open' THEN logical_input_status
+                       WHEN state='continuation_pending' THEN 'awaiting_successor'
+                       WHEN state='uncertain' THEN 'reconciling'
+                       WHEN state='cancelled' THEN 'cancelled'
+                       WHEN state='completed' AND turn_outcome='completed' THEN 'completed'
+                       WHEN state='completed' THEN 'failed'
+                       WHEN state IN ('executed','recovery_output') THEN
+                           CASE WHEN turn_outcome='completed' THEN 'completed' ELSE 'failed' END
+                       ELSE 'open' END,
+                   output_kind=CASE
+                       WHEN output_kind!='none' THEN output_kind
+                       WHEN final_text IS NULL THEN 'none'
+                       WHEN turn_outcome='completed' THEN 'final_answer'
+                       ELSE 'terminal_notice' END,
+                   delivery_status=CASE
+                       WHEN delivery_status!='none' THEN delivery_status
+                       WHEN state='completed' THEN 'delivered'
+                       WHEN state IN ('executed','recovery_output') THEN 'pending'
+                       ELSE 'none' END,
+                   finalized_at=CASE
+                       WHEN finalized_at IS NULL AND state='completed' THEN updated_at
+                       ELSE finalized_at END"""
+        )
         progress_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(codex_bridge_progress)")
         }
@@ -318,6 +387,16 @@ class CodexBridgeStore:
                    WHERE control_session_key=? AND generation=? AND logical_turn_id=?""",
                 (binding.control_session_key, binding.generation, identity),
             ).fetchone()
+            if previous is not None and str(previous[2]) == "finalized":
+                row = conn.execute(
+                    """SELECT control_session_key, generation, logical_turn_id, segments_json,
+                              content, message_id, state, last_error, attempt_count,
+                              next_attempt_at, updated_at
+                       FROM codex_bridge_progress
+                       WHERE control_session_key=? AND generation=? AND logical_turn_id=?""",
+                    (binding.control_session_key, binding.generation, identity),
+                ).fetchone()
+                return self._progress_from_row(row)
             try:
                 accumulated = list(json.loads(previous[0])) if previous is not None else []
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -452,13 +531,18 @@ class CodexBridgeStore:
             )
 
     def complete_progress(self, binding: CodexBridgeBinding, logical_turn_id: str) -> None:
-        """Forget a delivered preview after its final; failed previews remain retryable."""
+        """Freeze a preview once a terminal output intent exists.
+
+        Keeping a compact tombstone prevents late JSONL commentary from
+        recreating or editing the progress message after the final answer.
+        """
         with self._lock, self._transaction() as conn:
             conn.execute(
-                """DELETE FROM codex_bridge_progress
+                """UPDATE codex_bridge_progress
+                   SET state='finalized', next_attempt_at=0, updated_at=?
                    WHERE control_session_key=? AND generation=? AND logical_turn_id=?
-                     AND state='delivered'""",
-                (binding.control_session_key, binding.generation, logical_turn_id),
+                     AND state!='finalized'""",
+                (time.time(), binding.control_session_key, binding.generation, logical_turn_id),
             )
 
     def bind(
@@ -661,8 +745,11 @@ class CodexBridgeStore:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO codex_bridge_inputs
                        (input_id, control_session_key, lane_session_key, thread_id, generation,
-                        event_json, state, delivery_owner, turn_outcome, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'routed', 'runner', 'pending', ?, ?)""",
+                        event_json, state, delivery_owner, turn_outcome,
+                        physical_turn_status, logical_input_status, output_kind,
+                        delivery_status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'routed', 'runner', 'pending',
+                           'pending', 'open', 'none', 'none', ?, ?)""",
                 (input_id, binding.control_session_key, lane_session_key, binding.thread_id,
                  binding.generation, self._event_to_json(event), now, now),
             )
@@ -680,6 +767,8 @@ class CodexBridgeStore:
                 """UPDATE codex_bridge_inputs
                    SET state='executing', owner_pid=?, owner_started_at=?,
                        delivery_owner='runner', turn_outcome='pending',
+                       physical_turn_status='pending', logical_input_status='running',
+                       output_kind='none', delivery_status='none', finalized_at=NULL,
                        updated_at=?, last_error=NULL
                    WHERE input_id=? AND state IN ('routed','pending')""",
                 (owner_pid, owner_started_at, time.time(), input_id),
@@ -690,7 +779,8 @@ class CodexBridgeStore:
         """Fence the request immediately before ``turn/start`` is written."""
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
-                """UPDATE codex_bridge_inputs SET state='submitting', updated_at=?
+                """UPDATE codex_bridge_inputs
+                   SET state='submitting', physical_turn_status='submitting', updated_at=?
                    WHERE input_id=? AND state='executing'""",
                 (time.time(), input_id),
             )
@@ -705,7 +795,9 @@ class CodexBridgeStore:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
                    SET state='running', codex_turn_id=?, continuation_turn_id=NULL,
-                       delivery_owner='runner', turn_outcome='running', updated_at=?
+                       continuation_turn_ids_json='[]', delivery_owner='runner',
+                       turn_outcome='running', physical_turn_status='running',
+                       logical_input_status='running', updated_at=?
                    WHERE input_id=? AND state IN ('submitting','executing')""",
                 (cleaned, time.time(), input_id),
             )
@@ -717,6 +809,8 @@ class CodexBridgeStore:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
                    SET state='uncertain', delivery_owner='rollout', turn_outcome='unknown',
+                       physical_turn_status='unknown', logical_input_status='reconciling',
+                       delivery_status='none', output_kind='none',
                        owner_pid=NULL, owner_started_at=NULL, updated_at=?, last_error=?
                    WHERE input_id=? AND state IN ('submitting','running')""",
                 (time.time(), str(error or "submission result unknown")[:500], input_id),
@@ -725,19 +819,28 @@ class CodexBridgeStore:
 
     def mark_continuation_pending(
         self, input_id: str, error: str = "", *, continuation_turn_id: str = "",
+        continuation_turn_ids: tuple[str, ...] = (), physical_turn_status: str = "interrupted",
     ) -> bool:
         """Release the live runner while an external owner continues the same Codex turn."""
         continued = str(continuation_turn_id or "").strip() or None
+        chain = tuple(dict.fromkeys(
+            str(value).strip() for value in continuation_turn_ids if str(value).strip()
+        ))
+        if continued and continued not in chain:
+            chain += (continued,)
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
                    SET state='continuation_pending', owner_pid=NULL, owner_started_at=NULL,
                        delivery_owner='rollout', turn_outcome='continuing', final_text=NULL,
-                       continuation_turn_id=?,
+                       continuation_turn_id=?, continuation_turn_ids_json=?,
+                       physical_turn_status=?, logical_input_status='awaiting_successor',
+                       output_kind='none', delivery_status='none', finalized_at=NULL,
                        updated_at=?, last_error=?
                    WHERE input_id=? AND state IN ('executing','submitting','running')""",
                 (
-                    continued, time.time(),
+                    continued, json.dumps(chain, separators=(",", ":")),
+                    str(physical_turn_status or "unknown"), time.time(),
                     str(error or "external continuation pending")[:500], input_id,
                 ),
             )
@@ -745,49 +848,165 @@ class CodexBridgeStore:
 
     def mark_executed(
         self, input_id: str, final_text: str, *, turn_outcome: str = "completed",
+        output_kind: Optional[str] = None,
     ) -> bool:
+        physical = str(turn_outcome or "unknown").strip().lower()
+        kind = str(output_kind or (
+            "final_answer" if physical == "completed" else "terminal_notice"
+        )).strip().lower()
+        return self.stage_terminal_output(
+            input_id, final_text, physical_turn_status=physical, output_kind=kind,
+        ) is not None
+
+    def stage_terminal_output(
+        self, input_id: str, final_text: str, *, physical_turn_status: str,
+        output_kind: str, adapter_profile: Optional[str] = None,
+        recovery: bool = False,
+    ) -> Optional[str]:
+        """Atomically reduce a logical input and persist its canonical send intent."""
+        cleaned = str(final_text or "").strip()
+        physical = str(physical_turn_status or "unknown").strip().lower()
+        kind = str(output_kind or "").strip().lower()
+        if not cleaned:
+            return None
+        if kind == "final_answer" and physical != "completed":
+            raise ValueError("final_answer requires a completed physical turn")
+        if kind not in {"final_answer", "terminal_notice"}:
+            raise ValueError("unsupported Codex terminal output kind")
+        logical = "completed" if kind == "final_answer" else "failed"
+        target_state = "recovery_output" if recovery else "executed"
+        accepted = (
+            "'submitting','running','uncertain','continuation_pending','executed','recovery_output'"
+            if recovery else "'executing','submitting','running','uncertain'"
+        )
         with self._lock, self._transaction() as conn:
-            cur = conn.execute(
-                """UPDATE codex_bridge_inputs
-                   SET state='executed', final_text=?, delivery_owner='ledger',
-                       turn_outcome=?, updated_at=?
-                   WHERE input_id=? AND state IN (
-                       'executing','submitting','running','uncertain'
-                   )""",
-                (final_text, str(turn_outcome or "unknown"), time.time(), input_id),
+            row = conn.execute(
+                """SELECT lane_session_key, event_json
+                   FROM codex_bridge_inputs WHERE input_id=?""", (input_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            event = self._event_from_json(str(row[1]))
+            logical_key = f"codex-input:{input_id}"
+            from gateway.delivery_ledger import (
+                compute_semantic_obligation_id, stage_obligation_in_transaction,
             )
-        return bool(cur.rowcount)
+            obligation_id = compute_semantic_obligation_id(str(row[0]), logical_key, kind)
+            cur = conn.execute(
+                f"""UPDATE codex_bridge_inputs
+                    SET state=?, final_text=?, delivery_owner='ledger', turn_outcome=?,
+                        physical_turn_status=?, logical_input_status=?, output_kind=?,
+                        delivery_status='pending', delivery_obligation_id=?,
+                        owner_pid=NULL, owner_started_at=NULL, updated_at=?, last_error=NULL
+                    WHERE input_id=? AND state IN ({accepted})""",
+                (
+                    target_state, cleaned, physical, physical, logical, kind,
+                    obligation_id, time.time(), input_id,
+                ),
+            )
+            if not cur.rowcount:
+                existing = conn.execute(
+                    "SELECT delivery_obligation_id FROM codex_bridge_inputs WHERE input_id=?",
+                    (input_id,),
+                ).fetchone()
+                return str(existing[0]) if existing and existing[0] else None
+            stage_obligation_in_transaction(
+                conn, obligation_id=obligation_id, session_key=str(row[0]),
+                platform=event.source.platform.value, chat_id=event.source.chat_id,
+                thread_id=event.source.thread_id, content=cleaned,
+                adapter_profile=adapter_profile, logical_key=logical_key,
+                output_kind=kind, delivery_sequence=1,
+            )
+        return obligation_id
 
     def capture_recovery_output(
         self, input_id: str, final_text: str, *, turn_outcome: str = "completed",
     ) -> bool:
         """Resolve an uncertain request from its exact rollout client id."""
-        cleaned = str(final_text or "").strip()
-        if not cleaned:
-            return False
+        kind = "final_answer" if str(turn_outcome) == "completed" else "terminal_notice"
+        return self.stage_terminal_output(
+            input_id, final_text, physical_turn_status=turn_outcome,
+            output_kind=kind, recovery=True,
+        ) is not None
+
+    def mark_completed(self, input_id: str) -> bool:
+        """Close a logical input only after its exact outbox row is ACKed."""
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
-                   SET state='recovery_output', final_text=?, delivery_owner='ledger',
-                       turn_outcome=?, updated_at=?, last_error=NULL
-                   WHERE input_id=? AND state IN (
-                       'submitting','running','uncertain','continuation_pending'
-                   )""",
-                (cleaned, str(turn_outcome or "unknown"), time.time(), input_id),
-            )
-        return bool(cur.rowcount)
-
-    def mark_completed(self, input_id: str) -> None:
-        with self._lock, self._transaction() as conn:
-            conn.execute(
-                """UPDATE codex_bridge_inputs
                    SET state='completed', delivery_owner='none',
+                       delivery_status='delivered', finalized_at=?,
                        owner_pid=NULL, owner_started_at=NULL, updated_at=?
                    WHERE input_id=? AND state IN (
                        'executing','executed','recovery_output','continuation_pending'
-                   )""",
-                (time.time(), input_id),
+                   ) AND delivery_obligation_id IS NOT NULL
+                     AND EXISTS (
+                         SELECT 1 FROM delivery_obligations
+                         WHERE obligation_id=delivery_obligation_id AND state='delivered'
+                     )""",
+                (time.time(), time.time(), input_id),
             )
+        return bool(cur.rowcount)
+
+    def mark_delivery_pending(self, input_id: str, error: str = "") -> None:
+        with self._lock, self._transaction() as conn:
+            conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='recovery_output', delivery_owner='ledger',
+                       delivery_status='pending', updated_at=?, last_error=?
+                   WHERE input_id=? AND state IN ('executed','recovery_output')""",
+                (time.time(), str(error or "delivery pending")[:500], input_id),
+            )
+
+    def update_continuation_chain(
+        self, input_id: str, turn_ids: tuple[str, ...], *, reason: str = "",
+    ) -> bool:
+        chain = tuple(dict.fromkeys(
+            str(value).strip() for value in turn_ids if str(value).strip()
+        ))
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET continuation_turn_id=?, continuation_turn_ids_json=?, updated_at=?,
+                       last_error=COALESCE(NULLIF(?, ''), last_error)
+                   WHERE input_id=? AND state='continuation_pending'""",
+                (
+                    chain[-1] if chain else None,
+                    json.dumps(chain, separators=(",", ":")), time.time(),
+                    str(reason or "")[:500], input_id,
+                ),
+            )
+        return bool(cur.rowcount)
+
+    def reopen_for_rollout_reconciliation(self, input_id: str, reason: str = "") -> bool:
+        """A prepared handoff became a no-op; recover the old turn's final."""
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='uncertain', delivery_owner='rollout', turn_outcome='unknown',
+                       logical_input_status='reconciling', output_kind='none',
+                       delivery_status='none', updated_at=?, last_error=?
+                   WHERE input_id=? AND state='continuation_pending'""",
+                (time.time(), str(reason or "original turn completed during handoff")[:500], input_id),
+            )
+        return bool(cur.rowcount)
+
+    def cancel_active_input(self, input_id: str, error: str = "") -> bool:
+        """Terminally cancel work whose binding was revoked before delivery."""
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='cancelled', delivery_owner='none', turn_outcome='cancelled',
+                       physical_turn_status='cancelled', logical_input_status='cancelled',
+                       output_kind='none', delivery_status='none',
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?, last_error=?
+                   WHERE input_id=? AND state IN (
+                       'routed','pending','admitted','executing','submitting','running','uncertain',
+                       'continuation_pending'
+                   )""",
+                (time.time(), str(error or "binding changed")[:500], input_id),
+            )
+        return bool(cur.rowcount)
 
     def release_for_retry(self, input_id: str, error: str = "") -> None:
         with self._lock, self._transaction() as conn:
@@ -894,20 +1113,15 @@ class CodexBridgeStore:
             rows = conn.execute(
                 """SELECT input_id, control_session_key, lane_session_key, thread_id,
                           generation, event_json, state, final_text, codex_turn_id,
-                          delivery_owner, turn_outcome, continuation_turn_id
+                          delivery_owner, turn_outcome, continuation_turn_id,
+                          continuation_turn_ids_json, physical_turn_status,
+                          logical_input_status, output_kind, delivery_status,
+                          delivery_obligation_id, legacy_recovery_required
                    FROM codex_bridge_inputs
                    WHERE state='recovery_output' AND final_text IS NOT NULL
                    ORDER BY created_at"""
             ).fetchall()
-        return [
-            DurableCodexInput(
-                input_id=row[0], control_session_key=row[1], lane_session_key=row[2],
-                thread_id=row[3], generation=int(row[4]), event=self._event_from_json(row[5]),
-                state=row[6], final_text=row[7], codex_turn_id=row[8],
-                delivery_owner=row[9], turn_outcome=row[10], continuation_turn_id=row[11],
-            )
-            for row in rows
-        ]
+        return [self._durable_input_from_full_row(row) for row in rows]
 
     def continuation_pending_inputs(self) -> list[DurableCodexInput]:
         """Return externally continued inputs awaiting their authoritative rollout final."""
@@ -915,19 +1129,100 @@ class CodexBridgeStore:
             rows = conn.execute(
                 """SELECT input_id, control_session_key, lane_session_key, thread_id,
                           generation, event_json, state, final_text, codex_turn_id,
-                          delivery_owner, turn_outcome, continuation_turn_id
+                          delivery_owner, turn_outcome, continuation_turn_id,
+                          continuation_turn_ids_json, physical_turn_status,
+                          logical_input_status, output_kind, delivery_status,
+                          delivery_obligation_id, legacy_recovery_required
                    FROM codex_bridge_inputs
                    WHERE state='continuation_pending' ORDER BY created_at"""
             ).fetchall()
-        return [
-            DurableCodexInput(
-                input_id=row[0], control_session_key=row[1], lane_session_key=row[2],
-                thread_id=row[3], generation=int(row[4]), event=self._event_from_json(row[5]),
-                state=row[6], final_text=row[7], codex_turn_id=row[8],
-                delivery_owner=row[9], turn_outcome=row[10], continuation_turn_id=row[11],
+        return [self._durable_input_from_full_row(row) for row in rows]
+
+    def legacy_completed_handoff_candidates(self) -> list[DurableCodexInput]:
+        """Legacy rows where a delivered interruption notice may hide a successor."""
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute(
+                """SELECT input_id, control_session_key, lane_session_key, thread_id,
+                          generation, event_json, state, final_text, codex_turn_id,
+                          delivery_owner, turn_outcome, continuation_turn_id,
+                          continuation_turn_ids_json, physical_turn_status,
+                          logical_input_status, output_kind, delivery_status,
+                          delivery_obligation_id, legacy_recovery_required
+                   FROM codex_bridge_inputs
+                   WHERE state='completed' AND turn_outcome IN ('interrupted','failed')
+                     AND codex_turn_id IS NOT NULL
+                   ORDER BY created_at"""
+            ).fetchall()
+        return [self._durable_input_from_full_row(row) for row in rows]
+
+    def pending_legacy_rollout_recovery(self) -> list[DurableCodexInput]:
+        with self._lock, self._transaction() as conn:
+            rows = conn.execute(
+                """SELECT input_id, control_session_key, lane_session_key, thread_id,
+                          generation, event_json, state, final_text, codex_turn_id,
+                          delivery_owner, turn_outcome, continuation_turn_id,
+                          continuation_turn_ids_json, physical_turn_status,
+                          logical_input_status, output_kind, delivery_status,
+                          delivery_obligation_id, legacy_recovery_required
+                   FROM codex_bridge_inputs
+                   WHERE state='continuation_pending' AND legacy_recovery_required=1
+                   ORDER BY created_at"""
+            ).fetchall()
+        return [self._durable_input_from_full_row(row) for row in rows]
+
+    def reopen_legacy_handoff(
+        self, input_id: str, continuation_turn_ids: tuple[str, ...],
+    ) -> bool:
+        chain = tuple(dict.fromkeys(
+            str(value).strip() for value in continuation_turn_ids if str(value).strip()
+        ))
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='continuation_pending', delivery_owner='rollout',
+                       turn_outcome='continuing', continuation_turn_id=?,
+                       continuation_turn_ids_json=?, final_text=NULL,
+                       logical_input_status='awaiting_successor', output_kind='none',
+                       delivery_status='none', delivery_obligation_id=NULL,
+                       finalized_at=NULL, legacy_recovery_required=1, updated_at=?,
+                       last_error='legacy interrupted input reopened from formal handoff'
+                   WHERE input_id=? AND state='completed'
+                     AND turn_outcome IN ('interrupted','failed')""",
+                (
+                    chain[-1] if chain else None,
+                    json.dumps(chain, separators=(",", ":")), time.time(), input_id,
+                ),
             )
-            for row in rows
-        ]
+        return bool(cur.rowcount)
+
+    def finish_legacy_recovery_scan(self, input_id: str) -> None:
+        with self._lock, self._transaction() as conn:
+            conn.execute(
+                """UPDATE codex_bridge_inputs SET legacy_recovery_required=0, updated_at=?
+                   WHERE input_id=? AND state IN ('continuation_pending','recovery_output')""",
+                (time.time(), input_id),
+            )
+
+    @classmethod
+    def _durable_input_from_full_row(cls, row: tuple[Any, ...]) -> DurableCodexInput:
+        try:
+            chain = tuple(
+                str(value).strip() for value in json.loads(row[12] or "[]")
+                if str(value).strip()
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            chain = ()
+        return DurableCodexInput(
+            input_id=row[0], control_session_key=row[1], lane_session_key=row[2],
+            thread_id=row[3], generation=int(row[4]), event=cls._event_from_json(row[5]),
+            state=row[6], final_text=row[7], codex_turn_id=row[8],
+            delivery_owner=row[9], turn_outcome=row[10], continuation_turn_id=row[11],
+            continuation_turn_ids=chain, physical_turn_status=str(row[13] or "unknown"),
+            logical_input_status=str(row[14] or "open"), output_kind=str(row[15] or "none"),
+            delivery_status=str(row[16] or "none"),
+            delivery_obligation_id=str(row[17]) if row[17] is not None else None,
+            legacy_recovery_required=bool(row[18]),
+        )
 
     def claim_rollout_event(self, input_id: str, turn_id: str) -> tuple[str, bool]:
         """Resolve one rollout event's current delivery owner atomically.
@@ -945,7 +1240,7 @@ class CodexBridgeStore:
         with self._lock, self._transaction() as conn:
             row = conn.execute(
                 """SELECT state, codex_turn_id, delivery_owner, turn_outcome,
-                          continuation_turn_id
+                          continuation_turn_id, continuation_turn_ids_json
                    FROM codex_bridge_inputs WHERE input_id=?""",
                 (cleaned_input,),
             ).fetchone()
@@ -956,6 +1251,13 @@ class CodexBridgeStore:
             delivery_owner = str(row[2] or "none")
             turn_outcome = str(row[3] or "unknown")
             continuation_turn = str(row[4] or "").strip()
+            try:
+                continuation_chain = tuple(
+                    str(value).strip() for value in json.loads(row[5] or "[]")
+                    if str(value).strip()
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continuation_chain = ()
             if state == "cancelled":
                 return "terminal", False
             if not original_turn:
@@ -973,10 +1275,8 @@ class CodexBridgeStore:
                 if delivery_owner == "rollout" and state == "uncertain":
                     return "rollout", False
                 return "terminal", False
-            if cleaned_turn == continuation_turn:
+            if cleaned_turn == continuation_turn or cleaned_turn in continuation_chain:
                 return ("rollout" if delivery_owner == "rollout" else "terminal"), False
-            if continuation_turn:
-                return "terminal", False
             if turn_outcome not in {"interrupted", "unknown", "continuing"}:
                 return "terminal", False
             if delivery_owner in {"runner", "ledger"}:
@@ -986,12 +1286,17 @@ class CodexBridgeStore:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
                    SET state='continuation_pending', delivery_owner='rollout',
-                       turn_outcome='continuing', continuation_turn_id=?, final_text=NULL,
+                       turn_outcome='continuing', continuation_turn_id=?,
+                       continuation_turn_ids_json=?, final_text=NULL,
+                       physical_turn_status='interrupted',
+                       logical_input_status='awaiting_successor',
                        owner_pid=NULL, owner_started_at=NULL, updated_at=?,
-                       last_error='resumed Codex turn claimed by rollout watcher'
+                   last_error='resumed Codex turn claimed by rollout watcher'
                    WHERE input_id=? AND state=? AND delivery_owner=? AND turn_outcome=?""",
                 (
-                    cleaned_turn, time.time(), cleaned_input,
+                    cleaned_turn,
+                    json.dumps(tuple(dict.fromkeys((*continuation_chain, cleaned_turn))), separators=(",", ":")),
+                    time.time(), cleaned_input,
                     state, delivery_owner, turn_outcome,
                 ),
             )
@@ -1003,11 +1308,11 @@ class CodexBridgeStore:
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """DELETE FROM codex_bridge_inputs
-                   WHERE state IN ('routed','uncertain','completed','cancelled') AND updated_at < ?""",
+                   WHERE state IN ('routed','completed','cancelled') AND updated_at < ?""",
                 (cutoff,),
             )
             progress_cur = conn.execute(
-                "DELETE FROM codex_bridge_progress WHERE state='delivered' AND updated_at < ?",
+                "DELETE FROM codex_bridge_progress WHERE state IN ('delivered','finalized') AND updated_at < ?",
                 (cutoff,),
             )
         return int(cur.rowcount) + int(progress_cur.rowcount)

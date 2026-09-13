@@ -102,7 +102,7 @@ class TestCommandExecutionProjection:
 
 
 class TestAgentMessageProjection:
-    """assistant text → final_text + assistant message."""
+    """Assistant phase controls terminal eligibility."""
 
     def test_agent_message_projects_to_assistant(self) -> None:
         p = CodexEventProjector()
@@ -111,9 +111,29 @@ class TestAgentMessageProjection:
             "params": {"item": {"type": "agentMessage", "id": "x",
                                 "text": "hi there"}},
         })
-        assert r.final_text == "hi there"
+        assert r.final_text is None
+        assert r.terminal_candidate == "hi there"
         assert r.messages == [{"role": "assistant", "content": "hi there"}]
         assert r.is_tool_iteration is False
+
+    def test_commentary_is_never_a_terminal_candidate(self) -> None:
+        result = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "commentary",
+                                "phase": "commentary", "text": "still working"}},
+        })
+        assert result.final_text is None
+        assert result.terminal_candidate is None
+        assert result.message_phase == "commentary"
+
+    def test_final_answer_is_authoritative(self) -> None:
+        result = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "final",
+                                "phase": "final_answer", "text": "done"}},
+        })
+        assert result.final_text == "done"
+        assert result.terminal_candidate is None
 
     def test_pending_reasoning_attaches_to_next_assistant_message(self) -> None:
         p = CodexEventProjector()
