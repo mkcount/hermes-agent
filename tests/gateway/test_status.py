@@ -218,6 +218,23 @@ class TestScopedGatewayPidQuery:
 
 
 class TestGatewayRuntimeStatus:
+    def test_test_process_cannot_write_production_runtime_status(
+        self, tmp_path, monkeypatch,
+    ):
+        production = tmp_path / ".hermes"
+        production.mkdir()
+        state_path = production / "gateway_state.json"
+        original = {"pid": 42, "gateway_state": "running", "code_sha": "old"}
+        state_path.write_text(json.dumps(original), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(production))
+        monkeypatch.setattr(status, "_in_test_context", lambda: True)
+        monkeypatch.setattr(status, "_real_platform_state_root", lambda: production)
+
+        with pytest.raises(RuntimeError, match="production gateway_state.json"):
+            status.write_runtime_status(platform="feishu", platform_state="connected")
+
+        assert json.loads(state_path.read_text(encoding="utf-8")) == original
+
     def test_clear_profile_platforms_preserves_primary_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "gateway_state.json").write_text(

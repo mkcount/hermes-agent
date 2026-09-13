@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home
+from hermes_state_guard import _in_test_context, _real_platform_state_root
 from utils import atomic_json_write
 
 if sys.platform == "win32":
@@ -459,6 +460,29 @@ def _build_runtime_status_record() -> dict[str, Any]:
     }
 
 
+def _ensure_runtime_status_test_isolation(path: Path) -> None:
+    """Refuse pytest writes to the live gateway status, including late worker threads."""
+    if not _in_test_context():
+        return
+    root = _real_platform_state_root()
+    if root is None:
+        return
+    try:
+        resolved = path.expanduser().resolve()
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return
+    if relative.parts == (_RUNTIME_STATUS_FILE,) or (
+        len(relative.parts) == 3
+        and relative.parts[0] == "profiles"
+        and relative.parts[2] == _RUNTIME_STATUS_FILE
+    ):
+        raise RuntimeError(
+            "live-system guard: test attempted to write production gateway_state.json "
+            f"at {resolved}; tests and their background workers must retain a temporary HERMES_HOME"
+        )
+
+
 def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[str, Any]]:
     """JSON object at ``path``, or None when absent/empty/unreadable/invalid. ``bare_pid_ok`` also
     accepts legacy bare-integer PID files as ``{"pid": N}``."""
@@ -799,6 +823,7 @@ def write_runtime_status(
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
+    _ensure_runtime_status_test_isolation(path)
     payload = _read_json_file(path) or _build_runtime_status_record()
     previous_payload = copy.deepcopy(payload)
     current_record = _build_pid_record()

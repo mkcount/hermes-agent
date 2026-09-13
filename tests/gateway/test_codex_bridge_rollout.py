@@ -169,6 +169,51 @@ def test_formal_handoff_never_inherits_into_a_mismatched_turn(tmp_path):
     assert [(event.kind, event.text) for event in events] == [("user", "old work")]
 
 
+def test_formal_handoff_skips_dying_server_turn_then_binds_exact_successor(tmp_path):
+    """A resume sent during App Server shutdown must not consume provenance."""
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    records = [
+        _meta(THREAD),
+        {"timestamp": "2026-09-13T17:08:20Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-old"}},
+        {"timestamp": "2026-09-13T17:08:21Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "turn-old",
+                     "message": "finish river", "client_id": "telegram-input"}},
+        {"timestamp": "2026-09-13T17:08:26Z", "type": "event_msg",
+         "payload": {"type": "turn_aborted", "turn_id": "turn-old",
+                     "reason": "interrupted"}},
+        {"timestamp": "2026-09-13T17:08:28Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "dying-server-turn"}},
+        {"timestamp": "2026-09-13T17:08:36Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "turn_id": "dying-server-turn",
+                     "phase": "commentary", "message": "temporary progress"}},
+        # The dying server disappears without a terminal event for its turn.
+        {"timestamp": "2026-09-13T17:09:09Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-successor"}},
+        {"timestamp": "2026-09-13T17:11:46Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "turn_id": "turn-successor",
+                     "phase": "commentary", "message": "verified progress"}},
+        {"timestamp": "2026-09-13T17:23:52Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-successor",
+                     "last_agent_message": "verified final"}},
+    ]
+    _write(path, records)
+
+    events, next_offset, _ = RolloutTail(
+        THREAD, path,
+        handoff_graph=CodexHandoffGraph(
+            {"turn-old": "turn-successor"}, {"turn-old": "successor_bound"},
+        ),
+    ).scan()
+
+    assert [(event.kind, event.text, event.client_id) for event in events] == [
+        ("user", "finish river", "telegram-input"),
+        ("commentary", "verified progress", "telegram-input"),
+        ("final", "verified final", "telegram-input"),
+    ]
+    assert next_offset == path.stat().st_size
+
+
 def test_persisted_interrupted_turn_resumes_after_long_idle_without_new_user_item(tmp_path):
     path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
     records = [
