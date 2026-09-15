@@ -33,6 +33,8 @@ class CodexBridgeBinding:
     cursor_offset: int = 0
     last_event_id: Optional[str] = None
     pending_new: bool = False
+    codex_model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -118,6 +120,8 @@ class CodexBridgeStore:
                 cursor_offset INTEGER NOT NULL DEFAULT 0,
                 last_event_id TEXT,
                 pending_new INTEGER NOT NULL DEFAULT 0,
+                codex_model TEXT,
+                reasoning_effort TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )"""
@@ -183,6 +187,10 @@ class CodexBridgeStore:
             conn.execute(
                 "ALTER TABLE codex_bridge_bindings ADD COLUMN pending_new INTEGER NOT NULL DEFAULT 0"
             )
+        if "codex_model" not in columns:
+            conn.execute("ALTER TABLE codex_bridge_bindings ADD COLUMN codex_model TEXT")
+        if "reasoning_effort" not in columns:
+            conn.execute("ALTER TABLE codex_bridge_bindings ADD COLUMN reasoning_effort TEXT")
         input_columns = {row[1] for row in conn.execute("PRAGMA table_info(codex_bridge_inputs)")}
         if "owner_started_at" not in input_columns:
             conn.execute("ALTER TABLE codex_bridge_inputs ADD COLUMN owner_started_at INTEGER")
@@ -306,6 +314,8 @@ class CodexBridgeStore:
             generation=int(row[3]), source=source, rollout_path=row[5],
             cursor_device=row[6], cursor_inode=row[7], cursor_offset=int(row[8] or 0),
             last_event_id=row[9], pending_new=bool(row[10]),
+            codex_model=str(row[11]) if row[11] else None,
+            reasoning_effort=str(row[12]).lower() if row[12] else None,
         )
 
     def get_binding(self, control_session_key: str) -> Optional[CodexBridgeBinding]:
@@ -313,7 +323,7 @@ class CodexBridgeStore:
             row = conn.execute(
                 """SELECT control_session_key, thread_id, cwd, generation, source_json,
                           rollout_path, cursor_device, cursor_inode, cursor_offset, last_event_id,
-                          pending_new
+                          pending_new, codex_model, reasoning_effort
                    FROM codex_bridge_bindings WHERE control_session_key=?""",
                 (control_session_key,),
             ).fetchone()
@@ -324,7 +334,7 @@ class CodexBridgeStore:
             rows = conn.execute(
                 """SELECT control_session_key, thread_id, cwd, generation, source_json,
                           rollout_path, cursor_device, cursor_inode, cursor_offset, last_event_id,
-                          pending_new
+                          pending_new, codex_model, reasoning_effort
                    FROM codex_bridge_bindings WHERE thread_id IS NOT NULL ORDER BY updated_at DESC"""
             ).fetchall()
         return [self._binding_from_row(row) for row in rows]
@@ -554,11 +564,15 @@ class CodexBridgeStore:
         cursor_inode: Optional[int] = None, cursor_offset: int = 0,
         last_event_id: Optional[str] = None,
         pending_new: bool = False,
+        codex_model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> CodexBridgeBinding:
         cleaned = str(thread_id or "").strip()
         if not cleaned:
             raise ValueError("thread_id is required")
         now = time.time()
+        selected_model = str(codex_model or "").strip() or None
+        selected_effort = str(reasoning_effort or "").strip().lower() or None
         source_json = json.dumps(source.to_dict(), ensure_ascii=False, separators=(",", ":"))
         with self._lock, self._transaction() as conn:
             current = conn.execute(
@@ -570,18 +584,20 @@ class CodexBridgeStore:
                 """INSERT INTO codex_bridge_bindings (
                        control_session_key, thread_id, cwd, generation, source_json,
                        rollout_path, cursor_device, cursor_inode, cursor_offset, last_event_id,
-                       pending_new, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       pending_new, codex_model, reasoning_effort, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(control_session_key) DO UPDATE SET
                        thread_id=excluded.thread_id, cwd=excluded.cwd,
                        generation=excluded.generation, source_json=excluded.source_json,
                        rollout_path=excluded.rollout_path, cursor_device=excluded.cursor_device,
                        cursor_inode=excluded.cursor_inode, cursor_offset=excluded.cursor_offset,
                        last_event_id=excluded.last_event_id, pending_new=excluded.pending_new,
+                       codex_model=excluded.codex_model,
+                       reasoning_effort=excluded.reasoning_effort,
                        updated_at=excluded.updated_at""",
                 (control_session_key, cleaned, cwd or "", generation, source_json,
                  rollout_path, cursor_device, cursor_inode, max(0, int(cursor_offset)),
-                 last_event_id, int(bool(pending_new)), now, now),
+                 last_event_id, int(bool(pending_new)), selected_model, selected_effort, now, now),
             )
             conn.execute(
                 """UPDATE codex_bridge_inputs
@@ -619,7 +635,8 @@ class CodexBridgeStore:
                        thread_id=NULL, cwd='', generation=excluded.generation,
                        source_json=excluded.source_json, rollout_path=NULL,
                        cursor_device=NULL, cursor_inode=NULL, cursor_offset=0,
-                       last_event_id=NULL, pending_new=0, updated_at=excluded.updated_at""",
+                       last_event_id=NULL, pending_new=0, codex_model=NULL,
+                       reasoning_effort=NULL, updated_at=excluded.updated_at""",
                 (control_session_key, generation, source_json, now, now),
             )
             conn.execute(
@@ -663,6 +680,24 @@ class CodexBridgeStore:
                          )""",
                     (cleaned, time.time(), binding.control_session_key, binding.generation, binding.thread_id),
                 )
+        return self.get_binding(binding.control_session_key) if cur.rowcount else None
+
+    def set_inference(
+        self, binding: CodexBridgeBinding, *, codex_model: str, reasoning_effort: str,
+    ) -> Optional[CodexBridgeBinding]:
+        """Atomically update the model/effort pair while the selected binding generation is current."""
+        model = str(codex_model or "").strip()
+        effort = str(reasoning_effort or "").strip().lower()
+        if not model or not effort:
+            raise ValueError("codex_model and reasoning_effort are required")
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_bindings
+                   SET codex_model=?, reasoning_effort=?, updated_at=?
+                   WHERE control_session_key=? AND generation=? AND thread_id=?""",
+                (model, effort, time.time(), binding.control_session_key,
+                 binding.generation, binding.thread_id),
+            )
         return self.get_binding(binding.control_session_key) if cur.rowcount else None
 
     def update_cursor(

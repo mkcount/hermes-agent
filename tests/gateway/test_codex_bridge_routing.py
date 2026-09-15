@@ -10,7 +10,7 @@ import pytest
 
 from gateway.codex_bridge import handoff as handoff_mod
 from gateway.codex_bridge import rollout as rollout_mod
-from gateway.codex_bridge.catalog import CodexThreadSummary
+from gateway.codex_bridge.catalog import CodexProjectSummary, CodexThreadSummary
 from gateway.codex_bridge.mixin import GatewayCodexBridgeMixin
 from gateway.codex_bridge.rollout import RolloutEvent
 from gateway.codex_bridge.store import CodexBridgeStore
@@ -136,6 +136,102 @@ async def test_selection_command_stays_on_control_lane(tmp_path):
     )
     assert routed.source.trusted_local_lane is None
     assert "codex_bridge_input_id" not in routed.metadata
+
+    model_routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="/codex_model", source=source, message_id="79"),
+    )
+    assert model_routed.source.trusted_local_lane is None
+    assert "codex_bridge_input_id" not in model_routed.metadata
+
+
+@pytest.mark.asyncio
+async def test_codex_model_picker_commits_model_and_reasoning_together(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    binding = store.bind(
+        build_session_key(source), source, thread_id="thread-123",
+        codex_model="gpt-5.6-sol", reasoning_effort="xhigh",
+    )
+    bridge = _Bridge(store)
+    pickers = []
+
+    async def _send_picker(event, session_key, title, choices, callback):
+        pickers.append({
+            "event": event, "session_key": session_key, "title": title,
+            "choices": choices, "callback": callback,
+        })
+        return True
+
+    bridge._try_send_choice_picker = _send_picker
+    answer = await bridge._handle_codex_model_command(
+        MessageEvent(text="/codex_model", source=source, message_id="model-1"),
+    )
+
+    assert answer is None
+    assert [choice["label"] for choice in pickers[0]["choices"]] == [
+        "5.6 S", "5.6 T", "5.6 L", "6.0 A",
+    ]
+    first_result = await pickers[0]["callback"]("1001", "gpt-5.6-terra")
+    assert "5.6 T" in first_result
+    # Model selection alone is not a partial commit.
+    assert store.get_binding(binding.control_session_key).codex_model == "gpt-5.6-sol"
+    assert [choice["value"] for choice in pickers[1]["choices"]] == [
+        "medium", "high", "xhigh",
+    ]
+
+    final_result = await pickers[1]["callback"]("1001", "high")
+    updated = store.get_binding(binding.control_session_key)
+    assert "Codex 설정 완료" in final_result
+    assert updated.codex_model == "gpt-5.6-terra"
+    assert updated.reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_codex_model_picker_rejects_selection_after_binding_changes(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    old = store.bind(build_session_key(source), source, thread_id="thread-old")
+    bridge = _Bridge(store)
+    pickers = []
+
+    async def _send_picker(_event, _session_key, _title, _choices, callback):
+        pickers.append(callback)
+        return True
+
+    bridge._try_send_choice_picker = _send_picker
+    await bridge._handle_codex_model_command(
+        MessageEvent(text="/codex_model", source=source, message_id="model-stale"),
+    )
+    await pickers[0]("1001", "gpt-6-astra")
+    store.bind(build_session_key(source), source, thread_id="thread-new")
+
+    result = await pickers[1]("1001", "xhigh")
+    current = store.get_binding(old.control_session_key)
+    assert "세션이 바뀌었습니다" in result
+    assert current.thread_id == "thread-new"
+    assert current.codex_model is None
+    assert current.reasoning_effort is None
+
+
+@pytest.mark.asyncio
+async def test_ns_reserves_explicit_sol_xhigh_defaults(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    bridge = _Bridge(store)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.list_recent_projects",
+        lambda **_kwargs: [CodexProjectSummary(cwd="/project", name="Project", updated_at=1)],
+    )
+
+    answer = await bridge._handle_ns_command(
+        MessageEvent(text="/ns 1", source=source, message_id="ns-default"),
+    )
+
+    binding = store.get_binding(build_session_key(source))
+    assert "5.6 S · Sol / XHigh" in answer
+    assert binding.pending_new is True
+    assert binding.codex_model == "gpt-5.6-sol"
+    assert binding.reasoning_effort == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -523,7 +619,10 @@ async def test_completed_interruption_transfers_delivery_to_a_resumed_physical_t
 async def test_runner_configures_full_access_and_durable_turn_callbacks(tmp_path):
     store = CodexBridgeStore(tmp_path / "state.db")
     source = _source()
-    binding = store.bind(build_session_key(source), source, thread_id="thread-123", cwd="/project")
+    binding = store.bind(
+        build_session_key(source), source, thread_id="thread-123", cwd="/project",
+        codex_model="gpt-6-astra", reasoning_effort="high",
+    )
     bridge = _Bridge(store)
     routed = await bridge._resolve_codex_bridge_route(
         _Adapter(), MessageEvent(text="continue", source=source, message_id="80"),
@@ -547,6 +646,8 @@ async def test_runner_configures_full_access_and_durable_turn_callbacks(tmp_path
     assert agent._gateway_codex_full_access is True
     assert agent._codex_resume_thread_id == "thread-123"
     assert agent._codex_resume_active_turn_mode == "queue"
+    assert agent._codex_model_override == "gpt-6-astra"
+    assert agent._codex_reasoning_effort_override == "high"
     assert agent.session_cwd == "/project"
     assert store.input_state(input_id) == "running"
 

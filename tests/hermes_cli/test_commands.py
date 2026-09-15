@@ -623,6 +623,17 @@ class TestGatewaySkillCollector:
 class TestTelegramMenuCommands:
     """Integration: telegram_menu_commands enforces the 32-char limit."""
 
+    def test_codex_model_command_uses_telegram_name_and_default_priority(self):
+        from hermes_cli.commands import resolve_command
+        from hermes_cli.commands_platforms import _TELEGRAM_MENU_PRIORITY
+
+        command = resolve_command("codex_model")
+        assert command is not None
+        assert command.name == "codex-model"
+        assert "codex_model" in _TELEGRAM_MENU_PRIORITY
+        menu, _ = telegram_menu_commands(max_commands=100)
+        assert "codex_model" in {name for name, _description in menu}
+
 
     def test_external_dir_skills_included_in_telegram_menu(self, tmp_path, monkeypatch):
         """External skills (``skills.external_dirs``) must appear in the Telegram menu.

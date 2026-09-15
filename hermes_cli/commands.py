@@ -156,6 +156,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
         "ns", "Start a new Codex session in a recent project", "Session",
         args_hint="[number|refresh]", gateway_only=True,
     ),
+    CommandDef(
+        "codex-model", "Codex 모델과 리즈닝 설정", "Configuration",
+        aliases=("codex_model",),
+        args_hint="[5.6s|5.6t|5.6l|6.0a] [medium|high|xhigh]",
+        gateway_only=True,
+    ),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",

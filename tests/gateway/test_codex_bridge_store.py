@@ -36,6 +36,56 @@ def test_binding_generation_fences_a_to_b_to_a(tmp_path):
     assert third.thread_id == "thread-a"
 
 
+def test_binding_schema_migrates_model_and_reasoning_columns(tmp_path):
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE codex_bridge_bindings (
+                control_session_key TEXT PRIMARY KEY,
+                thread_id TEXT,
+                cwd TEXT NOT NULL DEFAULT '',
+                generation INTEGER NOT NULL,
+                source_json TEXT NOT NULL,
+                rollout_path TEXT,
+                cursor_device INTEGER,
+                cursor_inode INTEGER,
+                cursor_offset INTEGER NOT NULL DEFAULT 0,
+                last_event_id TEXT,
+                pending_new INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
+
+    CodexBridgeStore(path)
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(codex_bridge_bindings)")}
+    assert {"codex_model", "reasoning_effort"} <= columns
+
+
+def test_inference_pair_update_is_atomic_and_generation_fenced(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    first = store.bind(
+        "control", _source(), thread_id="thread-a",
+        codex_model="gpt-5.6-sol", reasoning_effort="xhigh",
+    )
+
+    updated = store.set_inference(
+        first, codex_model="gpt-6-astra", reasoning_effort="high",
+    )
+    assert (updated.codex_model, updated.reasoning_effort) == ("gpt-6-astra", "high")
+
+    store.bind("control", _source(), thread_id="thread-b")
+    assert store.set_inference(
+        first, codex_model="gpt-5.6-terra", reasoning_effort="medium",
+    ) is None
+    current = store.get_binding("control")
+    assert current.thread_id == "thread-b"
+    assert current.codex_model is None
+    assert current.reasoning_effort is None
+
+
 def test_telegram_topics_keep_independent_codex_bindings(tmp_path):
     store = CodexBridgeStore(tmp_path / "state.db")
     first_source = _source(thread_id="topic-10")
@@ -122,6 +172,7 @@ def test_pending_new_promotion_updates_owned_inputs_without_rotating_grant(tmp_p
     store = CodexBridgeStore(tmp_path / "state.db")
     binding = store.bind(
         "control", _source(), thread_id="pending_ns_token", cwd="/project", pending_new=True,
+        codex_model="gpt-5.6-sol", reasoning_effort="xhigh",
     )
     input_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source))
     assert store.mark_executing(input_id)
@@ -131,6 +182,8 @@ def test_pending_new_promotion_updates_owned_inputs_without_rotating_grant(tmp_p
     assert promoted.generation == binding.generation
     assert promoted.thread_id == "real-thread-id"
     assert promoted.pending_new is False
+    assert promoted.codex_model == "gpt-5.6-sol"
+    assert promoted.reasoning_effort == "xhigh"
 
     with sqlite3.connect(store.path) as conn:
         row = conn.execute(

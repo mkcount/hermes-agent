@@ -51,7 +51,25 @@ _GENERATION_KEY = "codex_bridge_generation"
 _INPUT_KEY = "codex_bridge_input_id"
 _LANE_KEY = "codex_bridge_lane_key"
 _SESSION_EXECUTION_OWNER_KEY = "codex_bridge_execution_owner"
-_SELECTION_COMMANDS = frozenset({"codex-session", "ns"})
+_SELECTION_COMMANDS = frozenset({"codex-session", "codex-model", "ns"})
+_CODEX_MODEL_CHOICES = (
+    ("gpt-5.6-sol", "5.6 S", "Sol", "5.6s"),
+    ("gpt-5.6-terra", "5.6 T", "Terra", "5.6t"),
+    ("gpt-5.6-luna", "5.6 L", "Luna", "5.6l"),
+    ("gpt-6-astra", "6.0 A", "Astra", "6.0a"),
+)
+_CODEX_MODEL_ALIASES = {
+    alias: model
+    for model, _short_label, name, compact in _CODEX_MODEL_CHOICES
+    for alias in (model, compact, compact.replace(".", ""), name.lower())
+}
+_CODEX_REASONING_ALIASES = {
+    "medium": "medium", "미디움": "medium",
+    "high": "high", "하이": "high",
+    "xhigh": "xhigh", "exhigh": "xhigh", "엑스하이": "xhigh",
+}
+_NEW_CODEX_MODEL = "gpt-5.6-sol"
+_NEW_CODEX_REASONING = "xhigh"
 _MIRROR_PROGRESS_MAX_SEGMENTS = 8
 # Leave ample room for Telegram's Markdown escaping while keeping one editable
 # message below its 4,096 UTF-16-unit ceiling.
@@ -353,15 +371,17 @@ class GatewayCodexBridgeMixin:
         state = self._peek_session_state(ctx.session_key)
         model_override = state.conversation.model_override if state is not None else None
         reasoning_override = state.conversation.reasoning_override if state is not None else None
-        agent._codex_model_override = (
+        lane_model = (
             str(model_override.get("model") or "").strip()
             if isinstance(model_override, dict) else None
         ) or None
-        agent._codex_reasoning_effort_override = (
+        lane_reasoning = (
             str(reasoning_override.get("effort") or "").strip().lower()
             if isinstance(reasoning_override, dict) and reasoning_override.get("enabled", True)
             else None
         ) or None
+        agent._codex_model_override = binding.codex_model or lane_model
+        agent._codex_reasoning_effort_override = binding.reasoning_effort or lane_reasoning
 
         def _starting(_thread_id: str, _client_message_id: str) -> None:
             if input_id and not store.mark_submitting(input_id):
@@ -670,6 +690,8 @@ class GatewayCodexBridgeMixin:
             f"세션: {binding.thread_id}",
             f"상태: {state}",
             f"프로젝트: {binding.cwd or '-'}",
+            f"모델: {binding.codex_model or 'Codex 세션 설정 따름'}",
+            f"리즈닝: {binding.reasoning_effort or 'Codex 세션 설정 따름'}",
             f"세대: {binding.generation}",
             f"rollout 미처리량: {lag}",
             f"진행 보고 outbox: 대기 {len(pending)} / 전체 {len(progress)}",
@@ -687,6 +709,101 @@ class GatewayCodexBridgeMixin:
             trusted_local_lane=f"codex-binding:{binding.control_session_key}:{binding.generation}",
         )
         return self._session_key_for_source(lane)
+
+    @staticmethod
+    def _codex_model_choice(model: str) -> Optional[tuple[str, str, str, str]]:
+        return next((choice for choice in _CODEX_MODEL_CHOICES if choice[0] == model), None)
+
+    async def _handle_codex_model_command(self, event: MessageEvent) -> Optional[str]:
+        """Set the model and reasoning pair used by the selected Telegram Codex binding."""
+        if event.source.platform != Platform.TELEGRAM or event.source.chat_type != "dm":
+            return "이 명령은 Telegram 개인 대화에서만 사용할 수 있습니다."
+        source = self._codex_bridge_control_source(event.source)
+        control_key = self._session_key_for_source(source)
+        await self.async_session_store.get_or_create_session(source)
+        store = self._codex_bridge_store_for_source(source)
+        binding = store.get_binding(control_key)
+        if binding is None or not binding.active:
+            return "먼저 /codex_session으로 세션을 연결하거나 /ns로 새 세션을 준비해 주세요."
+
+        def _binding_is_current() -> bool:
+            current = store.get_binding(control_key)
+            return bool(
+                current is not None
+                and current.active
+                and current.generation == binding.generation
+                and current.thread_id == binding.thread_id
+            )
+
+        async def _apply(model: str, effort: str) -> str:
+            if not _binding_is_current():
+                return "선택 중 Codex 세션이 바뀌었습니다. /codex_model을 다시 실행해 주세요."
+            updated = store.set_inference(
+                binding, codex_model=model, reasoning_effort=effort,
+            )
+            if updated is None:
+                return "선택 중 Codex 세션이 바뀌었습니다. /codex_model을 다시 실행해 주세요."
+            choice = self._codex_model_choice(model)
+            model_label = f"{choice[1]} · {choice[2]}" if choice else model
+            return (
+                f"✅ Codex 설정 완료\n\n모델: {model_label}\n"
+                f"리즈닝: {effort.upper()}\n다음 Codex 턴부터 적용됩니다."
+            )
+
+        raw = event.get_command_args().strip().lower()
+        if raw:
+            tokens = raw.replace(",", " ").split()
+            if len(tokens) != 2:
+                return "사용법: /codex_model 5.6s xhigh (모델: 5.6s/5.6t/5.6l/6.0a)"
+            model = _CODEX_MODEL_ALIASES.get(tokens[0])
+            effort = _CODEX_REASONING_ALIASES.get(tokens[1])
+            if model is None or effort is None:
+                return "사용법: /codex_model 5.6s xhigh (리즈닝: medium/high/xhigh)"
+            return await _apply(model, effort)
+
+        async def _selected_model(_chat_id: str, model: str) -> str:
+            choice = self._codex_model_choice(model)
+            if choice is None:
+                return "선택 항목이 만료됐습니다. /codex_model을 다시 실행해 주세요."
+            if not _binding_is_current():
+                return "선택 중 Codex 세션이 바뀌었습니다. /codex_model을 다시 실행해 주세요."
+
+            async def _selected_reasoning(_reasoning_chat_id: str, effort: str) -> str:
+                if effort not in {"medium", "high", "xhigh"}:
+                    return "선택 항목이 만료됐습니다. /codex_model을 다시 실행해 주세요."
+                return await _apply(model, effort)
+
+            sent = await self._try_send_choice_picker(
+                event,
+                control_key,
+                f"🧠 *Codex 리즈닝 선택*\n\n모델: {choice[1]} · {choice[2]}",
+                [
+                    {
+                        "value": effort,
+                        "label": label,
+                        "is_current": binding.reasoning_effort == effort and binding.codex_model == model,
+                    }
+                    for effort, label in (("medium", "Medium"), ("high", "High"), ("xhigh", "XHigh"))
+                ],
+                _selected_reasoning,
+            )
+            if not sent:
+                return f"리즈닝 선택기를 보내지 못했습니다. /codex_model {choice[3]} xhigh처럼 입력해 주세요."
+            return f"{choice[1]} · {choice[2]} 선택됨. 아래에서 리즈닝을 선택해 주세요."
+
+        sent = await self._try_send_choice_picker(
+            event,
+            control_key,
+            "🤖 *Codex 모델 선택*\n\nS=Sol · T=Terra · L=Luna · A=Astra",
+            [
+                {"value": model, "label": short_label, "is_current": binding.codex_model == model}
+                for model, short_label, _name, _compact in _CODEX_MODEL_CHOICES
+            ],
+            _selected_model,
+        )
+        if sent:
+            return None
+        return "모델 선택기를 보내지 못했습니다. /codex_model 5.6s xhigh처럼 입력해 주세요."
 
     async def _handle_codex_session_command(self, event: MessageEvent) -> Optional[str]:
         if event.source.platform != Platform.TELEGRAM or event.source.chat_type != "dm":
@@ -770,12 +887,14 @@ class GatewayCodexBridgeMixin:
                 placeholder = f"pending_ns_{uuid.uuid4().hex}"
                 store.bind(
                     control_key, source, thread_id=placeholder, cwd=project.cwd, pending_new=True,
+                    codex_model=_NEW_CODEX_MODEL, reasoning_effort=_NEW_CODEX_REASONING,
                 )
                 if old is not None:
                     self._codex_bridge_forget_binding_runtime(old)
                     self._evict_cached_agent(self._codex_bridge_lane_key(source, old))
             return (
                 f"✅ 새 Codex 세션 준비됨: {project.name}\n"
+                "기본 설정: 5.6 S · Sol / XHigh\n"
                 "다음 일반 메시지가 새 세션의 첫 지시가 됩니다. 그 턴도 승인 없이 전체 액세스로 실행됩니다."
                 + (
                     "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
