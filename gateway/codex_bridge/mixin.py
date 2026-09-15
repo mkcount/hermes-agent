@@ -28,6 +28,7 @@ from gateway.codex_bridge.handoff import read_thread_handoff_graph, read_turn_ha
 from gateway.codex_bridge.rollout import (
     RolloutEvent,
     RolloutTail,
+    collect_active_commentary,
     find_terminal_for_client_id,
     inspect_rollout,
     resolve_rollout_path,
@@ -70,10 +71,27 @@ _CODEX_REASONING_ALIASES = {
 }
 _NEW_CODEX_MODEL = "gpt-5.6-sol"
 _NEW_CODEX_REASONING = "xhigh"
-_MIRROR_PROGRESS_MAX_SEGMENTS = 8
-# Leave ample room for Telegram's Markdown escaping while keeping one editable
-# message below its 4,096 UTF-16-unit ceiling.
+# Leave ample room for Telegram's Markdown escaping while keeping every replay
+# card below its 4,096 UTF-16-unit ceiling.
 _MIRROR_PROGRESS_MAX_CHARS = 1_800
+
+
+def _split_progress_text(value: str, max_units: int) -> list[str]:
+    """Split without dropping text, using Telegram's UTF-16 accounting."""
+    limit = max(1, int(max_units))
+    chunks: list[str] = []
+    current: list[str] = []
+    used = 0
+    for character in str(value or ""):
+        width = 2 if ord(character) > 0xFFFF else 1
+        if current and used + width > limit:
+            chunks.append("".join(current))
+            current, used = [], 0
+        current.append(character)
+        used += width
+    if current:
+        chunks.append("".join(current))
+    return chunks
 
 
 class GatewayCodexBridgeMixin:
@@ -585,6 +603,14 @@ class GatewayCodexBridgeMixin:
             snapshot = await asyncio.to_thread(
                 inspect_rollout, summary.thread_id, hinted_path=summary.rollout_path or None,
             )
+        replay_events = []
+        if snapshot is not None and snapshot.active_turn_id:
+            replay_events = await asyncio.to_thread(
+                collect_active_commentary,
+                summary.thread_id,
+                snapshot,
+                handoff_graph=read_thread_handoff_graph(summary.thread_id),
+            )
         async with self._codex_bridge_binding_lock(control_key):
             previous = store.get_binding(control_key)
             if summary is None:
@@ -605,13 +631,21 @@ class GatewayCodexBridgeMixin:
             )
             rotated = bool(previous is not None and previous.active and not unchanged)
             if unchanged:
-                binding = previous
+                if snapshot is not None:
+                    binding = store.restart_mirror(
+                        previous,
+                        rollout_path=snapshot.path,
+                        device=snapshot.device,
+                        inode=snapshot.inode,
+                        offset=snapshot.size,
+                    )
+                    if binding is None:
+                        raise RuntimeError("Codex binding changed while restarting its mirror")
+                    self._codex_bridge_forget_binding_runtime(previous)
+                else:
+                    binding = previous
             else:
-                cursor = (
-                    snapshot.active_start_offset
-                    if snapshot is not None and snapshot.active_start_offset is not None
-                    else snapshot.size if snapshot is not None else 0
-                )
+                cursor = snapshot.size if snapshot is not None else 0
                 binding = store.bind(
                     control_key, control_source, thread_id=summary.thread_id, cwd=summary.cwd,
                     rollout_path=snapshot.path if snapshot else summary.rollout_path or None,
@@ -622,15 +656,17 @@ class GatewayCodexBridgeMixin:
                 if previous is not None:
                     self._codex_bridge_forget_binding_runtime(previous)
                     self._evict_cached_agent(self._codex_bridge_lane_key(control_source, previous))
+            if replay_events:
+                self._codex_bridge_stage_commentary(store, binding, replay_events)
         answer = (
-            f"{'✅ 이미 연결된' if unchanged else '✅ Codex 세션 연결됨:'} {summary.title[:100]}\n"
+            f"{'🔄 Codex 세션 다시 연결됨:' if unchanged else '✅ Codex 세션 연결됨:'} {summary.title[:100]}\n"
             "이 채팅의 일반 메시지는 승인 요청 없이 전체 액세스로 같은 Codex 세션에 이어집니다. "
-            "데스크톱에서 시작한 진행 보고는 Telegram에 남는 메시지로 전달되고 새 보고 때 갱신되며, "
+            "데스크톱에서 시작한 진행 보고는 각각 Telegram의 새 메시지로 전달되며, "
             "최종 답변은 별도 메시지로 전달됩니다. "
             "데스크톱 작업이 쓰기 권한을 사용 중이면 Telegram 입력은 그 작업이 끝날 때까지 순서대로 기다립니다."
         )
         answer += (
-            "\n현재 Codex 턴이 진행 중이므로 이후 진행 보고부터 전달합니다."
+            f"\n현재 Codex 턴의 중간보고 {len(replay_events)}개를 아래에 처음부터 다시 전달합니다."
             if snapshot is not None and snapshot.active_turn_id
             else "\n현재 실행 중인 Codex 턴은 없습니다. 새 턴이 시작되기 전에는 추가 보고가 없습니다."
         )
@@ -641,7 +677,7 @@ class GatewayCodexBridgeMixin:
         )
         if rotated:
             answer += "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
-        if not unchanged and snapshot is not None and snapshot.latest_final_text:
+        if snapshot is not None and snapshot.latest_final_text:
             answer += f"\n\n🧾 마지막 답변\n\n{snapshot.latest_final_text}"
         logger.info("Bound Codex thread %s to %s generation=%s", summary.thread_id, control_key, binding.generation)
         return answer
@@ -1067,24 +1103,33 @@ class GatewayCodexBridgeMixin:
     @staticmethod
     def _codex_bridge_stage_commentary(
         store: CodexBridgeStore, binding: CodexBridgeBinding, events: list[RolloutEvent],
-    ) -> DurableCodexProgress:
-        """Commit commentary to the outbox before acknowledging rollout bytes."""
+    ) -> list[DurableCodexProgress]:
+        """Commit every commentary card before acknowledging rollout bytes."""
         if not events:
             raise ValueError("events are required")
-        event = events[-1]
-        return store.upsert_progress(
-            binding,
-            GatewayCodexBridgeMixin._codex_bridge_mirror_identity(event),
-            [candidate.text for candidate in events],
-            max_segments=_MIRROR_PROGRESS_MAX_SEGMENTS,
-            max_chars=_MIRROR_PROGRESS_MAX_CHARS,
-        )
+        progress_rows: list[DurableCodexProgress] = []
+        occurrences: dict[str, int] = {}
+        for event in events:
+            identity = GatewayCodexBridgeMixin._codex_bridge_mirror_identity(event)
+            occurrence = occurrences.get(event.event_id, 0) + 1
+            occurrences[event.event_id] = occurrence
+            for part_index, part in enumerate(
+                _split_progress_text(event.text, _MIRROR_PROGRESS_MAX_CHARS), 1,
+            ):
+                progress_rows.append(store.upsert_progress(
+                    binding,
+                    f"{identity}:commentary:{event.event_id}:{occurrence}:{part_index}",
+                    [part],
+                    max_segments=1,
+                    max_chars=_MIRROR_PROGRESS_MAX_CHARS,
+                ))
+        return progress_rows
 
     async def _codex_bridge_deliver_progress(
         self, store: CodexBridgeStore, binding: CodexBridgeBinding,
         progress: DurableCodexProgress, adapter: Any,
     ) -> None:
-        """Send once, then edit; failures stay pending in SQLite for restart recovery."""
+        """Deliver one durable progress card; legacy editable rows remain recoverable."""
         metadata = dict(self._thread_metadata_for_source(binding.source) or {})
         metadata["_interim_send"] = True
         try:
@@ -1286,21 +1331,22 @@ class GatewayCodexBridgeMixin:
                 return
             last: Optional[RolloutEvent] = None
             for grouped in pending_commentary.values():
-                progress = self._codex_bridge_stage_commentary(store, binding, grouped)
-                try:
-                    if progress.state == "pending":
-                        await self._codex_bridge_deliver_progress(
-                            store, binding, progress, adapter,
+                progress_rows = self._codex_bridge_stage_commentary(store, binding, grouped)
+                for progress in progress_rows:
+                    try:
+                        if progress.state == "pending":
+                            await self._codex_bridge_deliver_progress(
+                                store, binding, progress, adapter,
+                            )
+                    except Exception:
+                        # The outbox is committed already, so a transient failure
+                        # cannot erase progress even though the rollout cursor
+                        # advances to keep a durable final from starving.
+                        logger.warning(
+                            "Codex progress delivery failed for %s",
+                            binding.control_session_key,
+                            exc_info=True,
                         )
-                except Exception:
-                    # The outbox is committed already, so a transient failure
-                    # cannot erase progress even though the rollout cursor
-                    # advances to keep a durable final from starving.
-                    logger.warning(
-                        "Codex progress delivery failed for %s",
-                        binding.control_session_key,
-                        exc_info=True,
-                    )
                 if last is None or grouped[-1].offset > last.offset:
                     last = grouped[-1]
             pending_commentary.clear()

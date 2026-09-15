@@ -328,11 +328,15 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
     input_id, _, _ = store.enqueue_input(
         current, "lane", MessageEvent(text="continue", source=source, message_id="current-work"),
     )
+    old_progress = store.upsert_progress(current, "old-turn", ["old location"])
+    store.mark_progress_delivered(old_progress, "old-message")
     bridge = _Bridge(store)
     monkeypatch.setattr(
         "gateway.codex_bridge.mixin.inspect_rollout",
         lambda *_args, **_kwargs: SimpleNamespace(
-            active_turn_id=None, latest_final_text="must not repeat",
+            path="/rollout.jsonl", device=1, inode=2, size=99,
+            active_turn_id=None, active_start_offset=None,
+            latest_final_text="repeat this final",
         ),
     )
 
@@ -344,10 +348,65 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
         ),
     )
 
-    assert "이미 연결된" in answer
-    assert "must not repeat" not in answer
-    assert store.get_binding(build_session_key(source)).generation == current.generation
+    assert "다시 연결됨" in answer
+    assert "repeat this final" in answer
+    refreshed = store.get_binding(build_session_key(source))
+    assert refreshed.generation == current.generation
+    assert refreshed.cursor_offset == 99
+    assert store.list_progress(refreshed) == []
     assert store.input_state(input_id) == "routed"
+
+
+@pytest.mark.asyncio
+async def test_selecting_active_thread_replays_all_commentary_as_fresh_rows(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    current = store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    snapshot = SimpleNamespace(
+        path="/rollout.jsonl", device=1, inode=2, size=120,
+        active_turn_id="active-turn", active_start_offset=40,
+        latest_final_text="previous final",
+    )
+    repeated_id = "same-persisted-event"
+    commentary = [
+        RolloutEvent(
+            event_id=repeated_id, turn_id="active-turn", kind="commentary",
+            text="same report", offset=70,
+        ),
+        RolloutEvent(
+            event_id=repeated_id, turn_id="active-turn", kind="commentary",
+            text="same report", offset=70,
+        ),
+        RolloutEvent(
+            event_id="later-event", turn_id="active-turn", kind="commentary",
+            text="later report", offset=100,
+        ),
+    ]
+    monkeypatch.setattr("gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.collect_active_commentary",
+        lambda *_args, **_kwargs: commentary,
+    )
+
+    answer = await bridge._codex_bridge_store_binding(
+        source,
+        CodexThreadSummary(
+            thread_id="thread-123", title="Current", cwd="/project",
+            updated_at=1, status="active",
+        ),
+    )
+
+    refreshed = store.get_binding(build_session_key(source))
+    progress = store.list_progress(refreshed, pending_only=True)
+    assert "중간보고 3개" in answer
+    assert "previous final" in answer
+    assert refreshed.generation == current.generation
+    assert refreshed.cursor_offset == snapshot.size
+    assert len(progress) == 3
+    assert [row.segments for row in progress].count(("same report",)) == 2
+    assert [row.segments for row in progress].count(("later report",)) == 1
+    assert all(row.message_id is None for row in progress)
 
 
 @pytest.mark.asyncio
@@ -725,7 +784,7 @@ async def test_background_ledger_write_uses_binding_profile(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_progress_is_durable_across_restart_then_edits_one_persistent_message(
+async def test_progress_is_durable_across_restart_and_each_report_gets_a_new_message(
     tmp_path, monkeypatch,
 ):
     db_path = tmp_path / "state.db"
@@ -737,7 +796,7 @@ async def test_progress_is_durable_across_restart_then_edits_one_persistent_mess
             event_id=f"event-{index}", turn_id="turn-1", kind="commentary",
             text=f"progress {index}", offset=index,
         )
-        for index in range(3)
+        for index in range(10)
     ]
     failed_adapter = SimpleNamespace(
         supports_draft_streaming=lambda **_kwargs: True,
@@ -745,15 +804,17 @@ async def test_progress_is_durable_across_restart_then_edits_one_persistent_mess
         send=AsyncMock(return_value=SimpleNamespace(success=False, error="temporary")),
         edit_message=AsyncMock(),
     )
-    progress = bridge._codex_bridge_stage_commentary(store, binding, events)
+    progress_rows = bridge._codex_bridge_stage_commentary(store, binding, events)
 
     with pytest.raises(RuntimeError, match="temporary"):
-        await bridge._codex_bridge_deliver_progress(store, binding, progress, failed_adapter)
+        await bridge._codex_bridge_deliver_progress(
+            store, binding, progress_rows[0], failed_adapter,
+        )
 
     pending = store.list_progress(binding, pending_only=True)
-    assert len(pending) == 1
+    assert len(pending) == len(events)
     failed_adapter.send_draft.assert_not_awaited()
-    retry_at = pending[0].next_attempt_at + 1
+    retry_at = max(progress.next_attempt_at for progress in pending) + 1
     monkeypatch.setattr("gateway.codex_bridge.store.time.time", lambda: retry_at)
 
     restarted_store = CodexBridgeStore(db_path)
@@ -771,23 +832,26 @@ async def test_progress_is_durable_across_restart_then_edits_one_persistent_mess
         restarted_store, restarted_binding, adapter,
     )
 
-    adapter.send.assert_awaited_once()
-    sent_text = adapter.send.await_args.args[1]
+    assert adapter.send.await_count == len(events)
+    sent_text = "\n".join(call.args[1] for call in adapter.send.await_args_list)
     assert all(event.text in sent_text for event in events)
-    assert adapter.send.await_args.kwargs["metadata"]["_interim_send"] is True
+    assert all(
+        call.kwargs["metadata"]["_interim_send"] is True
+        for call in adapter.send.await_args_list
+    )
     adapter.send_draft.assert_not_awaited()
 
     update = RolloutEvent(
-        event_id="event-4", turn_id="turn-1", kind="commentary",
-        text="progress 4", offset=4,
+        event_id="event-new", turn_id="turn-1", kind="commentary",
+        text="progress new", offset=11,
     )
     revised = restarted_bridge._codex_bridge_stage_commentary(
         restarted_store, restarted_binding, [update],
     )
     await restarted_bridge._codex_bridge_deliver_progress(
-        restarted_store, restarted_binding, revised, adapter,
+        restarted_store, restarted_binding, revised[0], adapter,
     )
 
-    adapter.edit_message.assert_awaited_once()
-    assert adapter.edit_message.await_args.args[1] == "900"
-    assert "progress 4" in adapter.edit_message.await_args.args[2]
+    assert adapter.send.await_count == len(events) + 1
+    assert "progress new" in adapter.send.await_args.args[1]
+    adapter.edit_message.assert_not_awaited()

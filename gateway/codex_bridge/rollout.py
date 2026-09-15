@@ -244,7 +244,7 @@ class RolloutTail:
         except OSError:
             return
 
-    def scan(self) -> tuple[list[RolloutEvent], int, os.stat_result]:
+    def scan(self, *, end_offset: Optional[int] = None) -> tuple[list[RolloutEvent], int, os.stat_result]:
         stat = self.path.stat()
         if self.device is None or self.inode is None:
             self.device, self.inode = stat.st_dev, stat.st_ino
@@ -252,12 +252,13 @@ class RolloutTail:
             self._reset_for_replacement(stat)
         events: list[RolloutEvent] = []
         next_offset = self.offset
+        scan_end = stat.st_size if end_offset is None else min(stat.st_size, max(0, int(end_offset)))
         with self.path.open("rb") as handle:
             handle.seek(self.offset)
-            while True:
+            while handle.tell() < scan_end:
                 line_start = handle.tell()
                 raw = handle.readline()
-                if not raw or not raw.endswith(b"\n"):
+                if not raw or not raw.endswith(b"\n") or handle.tell() > scan_end:
                     break
                 try:
                     record = json.loads(raw.decode("utf-8"))
@@ -318,6 +319,7 @@ class RolloutTail:
         return self.turns.setdefault(turn_id, {
             "user_seen": False, "user_text": "", "client_id": None, "final": "", "start": None,
             "pending_commentary": [], "formal_continuation": False,
+            "correlation_complete": False,
         })
 
     def _expire_continuation(
@@ -371,7 +373,7 @@ class RolloutTail:
         # Some rollout versions attach clientUserMessageId in a later
         # item_completed record. Hold commentary until that correlation point
         # so a Telegram-originated turn cannot leak one duplicate frame.
-        if turn.get("client_id"):
+        if turn.get("client_id") or turn.get("correlation_complete"):
             self._emit(events, turn_id, "commentary", text, offset)
         else:
             turn.setdefault("pending_commentary", []).append(text)
@@ -471,6 +473,9 @@ class RolloutTail:
                     "client_id": inherited.get("client_id") if inherited else None,
                     "final": "", "start": line_start, "pending_commentary": [],
                     "formal_continuation": bool(inherited and managed),
+                    "correlation_complete": bool(
+                        inherited and inherited.get("correlation_complete")
+                    ),
                 }
             return
         turn_id = str(payload.get("turn_id") or self.active_turn_id or "").strip()
@@ -482,8 +487,12 @@ class RolloutTail:
             if isinstance(item, dict) and str(item.get("type") or "").replace("_", "").lower() == "usermessage":
                 if not turn.get("formal_continuation"):
                     turn["client_id"] = _client_id(item) or turn.get("client_id")
-                if turn.get("client_id"):
-                    self._flush_pending_commentary(events, turn_id, offset)
+                # This is the correlation boundary.  A Telegram-originated
+                # item has exposed its client id by now; a desktop-originated
+                # item legitimately has none and must become unmanaged instead
+                # of holding every commentary frame until task completion.
+                turn["correlation_complete"] = True
+                self._flush_pending_commentary(events, turn_id, offset)
             return
         if event_type == "user_message":
             text = str(payload.get("message") or "").strip()
@@ -552,6 +561,43 @@ def find_terminal_for_client_id(
             stalled = 0
             tail.offset = next_offset
     return terminal
+
+
+def collect_active_commentary(
+    thread_id: str, snapshot: RolloutSnapshot, *,
+    handoff_graph: Optional[CodexHandoffGraph] = None,
+) -> list[RolloutEvent]:
+    """Read every commentary frame already persisted for the active turn.
+
+    Binding replay is intentionally separate from live delivery ownership: a
+    user who explicitly selects a session asked to see its current transcript
+    again even when that turn originally came from this Telegram lane.
+    """
+    if snapshot.active_turn_id is None or snapshot.active_start_offset is None:
+        return []
+    path = Path(snapshot.path)
+    tail = RolloutTail(
+        thread_id, path,
+        device=snapshot.device, inode=snapshot.inode,
+        offset=snapshot.active_start_offset,
+        handoff_graph=handoff_graph,
+    )
+    collected: list[RolloutEvent] = []
+    while tail.offset < snapshot.size:
+        events, next_offset, _ = tail.scan(end_offset=snapshot.size)
+        collected.extend(
+            event for event in events
+            if event.turn_id == snapshot.active_turn_id and event.kind == "commentary"
+        )
+        if next_offset <= tail.offset:
+            break
+        tail.offset = next_offset
+
+    # Very old rollout formats can omit the user-item completion marker.  At
+    # an explicit replay boundary it is safe to expose those already-persisted
+    # frames as unmanaged desktop commentary.
+    tail._flush_pending_commentary(collected, snapshot.active_turn_id, snapshot.size)
+    return collected
 
 
 def inspect_rollout(

@@ -558,6 +558,42 @@ class CodexBridgeStore:
                 (time.time(), binding.control_session_key, binding.generation, logical_turn_id),
             )
 
+            family = f"{logical_turn_id}:commentary:"
+            conn.execute(
+                """UPDATE codex_bridge_progress
+                   SET state='finalized', next_attempt_at=0, updated_at=?
+                   WHERE control_session_key=? AND generation=?
+                     AND substr(logical_turn_id, 1, ?)=? AND state!='finalized'""",
+                (
+                    time.time(), binding.control_session_key, binding.generation,
+                    len(family), family,
+                ),
+            )
+
+    def restart_mirror(
+        self, binding: CodexBridgeBinding, *, rollout_path: str,
+        device: int, inode: int, offset: int,
+    ) -> Optional[CodexBridgeBinding]:
+        """Start a fresh presentation without rotating execution authority."""
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_bindings
+                   SET rollout_path=?, cursor_device=?, cursor_inode=?,
+                       cursor_offset=?, last_event_id=NULL, updated_at=?
+                   WHERE control_session_key=? AND generation=? AND thread_id=?""",
+                (
+                    rollout_path, int(device), int(inode), max(0, int(offset)), time.time(),
+                    binding.control_session_key, binding.generation, binding.thread_id,
+                ),
+            )
+            if cur.rowcount:
+                conn.execute(
+                    """DELETE FROM codex_bridge_progress
+                       WHERE control_session_key=? AND generation=?""",
+                    (binding.control_session_key, binding.generation),
+                )
+        return self.get_binding(binding.control_session_key) if cur.rowcount else None
+
     def bind(
         self, control_session_key: str, source: SessionSource, *, thread_id: str, cwd: str = "",
         rollout_path: Optional[str] = None, cursor_device: Optional[int] = None,
@@ -1327,6 +1363,11 @@ class CodexBridgeStore:
                 return "terminal", False
             if cleaned_turn == continuation_turn or cleaned_turn in continuation_chain:
                 return ("rollout" if delivery_owner == "rollout" else "terminal"), False
+            if continuation_chain:
+                # A formal ReloginTool handoff names the only physical turns
+                # allowed to inherit this input.  Unrelated later turns can
+                # carry stale provenance but must stay local to their owner.
+                return "terminal", False
             if turn_outcome not in {"interrupted", "unknown", "continuing"}:
                 return "terminal", False
             if delivery_owner in {"runner", "ledger"}:

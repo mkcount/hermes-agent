@@ -7,7 +7,12 @@ from pathlib import Path
 
 import gateway.codex_bridge.rollout as rollout_mod
 from gateway.codex_bridge.handoff import CodexHandoffGraph
-from gateway.codex_bridge.rollout import RolloutTail, inspect_rollout, resolve_rollout_path
+from gateway.codex_bridge.rollout import (
+    RolloutTail,
+    collect_active_commentary,
+    inspect_rollout,
+    resolve_rollout_path,
+)
 
 
 THREAD = "01a0896d-46b8-7422-9a9c-e16635c18eae"
@@ -95,6 +100,32 @@ def test_explicit_aborted_turn_continues_provenance_without_new_user_item(tmp_pa
         ("user", "do all fixes", None),
         ("commentary", "still working", "desktop-client"),
         ("final", "all done", "desktop-client"),
+    ]
+
+
+def test_desktop_commentary_becomes_unmanaged_at_user_item_boundary(tmp_path):
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    records = [
+        _meta(THREAD),
+        {"timestamp": "2026-09-10T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "active-turn"}},
+        {"timestamp": "2026-09-10T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "turn_id": "active-turn",
+                     "message": "desktop request"}},
+        {"timestamp": "2026-09-10T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "item_completed", "turn_id": "active-turn",
+                     "item": {"type": "UserMessage"}}},
+        {"timestamp": "2026-09-10T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "turn_id": "active-turn",
+                     "phase": "commentary", "message": "desktop progress"}},
+    ]
+    _write(path, records)
+
+    events, _, _ = RolloutTail(THREAD, path).scan()
+
+    assert [(event.kind, event.text, event.client_id) for event in events] == [
+        ("user", "desktop request", None),
+        ("commentary", "desktop progress", None),
     ]
 
 
@@ -397,3 +428,6 @@ def test_initial_inspection_streams_beyond_bootstrap_window(tmp_path, monkeypatc
     assert snapshot.latest_final_text == "last complete answer"
     assert snapshot.active_turn_id == "active-turn"
     assert snapshot.active_start_offset is not None
+    assert [event.text for event in collect_active_commentary(THREAD, snapshot)] == [
+        f"progress {index}" for index in range(20)
+    ]
