@@ -3917,13 +3917,25 @@ class TelegramAdapter(BasePlatformAdapter):
             "send_choice_picker", chat_id, metadata, build, thread_id=metadata.get("thread_id") if metadata else None,
             reply_to_mode=self._reply_to_mode)
 
-    async def _edit_result_text(self, query, result_text: str) -> None:
-        """Replace a picker message with ``result_text`` (MarkdownV2, then plain, then give up), keyboard removed."""
+    async def _edit_result_text(self, query, result_text: str) -> bool:
+        """Replace a picker message with ``result_text`` and report whether either edit succeeded."""
         try:
             await query.edit_message_text(text=self.format_message(result_text), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
-        except Exception:
-            with contextlib.suppress(Exception):
+            return True
+        except Exception as markdown_error:
+            logger.debug(
+                "[%s] Choice picker MarkdownV2 edit failed, falling back to plain text: %s",
+                self.name, _redact_telegram_error_text(markdown_error),
+            )
+            try:
                 await query.edit_message_text(text=result_text, parse_mode=None, reply_markup=None)
+                return True
+            except Exception as plain_error:
+                logger.warning(
+                    "[%s] Choice picker result edit failed: %s",
+                    self.name, _redact_telegram_error_text(plain_error),
+                )
+                return False
 
     async def _handle_choice_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle choice picker button taps (cp:<index>)."""
@@ -3956,7 +3968,29 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("Choice picker selection failed: %s", _redact_telegram_error_text(exc), exc_info=True)
             result_text = "선택을 적용하지 못했습니다. 명령을 다시 실행해 주세요."
-        await self._edit_result_text(query, result_text)
+        overflow = utf16_len(result_text) > self.MAX_MESSAGE_LENGTH
+        edit_text = (
+            "✅ Selection applied. The detailed result follows below."
+            if overflow else result_text
+        )
+        edited = await self._edit_result_text(query, edit_text)
+        if overflow or not edited:
+            message = getattr(query, "message", None)
+            message_thread_id = getattr(message, "message_thread_id", None)
+            metadata = (
+                {"thread_id": str(message_thread_id)}
+                if message_thread_id is not None else None
+            )
+            sent = await self.send(chat_id, result_text, metadata=metadata)
+            if not sent.success:
+                warning = (
+                    "Selection was applied, but the detailed result could not be delivered. "
+                    "Run the command again."
+                )
+                if edited:
+                    await self._edit_result_text(query, f"⚠️ {warning}")
+                await query.answer(text=warning[:200])
+                return
         await query.answer()
 
     _MODEL_PAGE_SIZE = 8

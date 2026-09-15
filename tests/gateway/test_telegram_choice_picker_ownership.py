@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.platforms.base import SendResult, utf16_len
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -15,7 +16,8 @@ def _adapter():
     adapter._choice_picker_state = {}
     adapter._callback_authorized = AsyncMock(return_value=True)
     adapter._callback_ctx = lambda _query: None
-    adapter._edit_result_text = AsyncMock()
+    adapter._edit_result_text = AsyncMock(return_value=True)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="11"))
     return adapter
 
 
@@ -88,3 +90,49 @@ async def test_simultaneous_taps_crossing_authorization_apply_once():
     )
 
     callback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_long_picker_result_is_acknowledged_and_sent_via_chunking_path():
+    adapter = _adapter()
+    result_text = "x" * (adapter.MAX_MESSAGE_LENGTH + 1)
+    callback = AsyncMock(return_value=result_text)
+    adapter._choice_picker_state["chat:10"] = {
+        "choices": [{"value": "a"}],
+        "on_choice_selected": callback,
+        "expires_at": time.monotonic() + 60,
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=10, message_thread_id=77),
+        answer=AsyncMock(),
+    )
+
+    await adapter._handle_choice_picker_callback(query, "cp:0", "chat")
+
+    edited_text = adapter._edit_result_text.await_args.args[1]
+    assert utf16_len(edited_text) <= adapter.MAX_MESSAGE_LENGTH
+    adapter.send.assert_awaited_once_with(
+        "chat", result_text, metadata={"thread_id": "77"},
+    )
+    query.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_failed_picker_edit_falls_back_to_a_new_message():
+    adapter = _adapter()
+    adapter._edit_result_text.return_value = False
+    callback = AsyncMock(return_value="selected")
+    adapter._choice_picker_state["chat:10"] = {
+        "choices": [{"value": "a"}],
+        "on_choice_selected": callback,
+        "expires_at": time.monotonic() + 60,
+    }
+    query = SimpleNamespace(
+        message=SimpleNamespace(message_id=10, message_thread_id=None),
+        answer=AsyncMock(),
+    )
+
+    await adapter._handle_choice_picker_callback(query, "cp:0", "chat")
+
+    adapter.send.assert_awaited_once_with("chat", "selected", metadata=None)
+    query.answer.assert_awaited_once_with()
