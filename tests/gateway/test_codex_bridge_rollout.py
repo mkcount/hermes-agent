@@ -348,6 +348,24 @@ def test_inspect_reports_active_continuation_start(tmp_path):
     assert snapshot.active_start_offset is not None
 
 
+def test_inspect_reports_latest_turn_model_and_reasoning(tmp_path):
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    records = [
+        _meta(THREAD),
+        {"timestamp": "2026-09-10T00:00:01Z", "type": "turn_context",
+         "payload": {"model": "gpt-5.6-terra", "effort": "medium"}},
+        {"timestamp": "2026-09-10T00:00:02Z", "type": "turn_context",
+         "payload": {"model": "gpt-6-astra", "effort": "xhigh"}},
+    ]
+    _write(path, records)
+
+    snapshot = inspect_rollout(THREAD, hinted_path=str(path), codex_home=str(tmp_path))
+
+    assert snapshot is not None
+    assert snapshot.latest_model == "gpt-6-astra"
+    assert snapshot.latest_reasoning_effort == "xhigh"
+
+
 def test_initial_inspection_streams_beyond_bootstrap_window(tmp_path, monkeypatch):
     path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
     records = [

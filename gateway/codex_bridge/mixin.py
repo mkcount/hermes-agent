@@ -714,6 +714,18 @@ class GatewayCodexBridgeMixin:
     def _codex_model_choice(model: str) -> Optional[tuple[str, str, str, str]]:
         return next((choice for choice in _CODEX_MODEL_CHOICES if choice[0] == model), None)
 
+    @classmethod
+    def _codex_inference_label(cls, model: Optional[str], effort: Optional[str]) -> str:
+        choice = cls._codex_model_choice(str(model or ""))
+        model_label = f"{choice[1]} · {choice[2]}" if choice else str(model or "").strip()
+        effort_value = str(effort or "").strip().lower()
+        effort_label = {"medium": "Medium", "high": "High", "xhigh": "XHigh"}.get(
+            effort_value, effort_value
+        )
+        if model_label and effort_label:
+            return f"{model_label} / {effort_label}"
+        return model_label or effort_label or "확인할 수 없음"
+
     async def _handle_codex_model_command(self, event: MessageEvent) -> Optional[str]:
         """Set the model and reasoning pair used by the selected Telegram Codex binding."""
         if event.source.platform != Platform.TELEGRAM or event.source.chat_type != "dm":
@@ -725,6 +737,31 @@ class GatewayCodexBridgeMixin:
         binding = store.get_binding(control_key)
         if binding is None or not binding.active:
             return "먼저 /codex_session으로 세션을 연결하거나 /ns로 새 세션을 준비해 주세요."
+
+        inherited_model = inherited_effort = None
+        if not binding.codex_model or not binding.reasoning_effort:
+            try:
+                snapshot = await asyncio.to_thread(
+                    inspect_rollout, binding.thread_id, hinted_path=binding.rollout_path,
+                )
+            except Exception:
+                logger.warning("Codex rollout inference inspection failed", exc_info=True)
+                snapshot = None
+            if snapshot is not None:
+                inherited_model = getattr(snapshot, "latest_model", None)
+                inherited_effort = getattr(snapshot, "latest_reasoning_effort", None)
+        current_model = binding.codex_model or inherited_model
+        current_effort = binding.reasoning_effort or inherited_effort
+        setting_source = (
+            "텔레그램 지정"
+            if binding.codex_model and binding.reasoning_effort
+            else "데스크톱 세션 계승"
+        )
+        current_label = self._codex_inference_label(current_model, current_effort)
+        if not current_model and not current_effort:
+            current_label = "데스크톱 세션 설정 계승"
+        else:
+            current_label = f"{current_label} ({setting_source})"
 
         def _binding_is_current() -> bool:
             current = store.get_binding(control_key)
@@ -776,12 +813,16 @@ class GatewayCodexBridgeMixin:
             sent = await self._try_send_choice_picker(
                 event,
                 control_key,
-                f"🧠 *Codex 리즈닝 선택*\n\n모델: {choice[1]} · {choice[2]}",
+                (
+                    "🧠 *Codex 리즈닝 선택*\n\n"
+                    f"현재 설정: *{current_label}*\n"
+                    f"새 모델: *{choice[1]} · {choice[2]}*"
+                ),
                 [
                     {
                         "value": effort,
                         "label": label,
-                        "is_current": binding.reasoning_effort == effort and binding.codex_model == model,
+                        "is_current": current_effort == effort and current_model == model,
                     }
                     for effort, label in (("medium", "Medium"), ("high", "High"), ("xhigh", "XHigh"))
                 ],
@@ -794,9 +835,13 @@ class GatewayCodexBridgeMixin:
         sent = await self._try_send_choice_picker(
             event,
             control_key,
-            "🤖 *Codex 모델 선택*\n\nS=Sol · T=Terra · L=Luna · A=Astra",
+            (
+                "🤖 *Codex 모델 선택*\n\n"
+                f"현재 설정: *{current_label}*\n"
+                "S=Sol · T=Terra · L=Luna · A=Astra"
+            ),
             [
-                {"value": model, "label": short_label, "is_current": binding.codex_model == model}
+                {"value": model, "label": short_label, "is_current": current_model == model}
                 for model, short_label, _name, _compact in _CODEX_MODEL_CHOICES
             ],
             _selected_model,

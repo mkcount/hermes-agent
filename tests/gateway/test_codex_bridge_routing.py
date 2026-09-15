@@ -171,6 +171,7 @@ async def test_codex_model_picker_commits_model_and_reasoning_together(tmp_path)
     assert [choice["label"] for choice in pickers[0]["choices"]] == [
         "5.6 S", "5.6 T", "5.6 L", "6.0 A",
     ]
+    assert "현재 설정: *5.6 S · Sol / XHigh (텔레그램 지정)*" in pickers[0]["title"]
     first_result = await pickers[0]["callback"]("1001", "gpt-5.6-terra")
     assert "5.6 T" in first_result
     # Model selection alone is not a partial commit.
@@ -178,12 +179,49 @@ async def test_codex_model_picker_commits_model_and_reasoning_together(tmp_path)
     assert [choice["value"] for choice in pickers[1]["choices"]] == [
         "medium", "high", "xhigh",
     ]
+    assert "현재 설정: *5.6 S · Sol / XHigh (텔레그램 지정)*" in pickers[1]["title"]
+    assert "새 모델: *5.6 T · Terra*" in pickers[1]["title"]
 
     final_result = await pickers[1]["callback"]("1001", "high")
     updated = store.get_binding(binding.control_session_key)
     assert "Codex 설정 완료" in final_result
     assert updated.codex_model == "gpt-5.6-terra"
     assert updated.reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_codex_model_picker_shows_inherited_desktop_settings(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    pickers = []
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.inspect_rollout",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            latest_model="gpt-5.6-sol", latest_reasoning_effort="xhigh",
+        ),
+    )
+
+    async def _send_picker(_event, _session_key, title, choices, callback):
+        pickers.append({"title": title, "choices": choices, "callback": callback})
+        return True
+
+    bridge._try_send_choice_picker = _send_picker
+    answer = await bridge._handle_codex_model_command(
+        MessageEvent(text="/codex_model", source=source, message_id="model-inherited"),
+    )
+
+    assert answer is None
+    assert "현재 설정: *5.6 S · Sol / XHigh (데스크톱 세션 계승)*" in pickers[0]["title"]
+    assert next(
+        choice for choice in pickers[0]["choices"] if choice["value"] == "gpt-5.6-sol"
+    )["is_current"] is True
+
+    await pickers[0]["callback"]("1001", "gpt-5.6-sol")
+    assert next(
+        choice for choice in pickers[1]["choices"] if choice["value"] == "xhigh"
+    )["is_current"] is True
 
 
 @pytest.mark.asyncio

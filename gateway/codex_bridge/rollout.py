@@ -46,6 +46,8 @@ class RolloutSnapshot:
     active_turn_id: Optional[str]
     active_start_offset: Optional[int]
     latest_final_text: str = ""
+    latest_model: Optional[str] = None
+    latest_reasoning_effort: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +180,8 @@ class RolloutTail:
         self.active_start_offset: Optional[int] = None
         self.turns: dict[str, dict[str, Any]] = {}
         self.latest_final_text = ""
+        self.latest_model: Optional[str] = None
+        self.latest_reasoning_effort: Optional[str] = None
         self._continuation_seed: Optional[_ContinuationSeed] = None
         self._handoff_graph = handoff_graph or CodexHandoffGraph({}, {})
         self._bad_line: Optional[tuple[int, str]] = None
@@ -194,6 +198,8 @@ class RolloutTail:
         self.active_turn_id = self.active_start_offset = None
         self.turns.clear()
         self.latest_final_text = ""
+        self.latest_model = None
+        self.latest_reasoning_effort = None
         self._continuation_seed = None
         self._prime(self.offset)
 
@@ -216,6 +222,8 @@ class RolloutTail:
         self.active_turn_id = self.active_start_offset = None
         self.turns.clear()
         self.latest_final_text = ""
+        self.latest_model = None
+        self.latest_reasoning_effort = None
         self._continuation_seed = None
         self._prime_range(0, end)
 
@@ -394,6 +402,16 @@ class RolloutTail:
         if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
             return
         payload = record["payload"]
+        if record.get("type") == "turn_context":
+            model = str(payload.get("model") or "").strip()
+            effort = str(
+                payload.get("effort") or payload.get("reasoning_effort") or ""
+            ).strip().lower()
+            if model:
+                self.latest_model = model
+            if effort:
+                self.latest_reasoning_effort = effort
+            return
         if record.get("type") == "response_item" and payload.get("type") == "message":
             turn_id = self._turn_id_for_item(payload)
             if not turn_id:
@@ -552,4 +570,6 @@ def inspect_rollout(
         path=str(path), device=stat.st_dev, inode=stat.st_ino, size=stat.st_size,
         active_turn_id=tail.active_turn_id, active_start_offset=tail.active_start_offset,
         latest_final_text=tail.latest_final_text,
+        latest_model=tail.latest_model,
+        latest_reasoning_effort=tail.latest_reasoning_effort,
     )
