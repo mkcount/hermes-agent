@@ -1278,6 +1278,12 @@ class GatewayInboundMixin:
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
+                # This message was explicitly rejected and must not be returned to the durable
+                # watcher as retryable work by the outer finally block.  Otherwise the watcher
+                # repeats the same warning forever while the conflicting turn holds its lease.
+                self._codex_bridge_cancel_input(
+                    event, "turn lease timeout; message was not processed",
+                )
                 return (
                     "⏳ Another turn is still running on this session. To "
                     "protect the transcript, this message was not processed. "

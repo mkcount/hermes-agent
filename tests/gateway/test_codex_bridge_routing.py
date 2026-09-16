@@ -41,7 +41,10 @@ class _Bridge(GatewayCodexBridgeMixin):
         self.store = store
         self.profile_home = profile_home
         self.session_store = _SessionStore()
-        self.async_session_store = SimpleNamespace(get_or_create_session=AsyncMock())
+        self.async_session_store = SimpleNamespace(
+            get_or_create_session=AsyncMock(),
+            get_or_create_isolated_session=AsyncMock(),
+        )
         self._codex_bridge_binding_locks = {}
         self._codex_bridge_tails = {}
 
@@ -67,6 +70,10 @@ class _Bridge(GatewayCodexBridgeMixin):
     def _evict_cached_agent(_session_key):
         return None
 
+    @staticmethod
+    def _is_session_running(_session_key):
+        return False
+
 
 def _source():
     return SessionSource(
@@ -88,6 +95,29 @@ async def test_bound_message_is_persisted_but_not_executable_before_runner_gates
     assert routed.metadata["codex_bridge_thread_id"] == "thread-123"
     assert store.input_state(routed.metadata["codex_bridge_input_id"]) == "routed"
     assert build_session_key(routed.source) != build_session_key(source)
+    bridge.async_session_store.get_or_create_isolated_session.assert_awaited_once_with(
+        routed.source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_route_rejection_cannot_be_released_for_retry(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="continue", source=source, message_id="lease-timeout"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.input_state(input_id) == "executing"
+
+    bridge._codex_bridge_cancel_input(routed, "turn lease timeout")
+    bridge._codex_bridge_release_input(routed, "outer finally")
+
+    assert store.input_state(input_id) == "cancelled"
+    assert store.recoverable_inputs() == []
 
 
 @pytest.mark.asyncio
@@ -355,6 +385,45 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
     assert refreshed.cursor_offset == 99
     assert store.list_progress(refreshed) == []
     assert store.input_state(input_id) == "routed"
+
+
+@pytest.mark.asyncio
+async def test_selecting_another_thread_interrupts_the_running_previous_lane(
+    tmp_path, monkeypatch,
+):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    previous = store.bind(
+        build_session_key(source), source, thread_id="thread-old", cwd="/old-project",
+    )
+    input_id, _, _ = store.enqueue_input(
+        previous, "old-lane", MessageEvent(text="keep working", source=source, message_id="old"),
+    )
+    assert store.mark_executing(input_id)
+    bridge = _Bridge(store)
+    previous_lane_key = bridge._codex_bridge_lane_key(source, previous)
+    bridge._is_session_running = lambda key: key == previous_lane_key
+    bridge._interrupt_and_clear_session = AsyncMock()
+    monkeypatch.setattr("gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: None)
+
+    answer = await bridge._codex_bridge_store_binding(
+        source,
+        CodexThreadSummary(
+            thread_id="thread-new", title="New target", cwd="/new-project",
+            updated_at=2, status="idle",
+        ),
+    )
+
+    assert "이전 연결" in answer
+    assert store.input_state(input_id) == "cancelled"
+    bridge._interrupt_and_clear_session.assert_awaited_once()
+    call = bridge._interrupt_and_clear_session.await_args
+    assert call.args[0] == previous_lane_key
+    assert call.args[1].trusted_local_lane.endswith(f":{previous.generation}")
+    assert call.kwargs == {
+        "interrupt_reason": "Stop requested",
+        "invalidation_reason": "codex_binding_changed",
+    }
 
 
 @pytest.mark.asyncio

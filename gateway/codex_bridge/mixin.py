@@ -304,6 +304,9 @@ class GatewayCodexBridgeMixin:
             control_source,
             trusted_local_lane=f"codex-binding:{control_key}:{binding.generation}",
         )
+        # Establish the exact lane before journaling the input.  This also repairs mappings made
+        # by older builds where peer recovery aliased two Codex bindings to one transcript.
+        await self.async_session_store.get_or_create_isolated_session(lane_source)
         lane_key = adapter._event_session_key(dataclasses.replace(event, source=lane_source))
         # A stale generic marker must not prepend restart-recovery text to an
         # explicit Telegram input that is already journaled by this bridge.
@@ -581,7 +584,7 @@ class GatewayCodexBridgeMixin:
     def _codex_bridge_cancel_input(self, event: MessageEvent, error: str = "") -> None:
         input_id = str((event.metadata or {}).get(_INPUT_KEY) or "").strip()
         if input_id:
-            self._codex_bridge_store_for_source(event.source).cancel_input(input_id, error)
+            self._codex_bridge_store_for_source(event.source).cancel_active_input(input_id, error)
 
     def _codex_bridge_cancel_lane(self, lane_key: str, source: SessionSource) -> int:
         return self._codex_bridge_store_for_source(source).cancel_lane(lane_key)
@@ -611,6 +614,7 @@ class GatewayCodexBridgeMixin:
                 snapshot,
                 handoff_graph=read_thread_handoff_graph(summary.thread_id),
             )
+        previous_lane = None
         async with self._codex_bridge_binding_lock(control_key):
             previous = store.get_binding(control_key)
             if summary is None:
@@ -655,9 +659,30 @@ class GatewayCodexBridgeMixin:
                 )
                 if previous is not None:
                     self._codex_bridge_forget_binding_runtime(previous)
-                    self._evict_cached_agent(self._codex_bridge_lane_key(control_source, previous))
+                    previous_lane_source = dataclasses.replace(
+                        control_source,
+                        trusted_local_lane=(
+                            f"codex-binding:{previous.control_session_key}:{previous.generation}"
+                        ),
+                    )
+                    previous_lane = (
+                        self._session_key_for_source(previous_lane_source), previous_lane_source,
+                    )
             if replay_events:
                 self._codex_bridge_stage_commentary(store, binding, replay_events)
+        if previous_lane is not None:
+            previous_lane_key, previous_lane_source = previous_lane
+            if self._is_session_running(previous_lane_key):
+                from gateway.run import _INTERRUPT_REASON_STOP
+
+                await self._interrupt_and_clear_session(
+                    previous_lane_key,
+                    previous_lane_source,
+                    interrupt_reason=_INTERRUPT_REASON_STOP,
+                    invalidation_reason="codex_binding_changed",
+                )
+            else:
+                self._evict_cached_agent(previous_lane_key)
         answer = (
             f"{'🔄 Codex 세션 다시 연결됨:' if unchanged else '✅ Codex 세션 연결됨:'} {summary.title[:100]}\n"
             "이 채팅의 일반 메시지는 승인 요청 없이 전체 액세스로 같은 Codex 세션에 이어집니다. "

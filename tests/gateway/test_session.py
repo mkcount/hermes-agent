@@ -555,6 +555,41 @@ class TestSessionStoreSwitchSession:
         db.close()
 
 
+class TestTrustedLaneIsolation:
+    def test_trusted_lane_skips_peer_recovery_and_heals_a_legacy_alias(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="telegram-chat",
+            chat_type="dm",
+            user_id="telegram-user",
+        )
+        ordinary = store.get_or_create_session(source)
+        lane_source = replace(source, trusted_local_lane="codex-binding:control:7")
+
+        # A missing exact lane must create its own transcript, even though a recoverable peer row
+        # exists for the same Telegram user/chat.
+        lane = store.get_or_create_session(lane_source)
+        assert lane.session_id != ordinary.session_id
+
+        # Reproduce the persisted shape made by older builds, then verify the bridge-facing
+        # accessor self-heals only this lane without moving the ordinary route.
+        with store._lock:
+            store._entries[lane.session_key].session_id = ordinary.session_id
+        isolated = store.get_or_create_isolated_session(lane_source)
+
+        assert isolated.session_id != ordinary.session_id
+        assert store.lookup_by_session_key(ordinary.session_key).session_id == ordinary.session_id
+        assert store.lookup_by_session_key(lane.session_key).session_id == isolated.session_id
+        db.close()
+
+
 class TestSessionStoreLookup:
     @pytest.fixture()
     def store(self, tmp_path):
@@ -1668,4 +1703,3 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-

@@ -213,8 +213,10 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
+    event = _event()
+    runner._codex_bridge_cancel_input = MagicMock()
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+        response = await asyncio.wait_for(runner._handle_message(event), timeout=1)
     finally:
         assert runner._turn_leases.release(holder) is True
 
@@ -224,6 +226,9 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner.session_store.load_transcript.assert_not_called()
     runner._clear_session_env.assert_called_once_with(session_env_tokens)
     runner._post_turn_goal_continuation.assert_not_awaited()
+    runner._codex_bridge_cancel_input.assert_called_once_with(
+        event, "turn lease timeout; message was not processed",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -492,5 +497,4 @@ def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
         assert runner._release_turn_lease("", 1) is False
 
     _run(scenario())
-
 

@@ -886,6 +886,59 @@ class SessionStore(
             with inflight_lock:
                 self._inflight_sessions.pop(session_key, None)
 
+    def get_or_create_isolated_session(
+        self, source: SessionSource, touch_activity: bool = True,
+    ) -> SessionEntry:
+        """Return a session that is private to one trusted execution lane.
+
+        Older gateway builds could recover a missing trusted lane through the generic peer
+        fallback, leaving two routing keys mapped to one transcript.  Besides preventing that
+        recovery above, heal already-persisted collisions before the lane accepts another turn.
+        A running lane is left untouched so an in-flight transcript cannot be moved underneath it.
+        """
+        entry = self.get_or_create_session(source, touch_activity=touch_activity)
+        if not source.trusted_local_lane:
+            return entry
+
+        session_key = entry.session_key
+        with self._lock:
+            self._ensure_loaded_locked()
+            aliases = [
+                key for key, candidate in self._entries.items()
+                if key != session_key and candidate.session_id == entry.session_id
+            ]
+
+        durable_owner = ""
+        try:
+            db = self._db_for_key(session_key)
+            row = db.get_session(entry.session_id) if db else None
+            durable_owner = str((row or {}).get("session_key") or "")
+        except Exception:
+            logger.debug(
+                "Failed to inspect durable owner for trusted lane %s", session_key,
+                exc_info=True,
+            )
+
+        if not aliases and durable_owner in {"", session_key}:
+            return entry
+        if self._has_active_processes_safe(session_key, context="trusted lane isolation"):
+            logger.warning(
+                "Trusted lane %s still shares transcript %s but is active; deferring isolation",
+                session_key, entry.session_id,
+            )
+            return entry
+
+        logger.warning(
+            "Trusted lane %s shares transcript %s with aliases=%s durable_owner=%s; "
+            "creating an isolated transcript",
+            session_key, entry.session_id, aliases, durable_owner or "<unknown>",
+        )
+        # Deliberately do not end the shared predecessor: another routing key may still own and
+        # actively use it.  force_new only replaces this lane's mapping.
+        return self.get_or_create_session(
+            source, force_new=True, touch_activity=touch_activity,
+        )
+
     def _get_or_create_session_impl(
         self, source: SessionSource, force_new: bool = False, touch_activity: bool = True,
     ) -> SessionEntry:
