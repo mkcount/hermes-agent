@@ -37,6 +37,19 @@ def find_codex_control_socket(codex_home: Optional[str] = None) -> Optional[str]
         return None
 
 
+def codex_control_socket_identity(path: Optional[str]) -> Optional[tuple[int, int, int]]:
+    """Return an incarnation marker for a live desktop control socket."""
+    if not path:
+        return None
+    try:
+        socket_stat = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(socket_stat.st_mode):
+        return None
+    return socket_stat.st_dev, socket_stat.st_ino, socket_stat.st_ctime_ns
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -47,6 +60,10 @@ class CodexAppServerError(RuntimeError):
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return f"codex app-server error {self.code}: {self.message}"
+
+
+class CodexAppServerWriteError(RuntimeError):
+    """The complete JSON-RPC frame was not admitted to the transport."""
 
 
 @dataclass(frozen=True)
@@ -296,7 +313,8 @@ class CodexAppServerClient:
                     self._proc.stdin.write((payload + "\n").encode("utf-8"))
                     self._proc.stdin.flush()
         except Exception as exc:
-            error = RuntimeError(f"codex app-server stdin closed unexpectedly: {exc}")
+            error_type = CodexAppServerWriteError if self._websocket is not None else RuntimeError
+            error = error_type(f"codex app-server stdin closed unexpectedly: {exc}")
             self._fatal_reader_failure(str(error))
             raise error from exc
 

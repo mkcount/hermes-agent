@@ -23,6 +23,8 @@ from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
+    CodexAppServerWriteError,
+    codex_control_socket_identity,
     find_codex_control_socket,
 )
 from agent.transports.codex_event_projector import CodexEventProjector, ProjectionResult
@@ -61,6 +63,9 @@ class TurnResult:
     compacted: bool = False
     # Codex likely wedged (turn timeout, watchdog, token refresh failure): caller respawns next turn.
     should_retire: bool = False
+    # A turn/start frame that failed before the transport accepted it is safe
+    # for the durable gateway queue to replay on a fresh connection.
+    submission_not_admitted: bool = False
     turn_status: str = "unknown"
     turn_status_confirmed: bool = False
 
@@ -203,6 +208,8 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._using_desktop_control = False
+        self._desktop_control_socket_path: Optional[str] = None
+        self._desktop_control_socket_identity: Optional[tuple[int, int, int]] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
@@ -256,10 +263,67 @@ class CodexAppServerSession:
             raise
         return client
 
+    def _connect_client(self, control_socket: Optional[str] = None) -> None:
+        self._client = self._open_client(control_socket)
+        self._using_desktop_control = bool(control_socket)
+        self._desktop_control_socket_path = control_socket
+        self._desktop_control_socket_identity = codex_control_socket_identity(control_socket)
+
+    def _discard_client_for_reconnect(self) -> None:
+        """Drop one transport connection without closing the logical session."""
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                self._client.close()
+        self._client = None
+        self._thread_id = None
+        self._resumed_active_turn_id = None
+        self._using_desktop_control = False
+        self._desktop_control_socket_path = None
+        self._desktop_control_socket_identity = None
+
+    def _cached_desktop_thread(self) -> Optional[str]:
+        """Validate a cached desktop proxy before crossing the submission fence."""
+        if self._thread_id is None or not self._using_desktop_control:
+            return self._thread_id
+        current_socket = find_codex_control_socket(self._codex_home)
+        current_identity = codex_control_socket_identity(current_socket)
+        incarnation_changed = (
+            current_socket != self._desktop_control_socket_path
+            or (
+                self._desktop_control_socket_identity is not None
+                and current_identity != self._desktop_control_socket_identity
+            )
+        )
+        try:
+            if incarnation_changed:
+                raise RuntimeError("Codex desktop control socket was replaced")
+            if self._client is None:
+                raise RuntimeError("Codex desktop control client is missing")
+            state = self._client.request(
+                "thread/read",
+                {"threadId": self._thread_id, "includeTurns": False},
+                timeout=5,
+            )
+        except (CodexAppServerError, TimeoutError, RuntimeError, OSError) as exc:
+            logger.info(
+                "Codex desktop control connection changed; reconnecting before turn/start: %s",
+                exc,
+            )
+            self._discard_client_for_reconnect()
+            return None
+        thread_state = state.get("thread") or state
+        if self._resume_active_turn_mode == "queue":
+            self._resumed_active_turn_id = (
+                self._in_progress_turn_id(thread_state)
+                or ("desktop-writer" if self._thread_is_active(thread_state) else None)
+            )
+        return self._thread_id
+
     def ensure_started(self) -> str:
         """Spawn, handshake, then start or resume a thread; idempotent."""
-        if self._thread_id is not None:
-            return self._thread_id
+        cached_thread_id = self._cached_desktop_thread()
+        if cached_thread_id is not None:
+            return cached_thread_id
         if (
             self._resume_thread_id
             and self._resume_active_turn_mode == "queue"
@@ -272,8 +336,7 @@ class CodexAppServerSession:
                 if self._prefer_desktop_control_socket and self._resume_thread_id else None
             )
             try:
-                self._client = self._open_client(control_socket)
-                self._using_desktop_control = bool(control_socket)
+                self._connect_client(control_socket)
             except Exception:
                 if not control_socket:
                     raise
@@ -281,11 +344,8 @@ class CodexAppServerSession:
                     "Codex desktop control unavailable; falling back to an isolated app-server",
                     exc_info=True,
                 )
-                if self._client is not None:
-                    with contextlib.suppress(Exception):
-                        self._client.close()
-                self._client = self._open_client()
-                self._using_desktop_control = False
+                self._discard_client_for_reconnect()
+                self._connect_client()
         if self._resume_thread_id:
             method, params = "thread/resume", {"threadId": self._resume_thread_id}
         else:
@@ -345,11 +405,11 @@ class CodexAppServerSession:
                 # newly subscribed client immediately, then observe from a
                 # fresh unresumed connection so its notifications/approvals
                 # remain exclusively with the desktop owner.
-                self._client.close()
+                self._discard_client_for_reconnect()
                 control_socket = find_codex_control_socket(self._codex_home)
                 if not control_socket:
                     raise RuntimeError("Codex desktop control disappeared while waiting for its active turn")
-                self._client = self._open_client(control_socket)
+                self._connect_client(control_socket)
                 self._thread_id = self._resume_thread_id
                 wait_error = self._wait_for_resumed_turn_boundary(
                     raced_turn_id, timeout=None, poll_timeout=0.25,
@@ -391,6 +451,8 @@ class CodexAppServerSession:
         self._thread_id = None
         self._resumed_active_turn_id = None
         self._using_desktop_control = False
+        self._desktop_control_socket_path = None
+        self._desktop_control_socket_identity = None
 
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to issue turn/interrupt and unwind."""
@@ -478,6 +540,10 @@ class CodexAppServerSession:
         except TimeoutError as exc:
             hint = _classify_oauth_failure(self._stderr_blob(40))
             self._retire(result, hint or self._format_error_with_stderr(f"{label} timed out", exc))
+        except CodexAppServerWriteError as exc:
+            if method == "turn/start":
+                result.submission_not_admitted = True
+            self._retire(result, self._format_error_with_stderr(f"{label} transport failed", exc))
         except (CodexAppServerError, RuntimeError, OSError) as exc:
             if not isinstance(exc, CodexAppServerError):
                 self._retire(result, self._format_error_with_stderr(f"{label} transport failed", exc))

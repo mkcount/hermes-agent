@@ -471,10 +471,27 @@ class GatewayCodexBridgeMixin:
                 physical_turn_status=observed_physical_status,
             )
             return None
+        proven_not_admitted = (
+            current_state == "submitting"
+            and bool(transport.get("codex_submission_not_admitted"))
+            and not codex_turn_id
+        )
+        if proven_not_admitted:
+            error = str(transport.get("error") or "Codex transport rejected turn/start")
+            if store.retry_unaccepted_submission(input_id, error):
+                return (
+                    "⚠️ Codex 연결이 교체되는 동안 전송이 중단되었습니다. "
+                    "접수되지 않은 것이 확인되어 새 연결에서 자동으로 다시 시도합니다."
+                )
+            result = (
+                "Codex 새 연결에서도 입력을 전송하지 못했습니다. 이 입력은 접수되지 않았으므로 "
+                "같은 메시지를 다시 보내 주세요."
+            )
         if (
             current_state in {"submitting", "running"}
             and not bool(transport.get("completed"))
             and not delivered_stream
+            and not proven_not_admitted
             and (not transport or bool(transport.get("codex_should_retire")))
         ):
             error = str(transport.get("error") or "Codex submission result unknown")

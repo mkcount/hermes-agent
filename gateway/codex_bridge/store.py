@@ -152,6 +152,7 @@ class CodexBridgeStore:
                 delivery_obligation_id TEXT,
                 finalized_at REAL,
                 legacy_recovery_required INTEGER NOT NULL DEFAULT 0,
+                unaccepted_retry_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
             )"""
         )
@@ -225,6 +226,7 @@ class CodexBridgeStore:
             "delivery_obligation_id": "TEXT",
             "finalized_at": "REAL",
             "legacy_recovery_required": "INTEGER NOT NULL DEFAULT 0",
+            "unaccepted_retry_count": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, declaration in semantic_columns.items():
             if name not in input_columns:
@@ -888,6 +890,27 @@ class CodexBridgeStore:
                        owner_pid=NULL, owner_started_at=NULL, updated_at=?, last_error=?
                    WHERE input_id=? AND state IN ('submitting','running')""",
                 (time.time(), str(error or "submission result unknown")[:500], input_id),
+            )
+        return bool(cur.rowcount)
+
+    def retry_unaccepted_submission(self, input_id: str, error: str = "") -> bool:
+        """Requeue a turn/start frame proven not to have entered the transport."""
+        with self._lock, self._transaction() as conn:
+            cur = conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='pending', owner_pid=NULL, owner_started_at=NULL,
+                       codex_turn_id=NULL, delivery_owner='runner', turn_outcome='pending',
+                       physical_turn_status='pending', logical_input_status='open',
+                       output_kind='none', delivery_status='none',
+                       unaccepted_retry_count=unaccepted_retry_count + 1,
+                       updated_at=?, last_error=?
+                   WHERE input_id=? AND state='submitting' AND codex_turn_id IS NULL
+                     AND unaccepted_retry_count < 1""",
+                (
+                    time.time(),
+                    str(error or "turn/start frame was not admitted")[:500],
+                    input_id,
+                ),
             )
         return bool(cur.rowcount)
 

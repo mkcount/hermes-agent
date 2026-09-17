@@ -566,6 +566,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         codex_turn_status_confirmed=turn_status_confirmed,
         response_previewed=response_previewed,
         codex_submission_started=turn.submitted_user_text is not None,
+        codex_submission_not_admitted=bool(getattr(turn, "submission_not_admitted", False)),
         codex_should_retire=bool(turn.should_retire),
         **usage_result,
     )

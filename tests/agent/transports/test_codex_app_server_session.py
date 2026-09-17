@@ -14,6 +14,7 @@ from typing import Any, Optional
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.transports.codex_app_server import CodexAppServerWriteError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
@@ -366,10 +367,114 @@ class TestLifecycle:
         assert second_reads == 2
         assert [method for method, _ in second.requests][-1] == "thread/resume"
 
+    def test_cached_desktop_connection_reconnects_before_submission(self):
+        stale = FakeClient()
+        fresh = FakeClient()
+        stale_reads = 0
+
+        def stale_handle(method, params):
+            nonlocal stale_reads
+            if method == "thread/read":
+                stale_reads += 1
+                if stale_reads > 1:
+                    raise RuntimeError("desktop control connection closed")
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}}}
+            if method == "thread/resume":
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}}}
+            return {}
+
+        def fresh_handle(method, params):
+            if method == "thread/read":
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}}}
+            if method == "thread/resume":
+                return {"thread": {"id": "desktop-thread", "status": {"type": "idle"}}}
+            if method == "turn/start":
+                return {"turn": {"id": "fresh-turn"}}
+            return {}
+
+        stale._request_handler = stale_handle
+        fresh._request_handler = fresh_handle
+        fresh.queue_notification(
+            "turn/completed", threadId="desktop-thread",
+            turn={"id": "fresh-turn", "status": "completed", "error": None},
+        )
+        clients = iter((stale, fresh))
+        starting: list[tuple[str, str]] = []
+        session = CodexAppServerSession(
+            cwd="/tmp", client_factory=lambda **_kwargs: next(clients),
+            resume_thread_id="desktop-thread", resume_active_turn_mode="queue",
+            prefer_desktop_control_socket=True,
+            on_turn_starting=lambda thread_id, message_id: starting.append((thread_id, message_id)),
+        )
+
+        with (
+            patch.object(session_mod, "find_codex_control_socket", return_value="/tmp/codex.sock"),
+            patch.object(session_mod.time, "sleep"),
+        ):
+            assert session.ensure_started() == "desktop-thread"
+            result = session.run_turn("continue", turn_timeout=1.0)
+
+        assert result.turn_id == "fresh-turn"
+        assert result.error is None
+        assert stale._closed is True
+        assert not any(method == "turn/start" for method, _ in stale.requests)
+        assert [method for method, _ in fresh.requests] == [
+            "thread/read", "thread/resume", "turn/start",
+        ]
+        assert len(starting) == 1
+
+    def test_control_socket_incarnation_change_reconnects_without_probing_old_client(self):
+        stale = FakeClient()
+        fresh = FakeClient()
+        stale._request_handler = lambda method, params: (
+            {"thread": {"id": "desktop-thread", "status": {"type": "idle"}}}
+            if method in {"thread/read", "thread/resume"} else {}
+        )
+        fresh._request_handler = stale._request_handler
+        clients = iter((stale, fresh))
+        session = CodexAppServerSession(
+            cwd="/tmp", client_factory=lambda **_kwargs: next(clients),
+            resume_thread_id="desktop-thread", resume_active_turn_mode="queue",
+            prefer_desktop_control_socket=True,
+        )
+
+        with (
+            patch.object(session_mod, "find_codex_control_socket", return_value="/tmp/codex.sock"),
+            patch.object(
+                session_mod, "codex_control_socket_identity",
+                side_effect=[(1, 10, 100), (1, 20, 200), (1, 20, 200)],
+            ),
+        ):
+            assert session.ensure_started() == "desktop-thread"
+            stale_request_count = len(stale.requests)
+            assert session.ensure_started() == "desktop-thread"
+
+        assert stale._closed is True
+        assert len(stale.requests) == stale_request_count
+        assert [method for method, _ in fresh.requests] == ["thread/read", "thread/resume"]
+
 
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_turn_start_write_rejection_is_proven_not_admitted(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                raise CodexAppServerWriteError("closed before frame admission")
+            return {}
+
+        client._request_handler = handle
+        result = make_session(client).run_turn("retry safely", turn_timeout=1.0)
+
+        assert result.submission_not_admitted is True
+        assert result.should_retire is True
+        assert result.turn_id is None
+        assert "transport failed" in str(result.error)
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

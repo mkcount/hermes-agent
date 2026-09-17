@@ -548,6 +548,66 @@ async def test_ambiguous_turn_submission_is_not_replayed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_transport_rejected_turn_start_is_requeued_on_a_fresh_connection(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="continue", source=source, message_id="safe-retry"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.mark_submitting(input_id)
+    routed._codex_bridge_agent_result = {
+        "completed": False,
+        "codex_should_retire": True,
+        "codex_submission_not_admitted": True,
+        "error": "turn/start frame was not admitted",
+    }
+
+    result = await bridge._codex_bridge_finalize_input(routed, "lane", "", 1)
+    bridge._codex_bridge_release_input(routed, "finally")
+
+    assert "자동으로 다시 시도합니다" in result
+    assert store.input_state(input_id) == "pending"
+    assert [item.input_id for item in store.recoverable_inputs()] == [input_id]
+
+
+@pytest.mark.asyncio
+async def test_second_transport_rejection_stops_retrying_and_requests_resend(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    bridge._adapter_for_source = lambda _source: SimpleNamespace(
+        _owner_profile=None,
+        register_post_delivery_callback=lambda *_args, **_kwargs: None,
+    )
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="continue", source=source, message_id="bounded-retry"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.mark_submitting(input_id)
+    assert store.retry_unaccepted_submission(input_id, "first rejection")
+    assert store.mark_executing(input_id)
+    assert store.mark_submitting(input_id)
+    routed._codex_bridge_agent_result = {
+        "completed": False,
+        "codex_should_retire": True,
+        "codex_submission_not_admitted": True,
+        "error": "second turn/start frame was not admitted",
+    }
+
+    result = await bridge._codex_bridge_finalize_input(routed, "lane", "", 2)
+
+    assert "같은 메시지를 다시 보내 주세요" in result
+    assert store.input_state(input_id) == "executed"
+    assert store.recoverable_inputs() == []
+
+
+@pytest.mark.asyncio
 async def test_unconfirmed_handoff_intent_does_not_abandon_an_uncertain_turn(
     tmp_path, monkeypatch,
 ):

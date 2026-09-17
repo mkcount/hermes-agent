@@ -1799,6 +1799,7 @@ class TurnRunner:
             "codex_thread_id": result.get("codex_thread_id"),
             "codex_turn_id": result.get("codex_turn_id"),
             "codex_submission_started": result.get("codex_submission_started", False),
+            "codex_submission_not_admitted": result.get("codex_submission_not_admitted", False),
             "codex_should_retire": result.get("codex_should_retire", False),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
