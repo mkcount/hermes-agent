@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
     find_codex_control_socket,
 )
+from gateway.codex_bridge.handoff import CodexHandoffGraph
 
 _MODEL_SWITCH_NOTE_RE = re.compile(
     r"^\[Note:\s*model was just switched from [^\r\n]* via OpenAI Codex\.\s*"
@@ -35,6 +37,115 @@ class CodexProjectSummary:
     cwd: str
     name: str
     updated_at: int
+
+
+@dataclass(frozen=True)
+class CodexReplayFrame:
+    event_id: str
+    turn_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class CodexThreadReplay:
+    turn_id: str
+    status: str
+    commentary: tuple[CodexReplayFrame, ...]
+    final_text: str = ""
+    error_code: str = ""
+
+
+def _normalized_turn_status(value: object) -> str:
+    raw = value.get("type") if isinstance(value, dict) else value
+    compact = re.sub(r"[^a-z]", "", str(raw or "").lower())
+    return {
+        "inprogress": "in_progress",
+        "completed": "completed",
+        "failed": "failed",
+        "interrupted": "interrupted",
+        "cancelled": "interrupted",
+        "canceled": "interrupted",
+    }.get(compact, compact or "unknown")
+
+
+def _normalized_error_code(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    raw = (
+        value.get("codexErrorInfo") or value.get("codex_error_info")
+        or value.get("code") or value.get("type") or ""
+    )
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", text).replace("-", "_")
+    return snake.lower()
+
+
+def _thread_replay(
+    value: object, *, handoff_graph: Optional[CodexHandoffGraph] = None,
+) -> Optional[CodexThreadReplay]:
+    thread = value.get("thread") or value if isinstance(value, dict) else None
+    turns = thread.get("turns") if isinstance(thread, dict) else None
+    if not isinstance(turns, list):
+        return None
+    history = [
+        turn for turn in turns
+        if isinstance(turn, dict) and str(turn.get("id") or "").strip()
+    ]
+    if not history:
+        return None
+
+    latest = history[-1]
+    turn_id = str(latest.get("id") or "").strip()
+    chain_ids = {turn_id}
+    if handoff_graph is not None:
+        predecessor_by_successor = {
+            str(successor): str(predecessor)
+            for predecessor, successor in handoff_graph.successors.items()
+            if predecessor and successor
+        }
+        cursor = turn_id
+        while cursor in predecessor_by_successor:
+            cursor = predecessor_by_successor[cursor]
+            if cursor in chain_ids:
+                break
+            chain_ids.add(cursor)
+
+    commentary: list[CodexReplayFrame] = []
+    final_text = ""
+    for turn in history:
+        current_turn_id = str(turn.get("id") or "").strip()
+        if current_turn_id not in chain_ids:
+            continue
+        items = turn.get("items")
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            phase = str(item.get("phase") or "").replace("_", "").lower()
+            if phase == "commentary":
+                item_id = str(item.get("id") or "").strip()
+                identity = item_id or hashlib.sha256(
+                    f"{current_turn_id}\0{index}\0{text}".encode("utf-8")
+                ).hexdigest()
+                commentary.append(CodexReplayFrame(
+                    event_id=identity, turn_id=current_turn_id, text=text,
+                ))
+            elif current_turn_id == turn_id and phase == "finalanswer":
+                final_text = text
+
+    return CodexThreadReplay(
+        turn_id=turn_id,
+        status=_normalized_turn_status(latest.get("status")),
+        commentary=tuple(commentary),
+        final_text=final_text,
+        error_code=_normalized_error_code(latest.get("error")),
+    )
 
 
 def _thread_summary(value: object) -> Optional[CodexThreadSummary]:
@@ -159,6 +270,41 @@ def list_recent_threads(
             if client is not None:
                 client.close()
     return []
+
+
+def read_thread_replay(
+    thread_id: str, *, codex_home: Optional[str] = None,
+    handoff_graph: Optional[CodexHandoffGraph] = None,
+    client_factory: Callable[..., CodexAppServerClient] = CodexAppServerClient,
+) -> Optional[CodexThreadReplay]:
+    """Read the latest stored turn without resuming or subscribing to it."""
+    cleaned = str(thread_id or "").strip()
+    if not cleaned:
+        return None
+    control_socket = find_codex_control_socket(codex_home)
+    for socket_path in ((control_socket, None) if control_socket else (None,)):
+        kwargs = {"codex_home": codex_home}
+        if socket_path:
+            kwargs["control_socket_path"] = socket_path
+        client = None
+        try:
+            client = client_factory(**kwargs)
+            client.initialize(
+                client_name="hermes-codex-replay",
+                client_title="Hermes Codex Transcript Replay",
+                client_version="1",
+            )
+            result = client.request(
+                "thread/read", {"threadId": cleaned, "includeTurns": True}, timeout=20,
+            )
+            return _thread_replay(result, handoff_graph=handoff_graph)
+        except Exception:
+            if not socket_path:
+                raise
+        finally:
+            if client is not None:
+                client.close()
+    return None
 
 
 def list_recent_projects(

@@ -20,15 +20,18 @@ from typing import Any, Optional
 
 from gateway.codex_bridge.catalog import (
     CodexProjectSummary,
+    CodexThreadReplay,
     CodexThreadSummary,
     list_recent_projects,
     list_recent_threads,
+    read_thread_replay,
 )
 from gateway.codex_bridge.handoff import read_thread_handoff_graph, read_turn_handoff
 from gateway.codex_bridge.rollout import (
     RolloutEvent,
     RolloutTail,
     collect_active_commentary,
+    collect_latest_turn_commentary,
     find_terminal_for_client_id,
     inspect_rollout,
     resolve_rollout_path,
@@ -74,6 +77,7 @@ _NEW_CODEX_REASONING = "xhigh"
 # Leave ample room for Telegram's Markdown escaping while keeping every replay
 # card below its 4,096 UTF-16-unit ceiling.
 _MIRROR_PROGRESS_MAX_CHARS = 1_800
+_REPLAYABLE_TERMINAL_STATES = frozenset({"failed", "interrupted"})
 
 
 def _split_progress_text(value: str, max_units: int) -> list[str]:
@@ -92,6 +96,42 @@ def _split_progress_text(value: str, max_units: int) -> list[str]:
     if current:
         chunks.append("".join(current))
     return chunks
+
+
+def _stored_replay_events(replay: CodexThreadReplay) -> list[RolloutEvent]:
+    return [
+        RolloutEvent(
+            event_id=f"app-server:{frame.event_id}",
+            turn_id=frame.turn_id,
+            kind="commentary",
+            text=frame.text,
+            offset=index,
+        )
+        for index, frame in enumerate(replay.commentary, 1)
+    ]
+
+
+def _replay_state_message(status: str, error_code: str, count: int) -> str:
+    if error_code in {"usage_limit_exceeded", "usage_limit_exceeded_error"}:
+        description = "사용량 한도로 멈춘 마지막 Codex 턴"
+        terminal = "⏸ 이 턴은 사용량 한도로 중단된 상태입니다."
+    else:
+        descriptions = {
+            "in_progress": "현재 진행 중인 Codex 턴",
+            "interrupted": "중단된 마지막 Codex 턴",
+            "failed": "오류로 멈춘 마지막 Codex 턴",
+            "completed": "최종답변 없이 끝난 마지막 Codex 턴",
+        }
+        terminals = {
+            "in_progress": "",
+            "interrupted": "⛔ 이 턴은 완료 전에 중단된 상태입니다.",
+            "failed": "⚠️ 이 턴은 오류로 완료되지 않은 상태입니다.",
+            "completed": "⚠️ 이 턴은 최종답변 없이 종료된 상태입니다.",
+        }
+        description = descriptions.get(status, "마지막 Codex 턴")
+        terminal = terminals.get(status, "")
+    message = f"\n{description}의 중간보고 {count}개를 아래에 처음부터 다시 전달합니다."
+    return f"{message}\n{terminal}" if terminal else message
 
 
 class GatewayCodexBridgeMixin:
@@ -619,18 +659,106 @@ class GatewayCodexBridgeMixin:
         await self.async_session_store.get_or_create_session(control_source)
         store = self._codex_bridge_store_for_source(control_source)
         snapshot = None
+        stored_replay = None
+        handoff_graph = None
         if summary is not None:
+            handoff_graph = read_thread_handoff_graph(summary.thread_id)
             snapshot = await asyncio.to_thread(
                 inspect_rollout, summary.thread_id, hinted_path=summary.rollout_path or None,
             )
+            if snapshot is not None:
+                try:
+                    stored_replay = await asyncio.to_thread(
+                        read_thread_replay,
+                        summary.thread_id,
+                        handoff_graph=handoff_graph,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Codex stored transcript replay failed for thread=%s",
+                        summary.thread_id,
+                        exc_info=True,
+                    )
+                if stored_replay is not None:
+                    refreshed = await asyncio.to_thread(
+                        inspect_rollout,
+                        summary.thread_id,
+                        hinted_path=snapshot.path,
+                    )
+                    if refreshed is not None:
+                        snapshot = refreshed
         replay_events = []
+        replay_status = ""
+        replay_error_code = ""
+        replay_final_text = ""
         if snapshot is not None and snapshot.active_turn_id:
-            replay_events = await asyncio.to_thread(
+            active_events = await asyncio.to_thread(
                 collect_active_commentary,
                 summary.thread_id,
                 snapshot,
-                handoff_graph=read_thread_handoff_graph(summary.thread_id),
+                handoff_graph=handoff_graph,
             )
+            predecessor_events = []
+            if stored_replay is not None and stored_replay.turn_id == snapshot.active_turn_id:
+                predecessor_events = [
+                    event for event in _stored_replay_events(stored_replay)
+                    if event.turn_id != snapshot.active_turn_id
+                ]
+            replay_events = predecessor_events + active_events
+            replay_status = "in_progress"
+            replay_final_text = snapshot.latest_final_text
+        elif snapshot is not None and stored_replay is not None:
+            snapshot_latest_id = getattr(snapshot, "latest_turn_id", None)
+            # The stable thread read can race a terminal rollout append.  The
+            # refreshed file snapshot is authoritative when it has already
+            # closed the exact turn that thread/read still called in-progress.
+            if (
+                stored_replay.status == "in_progress"
+                and snapshot_latest_id == stored_replay.turn_id
+            ):
+                replay_status = getattr(snapshot, "latest_turn_status", "")
+                replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
+                has_final = bool(getattr(snapshot, "latest_turn_has_final", False))
+                if replay_status in _REPLAYABLE_TERMINAL_STATES or not has_final:
+                    current_events = await asyncio.to_thread(
+                        collect_latest_turn_commentary,
+                        summary.thread_id,
+                        snapshot,
+                        handoff_graph=handoff_graph,
+                    )
+                    predecessor_events = [
+                        event for event in _stored_replay_events(stored_replay)
+                        if event.turn_id != stored_replay.turn_id
+                    ]
+                    replay_events = predecessor_events + current_events
+                if has_final:
+                    replay_final_text = snapshot.latest_final_text
+            else:
+                replay_status = stored_replay.status
+                replay_error_code = stored_replay.error_code
+                if (
+                    replay_status in _REPLAYABLE_TERMINAL_STATES
+                    or replay_status == "in_progress"
+                    or (replay_status == "completed" and not stored_replay.final_text)
+                ):
+                    replay_events = _stored_replay_events(stored_replay)
+                if replay_status == "completed":
+                    replay_final_text = stored_replay.final_text or snapshot.latest_final_text
+        elif snapshot is not None:
+            replay_status = getattr(snapshot, "latest_turn_status", "")
+            replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
+            has_final = bool(getattr(snapshot, "latest_turn_has_final", False))
+            if replay_status in _REPLAYABLE_TERMINAL_STATES or (
+                replay_status == "completed" and not has_final
+            ):
+                replay_events = await asyncio.to_thread(
+                    collect_latest_turn_commentary,
+                    summary.thread_id,
+                    snapshot,
+                    handoff_graph=handoff_graph,
+                )
+            if not replay_status or has_final:
+                replay_final_text = snapshot.latest_final_text
         previous_lane = None
         async with self._codex_bridge_binding_lock(control_key):
             previous = store.get_binding(control_key)
@@ -708,8 +836,10 @@ class GatewayCodexBridgeMixin:
             "데스크톱 작업이 쓰기 권한을 사용 중이면 Telegram 입력은 그 작업이 끝날 때까지 순서대로 기다립니다."
         )
         answer += (
-            f"\n현재 Codex 턴의 중간보고 {len(replay_events)}개를 아래에 처음부터 다시 전달합니다."
-            if snapshot is not None and snapshot.active_turn_id
+            _replay_state_message(replay_status, replay_error_code, len(replay_events))
+            if replay_status and (
+                replay_status != "completed" or not replay_final_text
+            )
             else "\n현재 실행 중인 Codex 턴은 없습니다. 새 턴이 시작되기 전에는 추가 보고가 없습니다."
         )
         answer += (
@@ -719,8 +849,8 @@ class GatewayCodexBridgeMixin:
         )
         if rotated:
             answer += "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
-        if snapshot is not None and snapshot.latest_final_text:
-            answer += f"\n\n🧾 마지막 답변\n\n{snapshot.latest_final_text}"
+        if replay_final_text:
+            answer += f"\n\n🧾 마지막 답변\n\n{replay_final_text}"
         logger.info("Bound Codex thread %s to %s generation=%s", summary.thread_id, control_key, binding.generation)
         return answer
 

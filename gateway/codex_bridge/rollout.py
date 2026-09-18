@@ -48,6 +48,12 @@ class RolloutSnapshot:
     latest_final_text: str = ""
     latest_model: Optional[str] = None
     latest_reasoning_effort: Optional[str] = None
+    latest_turn_id: Optional[str] = None
+    latest_turn_start_offset: Optional[int] = None
+    latest_turn_end_offset: Optional[int] = None
+    latest_turn_status: str = ""
+    latest_turn_error_code: str = ""
+    latest_turn_has_final: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,16 @@ def _client_id(payload: dict) -> Optional[str]:
     return str(value).strip() if value else None
 
 
+def _error_code(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    raw = (
+        value.get("codex_error_info") or value.get("codexErrorInfo")
+        or value.get("code") or value.get("type") or ""
+    )
+    return str(raw or "").strip().lower()
+
+
 def _is_user_authored(payload: dict, text: str) -> bool:
     """Use Codex's structured provenance, with a legacy text fallback."""
     metadata = payload.get("internal_chat_message_metadata_passthrough")
@@ -182,6 +198,12 @@ class RolloutTail:
         self.latest_final_text = ""
         self.latest_model: Optional[str] = None
         self.latest_reasoning_effort: Optional[str] = None
+        self.latest_turn_id: Optional[str] = None
+        self.latest_turn_start_offset: Optional[int] = None
+        self.latest_turn_end_offset: Optional[int] = None
+        self.latest_turn_status = ""
+        self.latest_turn_error_code = ""
+        self.latest_turn_has_final = False
         self._continuation_seed: Optional[_ContinuationSeed] = None
         self._handoff_graph = handoff_graph or CodexHandoffGraph({}, {})
         self._bad_line: Optional[tuple[int, str]] = None
@@ -200,6 +222,12 @@ class RolloutTail:
         self.latest_final_text = ""
         self.latest_model = None
         self.latest_reasoning_effort = None
+        self.latest_turn_id = None
+        self.latest_turn_start_offset = None
+        self.latest_turn_end_offset = None
+        self.latest_turn_status = ""
+        self.latest_turn_error_code = ""
+        self.latest_turn_has_final = False
         self._continuation_seed = None
         self._prime(self.offset)
 
@@ -224,6 +252,12 @@ class RolloutTail:
         self.latest_final_text = ""
         self.latest_model = None
         self.latest_reasoning_effort = None
+        self.latest_turn_id = None
+        self.latest_turn_start_offset = None
+        self.latest_turn_end_offset = None
+        self.latest_turn_status = ""
+        self.latest_turn_error_code = ""
+        self.latest_turn_has_final = False
         self._continuation_seed = None
         self._prime_range(0, end)
 
@@ -509,6 +543,9 @@ class RolloutTail:
                 turn["final"] = text
         elif event_type in {"task_complete", "turn_aborted"}:
             self._flush_pending_commentary(events, turn_id, offset)
+            final = ""
+            terminal_status = "interrupted" if event_type == "turn_aborted" else "completed"
+            terminal_error_code = ""
             if event_type == "turn_aborted":
                 # Codex host continuation explicitly records reason=interrupted
                 # before a replacement task_started with no repeated user item.
@@ -522,6 +559,9 @@ class RolloutTail:
                     )
             else:
                 final = str(payload.get("last_agent_message") or turn.get("final") or "").strip()
+                if payload.get("error"):
+                    terminal_status = "failed"
+                    terminal_error_code = _error_code(payload.get("error"))
                 if final and turn.get("user_seen"):
                     self.latest_final_text = final
                 self._emit(events, turn_id, "final", final, offset)
@@ -529,6 +569,15 @@ class RolloutTail:
                     error = payload["error"]
                     text = str(error.get("message") if isinstance(error, dict) else error).strip()
                     self._emit(events, turn_id, "error", text, offset)
+            if turn.get("user_seen"):
+                self.latest_turn_id = turn_id
+                self.latest_turn_start_offset = (
+                    int(turn["start"]) if turn.get("start") is not None else line_start
+                )
+                self.latest_turn_end_offset = offset
+                self.latest_turn_status = terminal_status
+                self.latest_turn_error_code = terminal_error_code
+                self.latest_turn_has_final = bool(final)
             if self.active_turn_id == turn_id:
                 self.active_turn_id = self.active_start_offset = None
             self.turns.pop(turn_id, None)
@@ -563,6 +612,39 @@ def find_terminal_for_client_id(
     return terminal
 
 
+def _collect_turn_commentary(
+    thread_id: str, snapshot: RolloutSnapshot, *, turn_id: Optional[str],
+    start_offset: Optional[int], end_offset: Optional[int],
+    handoff_graph: Optional[CodexHandoffGraph] = None,
+) -> list[RolloutEvent]:
+    if turn_id is None or start_offset is None:
+        return []
+    path = Path(snapshot.path)
+    tail = RolloutTail(
+        thread_id, path,
+        device=snapshot.device, inode=snapshot.inode,
+        offset=start_offset,
+        handoff_graph=handoff_graph,
+    )
+    boundary = min(snapshot.size, end_offset if end_offset is not None else snapshot.size)
+    collected: list[RolloutEvent] = []
+    while tail.offset < boundary:
+        events, next_offset, _ = tail.scan(end_offset=boundary)
+        collected.extend(
+            event for event in events
+            if event.turn_id == turn_id and event.kind == "commentary"
+        )
+        if next_offset <= tail.offset:
+            break
+        tail.offset = next_offset
+
+    # Very old rollout formats can omit the user-item completion marker.  At
+    # an explicit replay boundary it is safe to expose those already-persisted
+    # frames as unmanaged desktop commentary.
+    tail._flush_pending_commentary(collected, turn_id, boundary)
+    return collected
+
+
 def collect_active_commentary(
     thread_id: str, snapshot: RolloutSnapshot, *,
     handoff_graph: Optional[CodexHandoffGraph] = None,
@@ -573,31 +655,27 @@ def collect_active_commentary(
     user who explicitly selects a session asked to see its current transcript
     again even when that turn originally came from this Telegram lane.
     """
-    if snapshot.active_turn_id is None or snapshot.active_start_offset is None:
-        return []
-    path = Path(snapshot.path)
-    tail = RolloutTail(
-        thread_id, path,
-        device=snapshot.device, inode=snapshot.inode,
-        offset=snapshot.active_start_offset,
+    return _collect_turn_commentary(
+        thread_id, snapshot,
+        turn_id=snapshot.active_turn_id,
+        start_offset=snapshot.active_start_offset,
+        end_offset=snapshot.size,
         handoff_graph=handoff_graph,
     )
-    collected: list[RolloutEvent] = []
-    while tail.offset < snapshot.size:
-        events, next_offset, _ = tail.scan(end_offset=snapshot.size)
-        collected.extend(
-            event for event in events
-            if event.turn_id == snapshot.active_turn_id and event.kind == "commentary"
-        )
-        if next_offset <= tail.offset:
-            break
-        tail.offset = next_offset
 
-    # Very old rollout formats can omit the user-item completion marker.  At
-    # an explicit replay boundary it is safe to expose those already-persisted
-    # frames as unmanaged desktop commentary.
-    tail._flush_pending_commentary(collected, snapshot.active_turn_id, snapshot.size)
-    return collected
+
+def collect_latest_turn_commentary(
+    thread_id: str, snapshot: RolloutSnapshot, *,
+    handoff_graph: Optional[CodexHandoffGraph] = None,
+) -> list[RolloutEvent]:
+    """Replay a terminal latest turn when app-server history is unavailable."""
+    return _collect_turn_commentary(
+        thread_id, snapshot,
+        turn_id=snapshot.latest_turn_id,
+        start_offset=snapshot.latest_turn_start_offset,
+        end_offset=snapshot.latest_turn_end_offset,
+        handoff_graph=handoff_graph,
+    )
 
 
 def inspect_rollout(
@@ -618,4 +696,10 @@ def inspect_rollout(
         latest_final_text=tail.latest_final_text,
         latest_model=tail.latest_model,
         latest_reasoning_effort=tail.latest_reasoning_effort,
+        latest_turn_id=tail.latest_turn_id,
+        latest_turn_start_offset=tail.latest_turn_start_offset,
+        latest_turn_end_offset=tail.latest_turn_end_offset,
+        latest_turn_status=tail.latest_turn_status,
+        latest_turn_error_code=tail.latest_turn_error_code,
+        latest_turn_has_final=tail.latest_turn_has_final,
     )

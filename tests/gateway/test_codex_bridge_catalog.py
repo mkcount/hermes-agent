@@ -1,6 +1,7 @@
 """Codex picker catalog contracts."""
 
 from gateway.codex_bridge import catalog
+from gateway.codex_bridge.handoff import CodexHandoffGraph
 
 
 class _FakeClient:
@@ -71,4 +72,65 @@ def test_picker_uses_canonical_index_and_collapses_rollout_incarnations(monkeypa
     assert rows[0].status == "active"
     client = _FakeClient.instances[0]
     assert client.requests[0][1]["useStateDbOnly"] is True
+    assert client.closed is True
+
+
+def test_stored_replay_follows_handoff_chain_and_preserves_failed_commentary(monkeypatch):
+    class ReplayClient(_FakeClient):
+        def request(self, method, params, timeout):
+            self.requests.append((method, params, timeout))
+            return {
+                "thread": {
+                    "turns": [
+                        {
+                            "id": "turn-old",
+                            "status": "interrupted",
+                            "items": [{
+                                "id": "old-report", "type": "agentMessage",
+                                "phase": "commentary", "text": "first report",
+                            }],
+                        },
+                        {
+                            "id": "dying-server-turn",
+                            "status": "interrupted",
+                            "items": [{
+                                "id": "wrong-report", "type": "agentMessage",
+                                "phase": "commentary", "text": "must stay hidden",
+                            }],
+                        },
+                        {
+                            "id": "turn-successor",
+                            "status": "failed",
+                            "error": {"codexErrorInfo": "usageLimitExceeded"},
+                            "items": [{
+                                "id": "new-report", "type": "agentMessage",
+                                "phase": "commentary", "text": "last report",
+                            }],
+                        },
+                    ],
+                },
+            }
+
+    ReplayClient.instances.clear()
+    monkeypatch.setattr(catalog, "find_codex_control_socket", lambda _home=None: "/control.sock")
+
+    replay = catalog.read_thread_replay(
+        "thread-a",
+        handoff_graph=CodexHandoffGraph(
+            {"turn-old": "turn-successor"}, {"turn-old": "successor_bound"},
+        ),
+        client_factory=ReplayClient,
+    )
+
+    assert replay is not None
+    assert replay.status == "failed"
+    assert replay.error_code == "usage_limit_exceeded"
+    assert [(frame.turn_id, frame.text) for frame in replay.commentary] == [
+        ("turn-old", "first report"),
+        ("turn-successor", "last report"),
+    ]
+    client = ReplayClient.instances[0]
+    assert client.requests == [
+        ("thread/read", {"threadId": "thread-a", "includeTurns": True}, 20),
+    ]
     assert client.closed is True

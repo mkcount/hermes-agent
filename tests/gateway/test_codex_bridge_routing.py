@@ -10,7 +10,12 @@ import pytest
 
 from gateway.codex_bridge import handoff as handoff_mod
 from gateway.codex_bridge import rollout as rollout_mod
-from gateway.codex_bridge.catalog import CodexProjectSummary, CodexThreadSummary
+from gateway.codex_bridge.catalog import (
+    CodexProjectSummary,
+    CodexReplayFrame,
+    CodexThreadReplay,
+    CodexThreadSummary,
+)
 from gateway.codex_bridge.mixin import GatewayCodexBridgeMixin
 from gateway.codex_bridge.rollout import RolloutEvent
 from gateway.codex_bridge.store import CodexBridgeStore
@@ -369,6 +374,9 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
             latest_final_text="repeat this final",
         ),
     )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.read_thread_replay", lambda *_args, **_kwargs: None,
+    )
 
     answer = await bridge._codex_bridge_store_binding(
         source,
@@ -452,7 +460,12 @@ async def test_selecting_active_thread_replays_all_commentary_as_fresh_rows(tmp_
             text="later report", offset=100,
         ),
     ]
-    monkeypatch.setattr("gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.read_thread_replay", lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         "gateway.codex_bridge.mixin.collect_active_commentary",
         lambda *_args, **_kwargs: commentary,
@@ -476,6 +489,58 @@ async def test_selecting_active_thread_replays_all_commentary_as_fresh_rows(tmp_
     assert [row.segments for row in progress].count(("same report",)) == 2
     assert [row.segments for row in progress].count(("later report",)) == 1
     assert all(row.message_id is None for row in progress)
+
+
+@pytest.mark.asyncio
+async def test_selecting_usage_stopped_thread_replays_reports_without_an_old_final(
+    tmp_path, monkeypatch,
+):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    current = store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    snapshot = SimpleNamespace(
+        path="/rollout.jsonl", device=1, inode=2, size=160,
+        active_turn_id=None, active_start_offset=None,
+        latest_final_text="older completed answer",
+        latest_turn_id="failed-turn", latest_turn_status="failed",
+        latest_turn_error_code="usage_limit_exceeded",
+        latest_turn_has_final=False,
+    )
+    replay = CodexThreadReplay(
+        turn_id="failed-turn",
+        status="failed",
+        error_code="usage_limit_exceeded",
+        commentary=(
+            CodexReplayFrame("report-1", "failed-turn", "first report"),
+            CodexReplayFrame("report-2", "failed-turn", "stopped here"),
+        ),
+    )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.read_thread_replay", lambda *_args, **_kwargs: replay,
+    )
+
+    answer = await bridge._codex_bridge_store_binding(
+        source,
+        CodexThreadSummary(
+            thread_id="thread-123", title="Stopped", cwd="/project",
+            updated_at=1, status="idle",
+        ),
+    )
+
+    refreshed = store.get_binding(build_session_key(source))
+    progress = store.list_progress(refreshed, pending_only=True)
+    assert refreshed.generation == current.generation
+    assert refreshed.cursor_offset == snapshot.size
+    assert "사용량 한도" in answer
+    assert "중간보고 2개" in answer
+    assert "older completed answer" not in answer
+    assert [row.segments for row in progress] == [
+        ("first report",), ("stopped here",),
+    ]
 
 
 @pytest.mark.asyncio
