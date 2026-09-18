@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -17,6 +18,7 @@ import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server import CodexAppServerWriteError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    TurnResult,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
@@ -196,6 +198,49 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_queue_mode_serializes_writers_by_durable_thread(self):
+        first = make_session(
+            FakeClient(), resume_thread_id="shared-thread", resume_active_turn_mode="queue",
+        )
+        second = make_session(
+            FakeClient(), resume_thread_id="shared-thread", resume_active_turn_mode="queue",
+        )
+        second_attempted = threading.Event()
+        second_entered = threading.Event()
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+
+            def acquire(self, timeout=-1):
+                if threading.current_thread().name == "second-codex-writer":
+                    second_attempted.set()
+                return self.lock.acquire(timeout=timeout)
+
+            def release(self):
+                self.lock.release()
+
+        identity = "\0shared-thread"
+        observed_lock = ObservedLock()
+        with CodexAppServerSession._thread_writer_registry_lock:
+            CodexAppServerSession._thread_writer_locks[identity] = observed_lock
+        first._acquire_thread_writer()
+        second._run_turn_with_writer = lambda *_args, **_kwargs: (
+            second_entered.set() or TurnResult()
+        )
+        second_thread = threading.Thread(
+            target=second.run_turn, args=("two",), name="second-codex-writer",
+        )
+        second_thread.start()
+        assert second_attempted.wait(2)
+        assert not second_entered.is_set()
+        first._release_thread_writer()
+        second_thread.join(2)
+        with CodexAppServerSession._thread_writer_registry_lock:
+            CodexAppServerSession._thread_writer_locks.pop(identity, None)
+
+        assert second_entered.is_set()
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)

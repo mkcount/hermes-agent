@@ -2315,6 +2315,19 @@ class BasePlatformAdapter(ABC):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            # A trusted pre-route may already have journaled each Telegram
+            # chunk. Keep every durable id attached to the merged event so the
+            # bridge can atomically claim the merged prompt and retire its
+            # component rows instead of replaying them as duplicate turns.
+            existing_metadata = existing.metadata or {}
+            incoming_id = str((event.metadata or {}).get("codex_bridge_input_id") or "").strip()
+            primary_id = str(existing_metadata.get("codex_bridge_input_id") or "").strip()
+            if incoming_id and incoming_id != primary_id:
+                batched = list(existing_metadata.get("codex_bridge_batched_input_ids") or [])
+                if incoming_id not in batched:
+                    batched.append(incoming_id)
+                existing_metadata["codex_bridge_batched_input_ids"] = batched
+                existing.metadata = existing_metadata
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -3520,29 +3533,9 @@ class BasePlatformAdapter(ABC):
         if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
                 and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
             await asyncio.to_thread(self._apply_topic_recovery, event)
-        resolver = getattr(self, "_session_route_resolver", None)
-        if resolver is not None and not expected_session_key:
-            try:
-                event = await resolver(event)
-            except SessionRouteRejected as exc:
-                event._gateway_accepted = True
-                if exc.user_message:
-                    await self.send(
-                        event.source.chat_id, exc.user_message,
-                        metadata=_thread_metadata_for_event(event),
-                    )
-                return
-            except Exception:
-                # A broken ownership store must never silently fall through to
-                # the ordinary Hermes session: that would execute the prompt in
-                # the wrong conversation with different permissions.
-                logger.exception("[%s] trusted session routing failed", self.name)
-                event._gateway_accepted = True
-                await self.send(
-                    event.source.chat_id,
-                    "Codex 세션 연결 상태를 확인하지 못해 이 메시지를 실행하지 않았습니다. 잠시 후 다시 보내 주세요.",
-                    metadata=_thread_metadata_for_event(event),
-                )
+        if not expected_session_key:
+            event = await self._prepare_session_route(event)
+            if event is None:
                 return
         session_key = self._event_session_key(event)
         if expected_session_key and session_key != expected_session_key:
@@ -3557,6 +3550,40 @@ class BasePlatformAdapter(ABC):
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+
+    async def _prepare_session_route(self, event: MessageEvent) -> Optional[MessageEvent]:
+        """Resolve and durably journal a trusted route before adapter buffering.
+
+        Telegram invokes this from its PTB handler so the Bot API update is in
+        SQLite before the handler returns and a later getUpdates offset can
+        acknowledge it. Other adapters continue to enter through
+        ``handle_message`` and receive the same fail-closed behavior.
+        """
+        resolver = getattr(self, "_session_route_resolver", None)
+        if resolver is None:
+            return event
+        try:
+            return await resolver(event)
+        except SessionRouteRejected as exc:
+            event._gateway_accepted = True
+            if exc.user_message:
+                await self.send(
+                    event.source.chat_id, exc.user_message,
+                    metadata=_thread_metadata_for_event(event),
+                )
+            return None
+        except Exception:
+            # A broken ownership store must never silently fall through to the
+            # ordinary Hermes session: that would execute the prompt in the
+            # wrong conversation with different permissions.
+            logger.exception("[%s] trusted session routing failed", self.name)
+            event._gateway_accepted = True
+            await self.send(
+                event.source.chat_id,
+                "Codex 세션 연결 상태를 확인하지 못해 이 메시지를 실행하지 않았습니다. 잠시 후 다시 보내 주세요.",
+                metadata=_thread_metadata_for_event(event),
+            )
+            return None
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass

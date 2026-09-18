@@ -98,6 +98,7 @@ async def test_bound_message_is_persisted_but_not_executable_before_runner_gates
 
     assert routed.source.trusted_local_lane
     assert routed.metadata["codex_bridge_thread_id"] == "thread-123"
+    assert routed.metadata["gateway_session_key"] == build_session_key(routed.source)
     assert store.input_state(routed.metadata["codex_bridge_input_id"]) == "routed"
     assert build_session_key(routed.source) != build_session_key(source)
     bridge.async_session_store.get_or_create_isolated_session.assert_awaited_once_with(

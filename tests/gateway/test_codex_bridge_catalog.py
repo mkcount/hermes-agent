@@ -79,37 +79,39 @@ def test_stored_replay_follows_handoff_chain_and_preserves_failed_commentary(mon
     class ReplayClient(_FakeClient):
         def request(self, method, params, timeout):
             self.requests.append((method, params, timeout))
-            return {
-                "thread": {
-                    "turns": [
+            if method == "thread/turns/list":
+                return {
+                    "data": [
                         {
                             "id": "turn-old",
                             "status": "interrupted",
-                            "items": [{
-                                "id": "old-report", "type": "agentMessage",
-                                "phase": "commentary", "text": "first report",
-                            }],
+                            "items": [],
                         },
                         {
                             "id": "dying-server-turn",
                             "status": "interrupted",
-                            "items": [{
-                                "id": "wrong-report", "type": "agentMessage",
-                                "phase": "commentary", "text": "must stay hidden",
-                            }],
+                            "items": [],
                         },
                         {
                             "id": "turn-successor",
                             "status": "failed",
                             "error": {"codexErrorInfo": "usageLimitExceeded"},
-                            "items": [{
-                                "id": "new-report", "type": "agentMessage",
-                                "phase": "commentary", "text": "last report",
-                            }],
+                            "items": [],
                         },
                     ],
-                },
+                    "nextCursor": None,
+                }
+            reports = {
+                "turn-old": [{
+                    "id": "old-report", "type": "agentMessage",
+                    "phase": "commentary", "text": "first report",
+                }],
+                "turn-successor": [{
+                    "id": "new-report", "type": "agentMessage",
+                    "phase": "commentary", "text": "last report",
+                }],
             }
+            return {"data": reports[params["turnId"]], "nextCursor": None}
 
     ReplayClient.instances.clear()
     monkeypatch.setattr(catalog, "find_codex_control_socket", lambda _home=None: "/control.sock")
@@ -131,6 +133,17 @@ def test_stored_replay_follows_handoff_chain_and_preserves_failed_commentary(mon
     ]
     client = ReplayClient.instances[0]
     assert client.requests == [
-        ("thread/read", {"threadId": "thread-a", "includeTurns": True}, 20),
+        ("thread/turns/list", {
+            "threadId": "thread-a", "limit": 100,
+            "sortDirection": "asc", "itemsView": "notLoaded",
+        }, 20),
+        ("thread/items/list", {
+            "threadId": "thread-a", "turnId": "turn-old",
+            "limit": 100, "sortDirection": "asc",
+        }, 20),
+        ("thread/items/list", {
+            "threadId": "thread-a", "turnId": "turn-successor",
+            "limit": 100, "sortDirection": "asc",
+        }, 20),
     ]
     assert client.closed is True

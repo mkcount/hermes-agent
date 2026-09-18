@@ -811,9 +811,10 @@ class CodexBridgeStore:
     ) -> tuple[str, str, bool]:
         """Persist pre-guard routing; return ``(id, state, inserted)``.
 
-        ``routed`` rows are deliberately not restart-recoverable: authorization,
-        pause, and plugin gates have not accepted them yet. The runner claims
-        one directly as ``executing`` only after all those gates pass.
+        The Telegram adapter performs this write before its update handler
+        returns. ``routed`` is therefore a durable inbox state: after restart
+        the event re-enters the normal runner gates instead of disappearing
+        with an already-advanced Bot API offset.
         """
         input_id = self.input_id(binding.control_session_key, event)
         now = time.time()
@@ -837,8 +838,48 @@ class CodexBridgeStore:
 
     def mark_executing(self, input_id: str) -> bool:
         """Atomically claim one gate-approved routed/recovered input for execution."""
+        return self.claim_batched_input(input_id, None, [])
+
+    def claim_batched_input(
+        self, input_id: str, event: Optional[MessageEvent], sibling_input_ids: list[str],
+    ) -> bool:
+        """Claim a debounced prompt and retire its already-journaled chunks atomically."""
         owner_pid, owner_started_at = self._owner_stamp()
         with self._lock, self._transaction() as conn:
+            primary = conn.execute(
+                """SELECT control_session_key, lane_session_key, thread_id, generation, state
+                   FROM codex_bridge_inputs WHERE input_id=?""",
+                (input_id,),
+            ).fetchone()
+            if primary is None or str(primary[4]) not in {"routed", "pending"}:
+                return False
+            siblings = list(dict.fromkeys(
+                str(value).strip() for value in sibling_input_ids
+                if str(value).strip() and str(value).strip() != input_id
+            ))
+            for sibling_id in siblings:
+                sibling = conn.execute(
+                    """SELECT control_session_key, lane_session_key, thread_id, generation, state
+                       FROM codex_bridge_inputs WHERE input_id=?""",
+                    (sibling_id,),
+                ).fetchone()
+                if sibling is None or tuple(sibling[:4]) != tuple(primary[:4]) or str(sibling[4]) not in {"routed", "pending"}:
+                    raise RuntimeError("Codex batched input ownership changed before execution")
+            if event is not None:
+                conn.execute(
+                    "UPDATE codex_bridge_inputs SET event_json=?, updated_at=? WHERE input_id=?",
+                    (self._event_to_json(event), time.time(), input_id),
+                )
+            if siblings:
+                placeholders = ",".join("?" for _ in siblings)
+                conn.execute(
+                    f"""UPDATE codex_bridge_inputs
+                        SET state='cancelled', delivery_owner='none', turn_outcome='cancelled',
+                            logical_input_status='cancelled', owner_pid=NULL, owner_started_at=NULL,
+                            updated_at=?, last_error='merged into debounced durable input'
+                        WHERE input_id IN ({placeholders}) AND state IN ('routed','pending')""",
+                    (time.time(), *siblings),
+                )
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
                    SET state='executing', owner_pid=?, owner_started_at=?,
@@ -1165,6 +1206,16 @@ class CodexBridgeStore:
         """
         now = time.time()
         with self._lock, self._transaction() as conn:
+            # These rows were synchronously persisted inside the Telegram
+            # update handler but had not yet crossed the runner gates. Replay
+            # them through those gates; deterministic input ids deduplicate a
+            # Bot API redelivery of the same update.
+            conn.execute(
+                """UPDATE codex_bridge_inputs
+                   SET state='pending', delivery_owner='runner', updated_at=?
+                   WHERE state='routed'""",
+                (now,),
+            )
             rows = conn.execute(
                 """SELECT input_id, state, owner_pid, owner_started_at, turn_outcome
                    FROM codex_bridge_inputs

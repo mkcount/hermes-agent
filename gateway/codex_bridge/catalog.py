@@ -244,6 +244,79 @@ def _list_thread_rows(client: CodexAppServerClient, *, limit: int) -> list[objec
     return list(result.get("data") or [])
 
 
+def _paged_data(
+    client: CodexAppServerClient, method: str, params: dict[str, object], *, timeout: int = 20,
+) -> list[object]:
+    """Read one official cursor-paginated app-server collection."""
+    rows: list[object] = []
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
+    for _ in range(100):
+        request = dict(params)
+        if cursor:
+            request["cursor"] = cursor
+        result = client.request(method, request, timeout=timeout)
+        rows.extend(list(result.get("data") or []))
+        next_cursor = str(result.get("nextCursor") or "").strip()
+        if not next_cursor:
+            return rows
+        if next_cursor in seen_cursors:
+            raise RuntimeError(f"{method} returned a repeated cursor")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    raise RuntimeError(f"{method} exceeded the replay pagination bound")
+
+
+def _read_thread_turns(
+    client: CodexAppServerClient, thread_id: str,
+    handoff_graph: Optional[CodexHandoffGraph],
+) -> list[object]:
+    """Hydrate the latest logical turn chain through official paging APIs."""
+    turns = _paged_data(
+        client,
+        "thread/turns/list",
+        {
+            "threadId": thread_id,
+            "limit": 100,
+            "sortDirection": "asc",
+            "itemsView": "notLoaded",
+        },
+    )
+    turn_rows = [row for row in turns if isinstance(row, dict) and row.get("id")]
+    if not turn_rows:
+        return []
+    required = {str(turn_rows[-1]["id"])}
+    if handoff_graph is not None:
+        predecessor_by_successor = {
+            str(successor): str(predecessor)
+            for predecessor, successor in handoff_graph.successors.items()
+            if predecessor and successor
+        }
+        cursor = next(iter(required))
+        while cursor in predecessor_by_successor:
+            cursor = predecessor_by_successor[cursor]
+            if cursor in required:
+                break
+            required.add(cursor)
+    for turn in turn_rows:
+        turn_id = str(turn.get("id") or "")
+        if turn_id not in required:
+            turn["items"] = []
+            continue
+        turn["items"] = _paged_data(
+            client,
+            "thread/items/list",
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "limit": 100,
+                "sortDirection": "asc",
+            },
+        )
+        turn["itemsView"] = "full"
+    return turn_rows
+
+
 def list_recent_threads(
     *, limit: int = 8, codex_home: Optional[str] = None,
     client_factory: Callable[..., CodexAppServerClient] = CodexAppServerClient,
@@ -294,9 +367,20 @@ def read_thread_replay(
                 client_title="Hermes Codex Transcript Replay",
                 client_version="1",
             )
-            result = client.request(
-                "thread/read", {"threadId": cleaned, "includeTurns": True}, timeout=20,
-            )
+            try:
+                turns = _read_thread_turns(client, cleaned, handoff_graph)
+                if not turns:
+                    return None
+                result = {"thread": {"turns": turns}}
+            except CodexAppServerError as exc:
+                if exc.code not in {-32601, -32602}:
+                    raise
+                # Compatibility only for older pinned runtimes. Raw rollout
+                # inspection remains a live diagnostic path, not replay's
+                # persisted source of truth.
+                result = client.request(
+                    "thread/read", {"threadId": cleaned, "includeTurns": True}, timeout=20,
+                )
             return _thread_replay(result, handoff_graph=handoff_graph)
         except Exception:
             if not socket_path:

@@ -163,6 +163,9 @@ class _ServerRequestRouting:
 class CodexAppServerSession:
     """One Codex thread per Hermes session, lifetime owned by AIAgent. Not thread-safe: one caller at a time."""
 
+    _thread_writer_registry_lock = threading.Lock()
+    _thread_writer_locks: dict[str, threading.Lock] = {}
+
     def __init__(
         self, *, cwd: Optional[str] = None, codex_bin: str = "codex",
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
@@ -219,7 +222,33 @@ class CodexAppServerSession:
         # In-progress fileChange items by id (item/started -> item/completed):
         # approval params don't carry the changeset, so this feeds the prompt summary.
         self._pending_file_changes: dict[str, str] = {}
+        self._thread_writer_lock: Optional[threading.Lock] = None
+        self._thread_writer_lock_acquired = False
         self._closed = False
+
+    def _acquire_thread_writer(self) -> None:
+        """Serialize every Hermes writer that targets one durable Codex thread."""
+        if (
+            self._thread_writer_lock_acquired
+            or self._resume_active_turn_mode != "queue"
+            or not self._resume_thread_id
+        ):
+            return
+        identity = f"{self._codex_home or ''}\0{self._resume_thread_id}"
+        with self._thread_writer_registry_lock:
+            lock = self._thread_writer_locks.setdefault(identity, threading.Lock())
+        while not lock.acquire(timeout=0.1):
+            if self._interrupt_event.is_set() or self._closed:
+                raise InterruptedError("Codex queued turn cancelled before acquiring the thread writer")
+        self._thread_writer_lock = lock
+        self._thread_writer_lock_acquired = True
+
+    def _release_thread_writer(self) -> None:
+        if not self._thread_writer_lock_acquired or self._thread_writer_lock is None:
+            return
+        self._thread_writer_lock.release()
+        self._thread_writer_lock = None
+        self._thread_writer_lock_acquired = False
 
     def _record_activity(self, description: str) -> None:
         """Forward transport-proven progress to the owning agent watchdog."""
@@ -453,6 +482,7 @@ class CodexAppServerSession:
         self._using_desktop_control = False
         self._desktop_control_socket_path = None
         self._desktop_control_socket_identity = None
+        self._release_thread_writer()
 
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to issue turn/interrupt and unwind."""
@@ -741,6 +771,21 @@ class CodexAppServerSession:
         self, user_input: Any, *, turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
     ) -> TurnResult:
+        try:
+            self._acquire_thread_writer()
+            return self._run_turn_with_writer(
+                user_input,
+                turn_timeout=turn_timeout,
+                notification_poll_timeout=notification_poll_timeout,
+            )
+        finally:
+            self._interrupt_event.clear()
+            self._release_thread_writer()
+
+    def _run_turn_with_writer(
+        self, user_input: Any, *, turn_timeout: float = 600.0,
+        notification_poll_timeout: float = 0.25,
+    ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
         ``turn_timeout`` is an inactivity deadline renewed by every in-scope app-server
@@ -769,7 +814,6 @@ class CodexAppServerSession:
                         result.error = wait_error
                         result.interrupted = self._interrupt_event.is_set()
                         result.should_retire = not result.interrupted
-                        self._interrupt_event.clear()
                         return result
                 # This callback is the durable ambiguity fence. It must run
                 # immediately before the request write, after every wait that
@@ -782,7 +826,6 @@ class CodexAppServerSession:
                 )
                 if ts is not None:
                     self._run_started_turn(result, ts, turn_timeout, notification_poll_timeout)
-        self._interrupt_event.clear()
         return result
 
     def _run_started_turn(

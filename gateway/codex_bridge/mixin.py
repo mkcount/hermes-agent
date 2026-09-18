@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import os
 import time
@@ -53,6 +54,7 @@ _CONTROL_KEY = "codex_bridge_control_key"
 _THREAD_KEY = "codex_bridge_thread_id"
 _GENERATION_KEY = "codex_bridge_generation"
 _INPUT_KEY = "codex_bridge_input_id"
+_BATCH_INPUTS_KEY = "codex_bridge_batched_input_ids"
 _LANE_KEY = "codex_bridge_lane_key"
 _SESSION_EXECUTION_OWNER_KEY = "codex_bridge_execution_owner"
 _SELECTION_COMMANDS = frozenset({"codex-session", "codex-model", "ns"})
@@ -190,6 +192,13 @@ class GatewayCodexBridgeMixin:
 
     def _codex_bridge_control_key(self, source: SessionSource) -> str:
         return self._session_key_for_source(self._codex_bridge_control_source(source))
+
+    @staticmethod
+    def _codex_bridge_lane_name(binding: CodexBridgeBinding) -> str:
+        """Canonical execution identity, shared by every binding to one thread."""
+        if binding.pending_new:
+            return f"codex-pending:{binding.control_session_key}:{binding.generation}"
+        return f"codex-thread:{binding.thread_id}"
 
     def _codex_bridge_owns_restart_recovery(self, entry_or_key: Any) -> bool:
         """True when durable bridge state, rather than generic session replay, owns recovery.
@@ -342,7 +351,7 @@ class GatewayCodexBridgeMixin:
         # first conversation, while A→B→A still receives three distinct lanes.
         lane_source = dataclasses.replace(
             control_source,
-            trusted_local_lane=f"codex-binding:{control_key}:{binding.generation}",
+            trusted_local_lane=self._codex_bridge_lane_name(binding),
         )
         # Establish the exact lane before journaling the input.  This also repairs mappings made
         # by older builds where peer recovery aliased two Codex bindings to one transcript.
@@ -360,6 +369,7 @@ class GatewayCodexBridgeMixin:
             _THREAD_KEY: binding.thread_id,
             _GENERATION_KEY: binding.generation,
             _LANE_KEY: lane_key,
+            "gateway_session_key": lane_key,
         })
 
         # Slash commands manipulate the selected lane but are not Codex inputs.
@@ -397,7 +407,12 @@ class GatewayCodexBridgeMixin:
         ):
             store.cancel_lane(str(metadata.get(_LANE_KEY) or ""))
             return "선택된 Codex 세션이 바뀌어 이 메시지는 실행하지 않았습니다. 다시 보내 주세요."
-        if not store.mark_executing(input_id):
+        batched_ids = [
+            str(value).strip()
+            for value in metadata.get(_BATCH_INPUTS_KEY) or []
+            if str(value).strip() and str(value).strip() != input_id
+        ]
+        if not store.claim_batched_input(input_id, event, batched_ids):
             return "이 Codex 메시지는 이미 처리되었거나 취소되었습니다."
         return None
 
@@ -663,87 +678,68 @@ class GatewayCodexBridgeMixin:
         handoff_graph = None
         if summary is not None:
             handoff_graph = read_thread_handoff_graph(summary.thread_id)
+            try:
+                stored_replay = await asyncio.to_thread(
+                    read_thread_replay,
+                    summary.thread_id,
+                    handoff_graph=handoff_graph,
+                )
+            except Exception:
+                logger.warning(
+                    "Codex stored transcript replay failed for thread=%s",
+                    summary.thread_id,
+                    exc_info=True,
+                )
             snapshot = await asyncio.to_thread(
                 inspect_rollout, summary.thread_id, hinted_path=summary.rollout_path or None,
             )
-            if snapshot is not None:
-                try:
-                    stored_replay = await asyncio.to_thread(
-                        read_thread_replay,
-                        summary.thread_id,
-                        handoff_graph=handoff_graph,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Codex stored transcript replay failed for thread=%s",
-                        summary.thread_id,
-                        exc_info=True,
-                    )
-                if stored_replay is not None:
-                    refreshed = await asyncio.to_thread(
-                        inspect_rollout,
-                        summary.thread_id,
-                        hinted_path=snapshot.path,
-                    )
-                    if refreshed is not None:
-                        snapshot = refreshed
+            if snapshot is not None and stored_replay is not None:
+                refreshed = await asyncio.to_thread(
+                    inspect_rollout,
+                    summary.thread_id,
+                    hinted_path=snapshot.path,
+                )
+                if refreshed is not None:
+                    snapshot = refreshed
         replay_events = []
         replay_status = ""
         replay_error_code = ""
         replay_final_text = ""
-        if snapshot is not None and snapshot.active_turn_id:
-            active_events = await asyncio.to_thread(
-                collect_active_commentary,
-                summary.thread_id,
-                snapshot,
-                handoff_graph=handoff_graph,
-            )
-            predecessor_events = []
-            if stored_replay is not None and stored_replay.turn_id == snapshot.active_turn_id:
-                predecessor_events = [
-                    event for event in _stored_replay_events(stored_replay)
-                    if event.turn_id != snapshot.active_turn_id
-                ]
-            replay_events = predecessor_events + active_events
-            replay_status = "in_progress"
-            replay_final_text = snapshot.latest_final_text
-        elif snapshot is not None and stored_replay is not None:
-            snapshot_latest_id = getattr(snapshot, "latest_turn_id", None)
-            # The stable thread read can race a terminal rollout append.  The
-            # refreshed file snapshot is authoritative when it has already
-            # closed the exact turn that thread/read still called in-progress.
+        if stored_replay is not None:
+            replay_status = stored_replay.status
+            replay_error_code = stored_replay.error_code
             if (
-                stored_replay.status == "in_progress"
-                and snapshot_latest_id == stored_replay.turn_id
+                replay_status in _REPLAYABLE_TERMINAL_STATES
+                or replay_status == "in_progress"
+                or (replay_status == "completed" and not stored_replay.final_text)
             ):
-                replay_status = getattr(snapshot, "latest_turn_status", "")
-                replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
-                has_final = bool(getattr(snapshot, "latest_turn_has_final", False))
-                if replay_status in _REPLAYABLE_TERMINAL_STATES or not has_final:
-                    current_events = await asyncio.to_thread(
+                replay_events = _stored_replay_events(stored_replay)
+            if replay_status == "completed":
+                replay_final_text = stored_replay.final_text
+
+            # Persisted app-server history is replay's authority. Raw rollout
+            # parsing is limited to the live edge where an in-progress turn or
+            # just-written terminal frame may not have reached storage yet.
+            if snapshot is not None and replay_status == "in_progress":
+                snapshot_latest_id = getattr(snapshot, "latest_turn_id", None)
+                if snapshot_latest_id == stored_replay.turn_id:
+                    live_status = getattr(snapshot, "latest_turn_status", "")
+                    if live_status and live_status != "in_progress":
+                        replay_status = live_status
+                        replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
+                    live_events = await asyncio.to_thread(
                         collect_latest_turn_commentary,
                         summary.thread_id,
                         snapshot,
                         handoff_graph=handoff_graph,
                     )
-                    predecessor_events = [
-                        event for event in _stored_replay_events(stored_replay)
-                        if event.turn_id != stored_replay.turn_id
-                    ]
-                    replay_events = predecessor_events + current_events
-                if has_final:
-                    replay_final_text = snapshot.latest_final_text
-            else:
-                replay_status = stored_replay.status
-                replay_error_code = stored_replay.error_code
-                if (
-                    replay_status in _REPLAYABLE_TERMINAL_STATES
-                    or replay_status == "in_progress"
-                    or (replay_status == "completed" and not stored_replay.final_text)
-                ):
-                    replay_events = _stored_replay_events(stored_replay)
-                if replay_status == "completed":
-                    replay_final_text = stored_replay.final_text or snapshot.latest_final_text
+                    seen = {(event.turn_id, event.text) for event in replay_events}
+                    replay_events.extend(
+                        event for event in live_events
+                        if (event.turn_id, event.text) not in seen
+                    )
+                    if bool(getattr(snapshot, "latest_turn_has_final", False)):
+                        replay_final_text = snapshot.latest_final_text
         elif snapshot is not None:
             replay_status = getattr(snapshot, "latest_turn_status", "")
             replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
@@ -806,9 +802,7 @@ class GatewayCodexBridgeMixin:
                     self._codex_bridge_forget_binding_runtime(previous)
                     previous_lane_source = dataclasses.replace(
                         control_source,
-                        trusted_local_lane=(
-                            f"codex-binding:{previous.control_session_key}:{previous.generation}"
-                        ),
+                        trusted_local_lane=self._codex_bridge_lane_name(previous),
                     )
                     previous_lane = (
                         self._session_key_for_source(previous_lane_source), previous_lane_source,
@@ -914,7 +908,7 @@ class GatewayCodexBridgeMixin:
     def _codex_bridge_lane_key(self, source: SessionSource, binding: CodexBridgeBinding) -> str:
         lane = dataclasses.replace(
             self._codex_bridge_control_source(source),
-            trusted_local_lane=f"codex-binding:{binding.control_session_key}:{binding.generation}",
+            trusted_local_lane=self._codex_bridge_lane_name(binding),
         )
         return self._session_key_for_source(lane)
 
@@ -1301,36 +1295,76 @@ class GatewayCodexBridgeMixin:
         self, store: CodexBridgeStore, binding: CodexBridgeBinding,
         progress: DurableCodexProgress, adapter: Any,
     ) -> None:
-        """Deliver one durable progress card; legacy editable rows remain recoverable."""
+        """Deliver one immutable progress card through the global outbox."""
+        from gateway.delivery_ledger import (
+            compute_semantic_obligation_id,
+            ensure_obligation,
+            mark_attempting,
+            mark_delivered,
+            mark_failed,
+            obligation_state,
+        )
+
         metadata = dict(self._thread_metadata_for_source(binding.source) or {})
         metadata["_interim_send"] = True
+        lane_key = self._codex_bridge_lane_key(binding.source, binding)
+        logical_key = (
+            f"codex-progress:{binding.thread_id}:{binding.control_session_key}:"
+            f"{binding.generation}:{progress.logical_turn_id}:"
+            f"{hashlib.sha256(progress.content.encode('utf-8')).hexdigest()[:16]}"
+        )
+        obligation_id = compute_semantic_obligation_id(lane_key, logical_key, "progress")
+        await self._codex_bridge_ledger_call(
+            binding.source,
+            ensure_obligation,
+            obligation_id=obligation_id,
+            session_key=lane_key,
+            platform=binding.source.platform.value,
+            chat_id=binding.source.chat_id,
+            thread_id=binding.source.thread_id,
+            content=progress.content,
+            adapter_profile=getattr(adapter, "_owner_profile", None),
+            logical_key=logical_key,
+            output_kind="progress",
+            delivery_sequence=1,
+        )
+        state = await self._codex_bridge_ledger_call(
+            binding.source, obligation_state, obligation_id,
+        )
+        if state == "delivered":
+            store.mark_progress_delivered(progress, progress.message_id)
+            return
+        if state not in {"pending", "failed"}:
+            return
+        claimed = await self._codex_bridge_ledger_call(
+            binding.source, mark_attempting, obligation_id,
+        )
+        if not claimed:
+            return
         try:
-            if progress.message_id:
-                result = await asyncio.wait_for(
-                    adapter.edit_message(
-                        binding.source.chat_id, progress.message_id,
-                        progress.content, metadata=metadata,
-                    ),
-                    timeout=20.0,
-                )
-            else:
-                result = await asyncio.wait_for(
-                    adapter.send(
-                        binding.source.chat_id, progress.content, metadata=metadata,
-                    ),
-                    timeout=20.0,
-                )
+            result = await asyncio.wait_for(
+                adapter.send(
+                    binding.source.chat_id, progress.content, metadata=metadata,
+                ),
+                timeout=20.0,
+            )
         except Exception as exc:
+            await self._codex_bridge_ledger_call(
+                binding.source, mark_failed, obligation_id, str(exc)[:500],
+            )
             store.mark_progress_failed(progress, str(exc))
             raise
         if not getattr(result, "success", False):
             error = str(getattr(result, "error", "") or "progress delivery failed")
-            if progress.message_id and getattr(result, "error_kind", None) == "not_found":
-                store.clear_progress_message(progress, error)
-            else:
-                store.mark_progress_failed(progress, error)
+            await self._codex_bridge_ledger_call(
+                binding.source, mark_failed, obligation_id, error[:500],
+            )
+            store.mark_progress_failed(progress, error)
             raise RuntimeError(f"Codex progress delivery failed: {error}")
         message_id = getattr(result, "message_id", None) or progress.message_id
+        await self._codex_bridge_ledger_call(
+            binding.source, mark_delivered, obligation_id,
+        )
         if not store.mark_progress_delivered(progress, message_id):
             raise RuntimeError("Codex progress changed while delivery was in flight")
 

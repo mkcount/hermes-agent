@@ -148,6 +148,22 @@ def test_restart_does_not_steal_live_gateway_input(tmp_path, monkeypatch):
     assert store.recoverable_inputs() == []
 
 
+def test_restart_replays_pre_guard_telegram_inbox_and_batch_claim_is_atomic(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    first_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source, "77"))
+    second_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source, "78"))
+
+    store.recover_after_restart()
+
+    assert [row.input_id for row in store.recoverable_inputs()] == [first_id, second_id]
+    merged = _event(binding.source, "77")
+    merged.text = "first chunk\nsecond chunk"
+    assert store.claim_batched_input(first_id, merged, [second_id])
+    assert store.input_state(first_id) == "executing"
+    assert store.input_state(second_id) == "cancelled"
+
+
 def test_restart_never_replays_a_possibly_submitted_turn(tmp_path, monkeypatch):
     store = CodexBridgeStore(tmp_path / "state.db")
     binding = store.bind("control", _source(), thread_id="thread-a")
