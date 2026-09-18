@@ -741,20 +741,29 @@ class GatewayCodexBridgeMixin:
                     if bool(getattr(snapshot, "latest_turn_has_final", False)):
                         replay_final_text = snapshot.latest_final_text
         elif snapshot is not None:
-            replay_status = getattr(snapshot, "latest_turn_status", "")
-            replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
-            has_final = bool(getattr(snapshot, "latest_turn_has_final", False))
-            if replay_status in _REPLAYABLE_TERMINAL_STATES or (
-                replay_status == "completed" and not has_final
-            ):
+            if getattr(snapshot, "active_turn_id", None):
+                replay_status = "in_progress"
                 replay_events = await asyncio.to_thread(
-                    collect_latest_turn_commentary,
+                    collect_active_commentary,
                     summary.thread_id,
                     snapshot,
                     handoff_graph=handoff_graph,
                 )
-            if not replay_status or has_final:
-                replay_final_text = snapshot.latest_final_text
+            else:
+                replay_status = getattr(snapshot, "latest_turn_status", "")
+                replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
+                has_final = bool(getattr(snapshot, "latest_turn_has_final", False))
+                if replay_status in _REPLAYABLE_TERMINAL_STATES or (
+                    replay_status == "completed" and not has_final
+                ):
+                    replay_events = await asyncio.to_thread(
+                        collect_latest_turn_commentary,
+                        summary.thread_id,
+                        snapshot,
+                        handoff_graph=handoff_graph,
+                    )
+                if not replay_status or has_final:
+                    replay_final_text = snapshot.latest_final_text
         previous_lane = None
         async with self._codex_bridge_binding_lock(control_key):
             previous = store.get_binding(control_key)

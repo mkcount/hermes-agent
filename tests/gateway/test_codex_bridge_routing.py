@@ -428,7 +428,7 @@ async def test_selecting_another_thread_interrupts_the_running_previous_lane(
     bridge._interrupt_and_clear_session.assert_awaited_once()
     call = bridge._interrupt_and_clear_session.await_args
     assert call.args[0] == previous_lane_key
-    assert call.args[1].trusted_local_lane.endswith(f":{previous.generation}")
+    assert call.args[1].trusted_local_lane == "codex-thread:thread-old"
     assert call.kwargs == {
         "interrupt_reason": "Stop requested",
         "invalidation_reason": "codex_binding_changed",
