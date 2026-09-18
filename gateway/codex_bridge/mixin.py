@@ -721,6 +721,7 @@ class GatewayCodexBridgeMixin:
             # parsing is limited to the live edge where an in-progress turn or
             # just-written terminal frame may not have reached storage yet.
             if snapshot is not None and replay_status == "in_progress":
+                replay_final_text = str(getattr(snapshot, "latest_final_text", "") or "")
                 snapshot_latest_id = getattr(snapshot, "latest_turn_id", None)
                 if snapshot_latest_id == stored_replay.turn_id:
                     live_status = getattr(snapshot, "latest_turn_status", "")
@@ -743,6 +744,7 @@ class GatewayCodexBridgeMixin:
         elif snapshot is not None:
             if getattr(snapshot, "active_turn_id", None):
                 replay_status = "in_progress"
+                replay_final_text = str(getattr(snapshot, "latest_final_text", "") or "")
                 replay_events = await asyncio.to_thread(
                     collect_active_commentary,
                     summary.thread_id,
