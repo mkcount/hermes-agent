@@ -54,6 +54,9 @@ class _FakeGateway:
     def _running_agent_count(self):
         return len(self._running_agents)
 
+    def _codex_bridge_owns_restart_recovery(self, _session_key):
+        return False
+
     def _active_cron_job_count(self):
         # stop() reads this alongside _running_agent_count when logging the
         # drain snapshot (#60432) -- this fake has no cron scheduler, so

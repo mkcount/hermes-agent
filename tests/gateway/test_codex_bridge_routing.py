@@ -641,6 +641,40 @@ async def test_transport_rejected_turn_start_is_requeued_on_a_fresh_connection(t
 
 
 @pytest.mark.asyncio
+async def test_startup_failure_before_submission_gets_one_durable_retry(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    store.bind(build_session_key(source), source, thread_id="thread-123")
+    bridge = _Bridge(store)
+    bridge._adapter_for_source = lambda _source: SimpleNamespace(
+        _owner_profile=None,
+        register_post_delivery_callback=lambda *_args, **_kwargs: None,
+    )
+    routed = await bridge._resolve_codex_bridge_route(
+        _Adapter(), MessageEvent(text="continue", source=source, message_id="startup-retry"),
+    )
+    input_id = routed.metadata["codex_bridge_input_id"]
+    assert bridge._codex_bridge_begin_input(routed) is None
+    assert store.input_state(input_id) == "executing"
+    routed._codex_bridge_agent_result = {
+        "completed": False,
+        "codex_should_retire": True,
+        "codex_submission_not_admitted": True,
+        "error": "desktop control disconnected before turn/start",
+    }
+
+    first = await bridge._codex_bridge_finalize_input(routed, "lane", "", 1)
+    assert "자동으로 다시 시도합니다" in first
+    assert store.input_state(input_id) == "pending"
+    assert [item.input_id for item in store.recoverable_inputs()] == [input_id]
+
+    assert store.mark_executing(input_id)
+    second = await bridge._codex_bridge_finalize_input(routed, "lane", "", 2)
+    assert "같은 메시지를 다시 보내 주세요" in second
+    assert store.input_state(input_id) == "executed"
+
+
+@pytest.mark.asyncio
 async def test_second_transport_rejection_stops_retrying_and_requests_resend(tmp_path):
     store = CodexBridgeStore(tmp_path / "state.db")
     source = _source()

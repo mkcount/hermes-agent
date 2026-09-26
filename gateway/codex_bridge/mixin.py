@@ -527,7 +527,7 @@ class GatewayCodexBridgeMixin:
             )
             return None
         proven_not_admitted = (
-            current_state == "submitting"
+            current_state in {"executing", "submitting"}
             and bool(transport.get("codex_submission_not_admitted"))
             and not codex_turn_id
         )

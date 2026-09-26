@@ -935,7 +935,7 @@ class CodexBridgeStore:
         return bool(cur.rowcount)
 
     def retry_unaccepted_submission(self, input_id: str, error: str = "") -> bool:
-        """Requeue a turn/start frame proven not to have entered the transport."""
+        """Requeue a user input proven not to have entered turn/start."""
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE codex_bridge_inputs
@@ -945,7 +945,7 @@ class CodexBridgeStore:
                        output_kind='none', delivery_status='none',
                        unaccepted_retry_count=unaccepted_retry_count + 1,
                        updated_at=?, last_error=?
-                   WHERE input_id=? AND state='submitting' AND codex_turn_id IS NULL
+                   WHERE input_id=? AND state IN ('executing','submitting') AND codex_turn_id IS NULL
                      AND unaccepted_retry_count < 1""",
                 (
                     time.time(),

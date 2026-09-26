@@ -73,6 +73,7 @@ class TurnResult:
 # Some codex versions stream ``<turn_aborted>`` as raw agentMessage text when an
 # interrupt/upstream error tears the turn down without emitting turn/completed.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+_FOREIGN_WRITER_WAIT_SECONDS = 30.0
 
 
 def _first_scope_id(*lookups: tuple[Any, str, str]) -> Any:
@@ -362,7 +363,7 @@ class CodexAppServerSession:
         if self._client is None:
             control_socket = (
                 find_codex_control_socket(self._codex_home)
-                if self._prefer_desktop_control_socket and self._resume_thread_id else None
+                if self._prefer_desktop_control_socket else None
             )
             try:
                 self._connect_client(control_socket)
@@ -395,6 +396,7 @@ class CodexAppServerSession:
                 if self._interrupt_event.is_set():
                     raise InterruptedError(wait_error)
                 raise RuntimeError(wait_error)
+        writer_conflict_deadline = None
         while True:
             try:
                 result = self._client.request(method, params, timeout=15)
@@ -411,10 +413,18 @@ class CodexAppServerSession:
                 ):
                     # Codex enforces one writer per durable thread. A desktop
                     # turn can therefore make thread/resume temporarily fail
-                    # before this app-server has enough state to poll it. Keep
-                    # the Telegram input durable and retry acquisition; never
-                    # fork, interrupt, or silently run it in another thread.
-                    if self._interrupt_event.wait(0.5) or self._closed:
+                    # before this app-server has enough state to poll it. An
+                    # abandoned foreign app-server can also hold the writer
+                    # forever; bound that wait instead of hanging a Telegram turn.
+                    now = time.monotonic()
+                    if writer_conflict_deadline is None:
+                        writer_conflict_deadline = now + _FOREIGN_WRITER_WAIT_SECONDS
+                    remaining = writer_conflict_deadline - now
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            "another Codex process owns the thread; release its writer before retrying"
+                        ) from exc
+                    if self._interrupt_event.wait(min(2.0, remaining)) or self._closed:
                         raise InterruptedError(
                             "Codex resume cancelled while waiting for the desktop writer"
                         ) from exc
@@ -554,6 +564,8 @@ class CodexAppServerSession:
             result.interrupted = True
             return False
         except (CodexAppServerError, TimeoutError, RuntimeError, OSError) as exc:
+            # Startup has not crossed the turn/start submission fence.
+            result.submission_not_admitted = True
             self._retire(result, self._format_error_with_stderr("codex app-server startup failed", exc))
             return False
         assert self._client is not None and self._thread_id is not None

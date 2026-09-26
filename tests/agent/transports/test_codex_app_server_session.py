@@ -198,6 +198,40 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_bridge_new_thread_uses_desktop_control_when_available(self):
+        client = FakeClient()
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp", client_factory=factory, prefer_desktop_control_socket=True,
+        )
+        with patch.object(session_mod, "find_codex_control_socket", return_value="/tmp/codex.sock"):
+            assert session.ensure_started() == "thread-fake-001"
+
+        assert captured["control_socket_path"] == "/tmp/codex.sock"
+        assert [method for method, _ in client.requests] == ["thread/start"]
+        session.close()
+
+    def test_startup_failure_before_turn_start_is_proven_unsubmitted(self):
+        client = FakeClient()
+
+        def handle(method, _params):
+            if method == "thread/resume":
+                raise RuntimeError("desktop control disconnected")
+            return {}
+
+        client._request_handler = handle
+        result = make_session(client, resume_thread_id="existing-thread").run_turn("hello")
+
+        assert result.should_retire is True
+        assert result.submission_not_admitted is True
+        assert result.turn_id is None
+        assert not any(method == "turn/start" for method, _ in client.requests)
+
     def test_queue_mode_serializes_writers_by_durable_thread(self):
         first = make_session(
             FakeClient(), resume_thread_id="shared-thread", resume_active_turn_mode="queue",
@@ -309,6 +343,41 @@ class TestLifecycle:
 
         assert attempts == 2
         assert not any(method == "thread/fork" for method, _ in client.requests)
+
+    def test_foreign_writer_conflict_is_bounded_and_never_submits_user_input(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+        attempts = 0
+        clock = VirtualClock()
+
+        def handle(method, _params):
+            nonlocal attempts
+            if method == "thread/resume":
+                attempts += 1
+                if attempts >= 25:
+                    raise AssertionError("unbounded writer retry")
+                raise CodexAppServerError(-32600, "thread already has an active writer")
+            return {}
+
+        def wait(seconds):
+            clock.advance(seconds)
+            return False
+
+        client._request_handler = handle
+        session = make_session(
+            client, resume_thread_id="desktop-thread", resume_active_turn_mode="queue",
+        )
+        with (
+            patch.object(session_mod.time, "monotonic", clock),
+            patch.object(session._interrupt_event, "wait", side_effect=wait),
+        ):
+            with pytest.raises(RuntimeError, match="another Codex process owns the thread"):
+                session.ensure_started()
+
+        assert attempts < 20
+        assert clock.value <= 35
+        assert not any(method == "turn/start" for method, _ in client.requests)
 
     def test_stop_before_resume_does_not_acquire_or_retire_writer(self):
         client = FakeClient()

@@ -42,6 +42,8 @@ def fake_session(monkeypatch):
             error=None,
             turn_id="turn-stub-1",
             thread_id="thread-stub-1",
+            turn_status="completed",
+            turn_status_confirmed=True,
         )
 
     monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
@@ -144,6 +146,8 @@ class TestRunConversationCodexPath:
                 turn_id="turn-compact-1",
                 thread_id="thread-compact-1",
                 compacted=True,
+                turn_status="completed",
+                turn_status_confirmed=True,
                 token_usage_last={
                     "totalTokens": 300_000,
                     "inputTokens": 300_000,
