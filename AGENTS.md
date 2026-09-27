@@ -404,6 +404,11 @@ extract, not to regex around it.
 
 ## Routing Table — working in X → read X/AGENTS.md
 
+For Telegram↔Codex bridge code changes, use the user-global Codex skill
+`~/.codex/skills/hermes-codex-map/SKILL.md`. Before finishing the task, update its affected
+`references/` maps and line coverage, and run the skill's coverage check. Keep the map in the
+global skill, not in this repository.
+
 | Area | Read | Covers |
 |---|---|---|
 | `run_agent.py`, `agent/` | `agent/AGENTS.md` | AIAgent + mixins, turn phases, caching integrity, message-flow invariants, compression, model/aux resolution |
