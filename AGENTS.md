@@ -404,8 +404,6 @@ extract, not to regex around it.
 
 ## Routing Table — working in X → read X/AGENTS.md
 
-When changing Telegram↔Codex bridge code, update the affected `docs/codex-bridge/` map and coverage in the same change.
-
 | Area | Read | Covers |
 |---|---|---|
 | `run_agent.py`, `agent/` | `agent/AGENTS.md` | AIAgent + mixins, turn phases, caching integrity, message-flow invariants, compression, model/aux resolution |
