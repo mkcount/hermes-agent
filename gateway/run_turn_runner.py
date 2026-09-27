@@ -1798,6 +1798,8 @@ class TurnRunner:
             "error": result.get("error"),
             "codex_thread_id": result.get("codex_thread_id"),
             "codex_turn_id": result.get("codex_turn_id"),
+            "codex_turn_status": result.get("codex_turn_status"),
+            "codex_turn_status_confirmed": result.get("codex_turn_status_confirmed", False),
             "codex_submission_started": result.get("codex_submission_started", False),
             "codex_submission_not_admitted": result.get("codex_submission_not_admitted", False),
             "codex_should_retire": result.get("codex_should_retire", False),

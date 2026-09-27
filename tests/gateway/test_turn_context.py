@@ -69,10 +69,19 @@ class TestTurnRunner:
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
 
-    def test_normal_response_preserves_compression_exhausted(self):
-        """A non-empty exhaustion response must still reach auto-reset consumers."""
+    @pytest.mark.parametrize(
+        ("turn_status", "failed", "compression_exhausted", "final_response"),
+        [
+            ("failed", True, True, "Context length exceeded. Cannot compress further."),
+            ("completed", False, False, "Codex task complete."),
+        ],
+    )
+    def test_normal_response_preserves_runtime_metadata(
+        self, turn_status, failed, compression_exhausted, final_response,
+    ):
+        """A confirmed Codex status must survive gateway response shaping."""
 
-        class _ExhaustedAgent:
+        class _ResultAgent:
             def __init__(self, **kwargs):
                 self.model = kwargs["model"]
                 self.session_id = kwargs["session_id"]
@@ -86,9 +95,11 @@ class TestTurnRunner:
 
             def run_conversation(self, _message, **_kwargs):
                 return {
-                    "final_response": "Context length exceeded. Cannot compress further.",
-                    "failed": True,
-                    "compression_exhausted": True,
+                    "final_response": final_response,
+                    "failed": failed,
+                    "compression_exhausted": compression_exhausted,
+                    "codex_turn_status": turn_status,
+                    "codex_turn_status_confirmed": True,
                     "messages": [],
                 }
 
@@ -131,7 +142,7 @@ class TestTurnRunner:
             session_id="test-session",
             session_key="test-session-key",
             user_config={},
-            AIAgent=_ExhaustedAgent,
+            AIAgent=_ResultAgent,
             resolve_display_setting=lambda *_args: False,
             _run_still_current=lambda: True,
             _hooks_ref=SimpleNamespace(loaded_hooks=False),
@@ -141,7 +152,7 @@ class TestTurnRunner:
 
         result = TurnRunner(gateway_runner, ctx).run_sync()
 
-        assert result["final_response"] == (
-            "Context length exceeded. Cannot compress further."
-        )
-        assert result["compression_exhausted"] is True
+        assert result["final_response"] == final_response
+        assert result["compression_exhausted"] is compression_exhausted
+        assert result["codex_turn_status"] == turn_status
+        assert result["codex_turn_status_confirmed"] is True
