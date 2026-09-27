@@ -1,10 +1,10 @@
 # Hermes Telegram ↔ Codex 브리지 구조
 
-- 검증한 소스 커밋: `a9fa345032a6dfd9805fc6ddd0296f80d818c89c`
+- 검증한 소스 커밋: `e9e415be2464ef4907f863011e22bb788e8ee3c7`
 - upstream 공통 기준점: `a6102b8d809d6b32824757b547b60f9d22d6a88e`
-- 범위: 기준점부터 위 검증 커밋까지 `mkcount`으로 기록된 27개 커밋의 비테스트 변경 30개 파일, 추가 6,062줄·삭제 230줄. Git 작성자 정보는 직접 타이핑한 사람의 증거가 아니다.
+- 범위: 기준점부터 위 검증 커밋까지의 브리지 비테스트 변경 30개 파일, 추가 6,173줄·삭제 230줄. Git 작성자 정보는 직접 타이핑한 사람의 증거가 아니다.
 - 읽기 기준: 새 브리지 6개 파일 전체와 기존 파일의 변경 줄·호출·반환 경로. ReloginTool 저장소 내부와 테스트 파일은 구조 장부에서 제외했다. 테스트는 수정 검증에 별도로 사용할 수 있다.
-- [줄·함수 장부](coverage.tsv)는 현재 파일의 추가 줄 6,062개를 빠짐없이 연결한다. 삭제 줄에는 현재 줄 번호가 없다. 자세한 실행·상태 경로는 [흐름 문서](flows.md)에 있다.
+- [줄·함수 장부](coverage.tsv)는 현재 파일의 추가 줄 6,173개를 빠짐없이 연결한다. 삭제 줄에는 현재 줄 번호가 없다. 자세한 실행·상태 경로는 [흐름 문서](flows.md)에 있다.
 - 이 문서는 소스 구조를 설명한다. 운영 프로세스·배포 상태·실제 Telegram 전달 여부는 별도 확인이 필요하다.
 
 ## 전체 관계도
@@ -36,20 +36,20 @@ flowchart LR
 | 파일 | 함수·메서드와 역할 |
 | --- | --- |
 | `gateway/codex_bridge/__init__.py` | 공개 binding/store 타입만 재노출하는 패키지 경계 |
-| `catalog.py` | `_normalized_turn_status`, `_normalized_error_code`, `_thread_replay`: 저장된 turn/items를 재생 프레임·최종 상태로 환원. `_thread_summary`, `_unique_thread_summaries`: picker용 중복 thread·제목 정리. `_list_thread_rows`, `_paged_data`, `_read_thread_turns`: 공식 API 페이징과 후계 턴 체인 조회. `list_recent_threads`, `read_thread_replay`, `list_recent_projects`: 사용자 선택·연결 시 조회 |
+| `catalog.py` | `_normalized_turn_status`, `_normalized_error_code`, `_replay_turn_ids`, `_thread_replay`: 최근 10개 턴과 정확한 handoff 선행 턴의 진행·최종 프레임을 복원. `_thread_summary`, `_unique_thread_summaries`: picker용 중복 thread·제목 정리. `_list_thread_rows`, `_paged_data`, `_read_thread_turns`: 공식 API 페이징과 `{turnId, item}` 해제·형식 검증. `list_recent_threads`, `read_thread_replay`, `list_recent_projects`: 사용자 선택·연결 시 조회와 빈 페이지의 `thread/read` 교차 확인 |
 | `handoff.py` | `CodexTurnHandoff`: handoff가 입력 소유권을 이어야 하는지 판단. `CodexHandoffGraph`: successor·pending 조회. `_read_handoffs`: JSON 파일 mtime/size 캐시 및 파싱. `read_thread_handoff_graph`, `read_turn_handoff`: 정확한 thread/turn 일치와 append-only 후계 체인 제공 |
 | `rollout.py` 앞부분 | `_codex_home`, `resolve_rollout_path`: 안전한 파일 탐색·session ID 검증. `_aligned_tail_start`, `_content`, `_client_id`, `_error_code`, `_is_user_authored`: JSONL 필드·출처 해석 |
 | `rollout.py` tail 수명 | `RolloutTail.__init__`, `set_handoff_graph`, `_reset_for_replacement`, `_record_time`, `_prime`, `prime_full`, `_prime_range`, `scan`: 커서·파일 incarnation·초기 이력·완전한 줄 처리 |
 | `rollout.py` 이벤트 해석 | `_defer_for_unbound_successor`, `_event`, `_turn`, `_expire_continuation`, `_flush_pending_commentary`, `_commentary`, `_turn_id_for_item`, `_emit`, `_consume`: 턴별 사용자/진행/최종/오류, 늦은 client ID, 중단 후속 턴을 하나의 사건 흐름으로 환원 |
 | `rollout.py` 복구 조회 | `find_terminal_for_client_id`, `_collect_turn_commentary`, `collect_active_commentary`, `collect_latest_turn_commentary`, `inspect_rollout`: 과거 정확한 결과와 연결 시 재생할 진행·상태 조회 |
-| `store.py` 스키마·바인딩 | `_transaction`, `_initialize`, `_owner_stamp`, `_owner_alive`, `_binding_from_row`, `get_binding`, `list_bindings`, `bind`, `unbind`, `promote_pending`, `set_inference`, `update_cursor`, `restart_mirror`: 프로필별 SQLite 권한·세대·커서 관리 |
+| `store.py` 스키마·바인딩 | `_transaction`, `_initialize`, `_owner_stamp`, `_owner_alive`, `_binding_from_row`, `get_binding`, `list_bindings`, `bind`, `unbind`, `promote_pending`, `set_inference`, `update_cursor`, `restart_mirror`: 프로필별 SQLite 권한·세대·커서 관리. 같은 바인딩의 표시 커서를 재시작해도 미전송 진행 행을 보존 |
 | `store.py` 진행 | `_progress_from_row`, `_truncate_progress`, `upsert_progress`, `list_progress`, `mark_progress_delivered`, `mark_progress_failed`, `clear_progress_message`, `complete_progress`: 카드 본문·재시도·최종 동결 |
 | `store.py` 입력 | `input_id`, `_event_to_json`, `_event_from_json`, `enqueue_input`, `mark_executing`, `claim_batched_input`, `mark_submitting`, `mark_running`, `mark_uncertain`, `retry_unaccepted_submission`, `mark_continuation_pending`: 조기 입력 기록과 전송 경계 |
 | `store.py` 결과 | `mark_executed`, `stage_terminal_output`, `capture_recovery_output`, `mark_completed`, `mark_delivery_pending`, `update_continuation_chain`, `reopen_for_rollout_reconciliation`: 물리적 턴 결과를 논리적 출력·장부 행으로 축약 |
 | `store.py` 종료·복구 | `cancel_active_input`, `release_for_retry`, `cancel_input`, `cancel_lane`, `has_lane_session`, `recover_after_restart`, `recoverable_inputs`, `recoverable_outputs`, `continuation_pending_inputs`, `legacy_completed_handoff_candidates`, `pending_legacy_rollout_recovery`, `reopen_legacy_handoff`, `finish_legacy_recovery_scan`, `_durable_input_from_full_row`, `claim_rollout_event`, `prune`, `input_state`, `input_turn_id`: 중단·재시작·예전 행 마이그레이션·rollout 소유권 판정 |
 | `mixin.py` 기본 경로 | `_split_progress_text`, `_stored_replay_events`, `_replay_state_message`, `_init_codex_bridge`, `_codex_bridge_binding_lock`, `_codex_bridge_home_for_source`, `_codex_bridge_store_for_source`, `_codex_bridge_ledger_call`, `_codex_bridge_control_source`, `_codex_bridge_control_key`, `_codex_bridge_lane_name`, `_codex_bridge_owns_restart_recovery`, `_codex_bridge_canonical_command`, `_codex_bridge_migrate_legacy_binding`, `_resolve_codex_bridge_route`: 프로필·control/lane 분리·사전 기록 |
 | `mixin.py` 실행·명령 | `_codex_bridge_begin_input`, `_configure_codex_bridge_agent`, `_codex_bridge_finalize_input`, `_codex_bridge_settle_input_delivery`, `_codex_bridge_release_input`, `_codex_bridge_cancel_input`, `_codex_bridge_cancel_lane`, `_codex_bridge_forget_binding_runtime`, `_codex_bridge_store_binding`, `_codex_bridge_status`, `_codex_bridge_lane_key`, `_codex_model_choice`, `_codex_inference_label`, `_handle_codex_model_command`, `_handle_codex_session_command`, `_handle_ns_command`: 턴 소유권·설정·사용자 제어 |
-| `mixin.py` watcher | `_codex_bridge_recover_input`, `_codex_bridge_recover_output`, `_codex_bridge_mirror_identity`, `_codex_bridge_stage_commentary`, `_codex_bridge_deliver_progress`, `_codex_bridge_retry_progress`, `_codex_bridge_mirror_final`, `_codex_bridge_poll_binding`, `_codex_bridge_reconcile_continuation`, `_codex_bridge_poll_binding_locked`, `_codex_bridge_watcher`: 복구·rollout 미러·장부 전달 |
+| `mixin.py` watcher | `_codex_bridge_recover_input`, `_codex_bridge_recover_output`, `_codex_bridge_mirror_identity`, `_codex_bridge_stage_commentary`, `_codex_bridge_stage_replay`, `_codex_bridge_deliver_progress`, `_codex_bridge_retry_progress`, `_codex_bridge_mirror_final`, `_codex_bridge_poll_binding`, `_codex_bridge_reconcile_continuation`, `_codex_bridge_poll_binding_locked`, `_codex_bridge_watcher`: 복구·rollout 미러·최근 기록의 순서 있는 장부 전달 |
 
 기존 파일 24개의 변경 역할은 아래와 같다. 각 파일의 세부 추가 줄은 TSV에 들어 있다.
 
@@ -87,3 +87,4 @@ flowchart LR
 3. 텍스트 일반 메시지는 PTB 반환 전 SQLite 기록이 명시되어 있다. 긴 `/command` 조각은 Telegram 어댑터에서 별도 debounce 경로를 사용하므로, 모든 입력 유형에 동일한 조기 기록 시점을 일반화할 수 없다.
 4. outbox의 `attempting`은 전송 성공을 뜻하지 않는다. ACK가 모호한 경우나 `manual_review` 행은 운영 점검이 필요하다. 소스 분석만으로 특정 메시지가 Telegram에 실제 도착했다고 말할 수 없다.
 5. 구조 장부는 테스트 파일을 제외한다. `a9fa345032`의 상태 전달 수정은 회귀 테스트로 검증했지만, 배포 프로세스·현재 DB 행·Telegram 실전 동작은 별도 운영 점검 대상이다.
+6. `/codex_session`은 최근 10개 턴과 handoff 선행 턴의 진행·최종 프레임을 별도 메시지로 재생한다. App Server 기록을 읽지 못하면 rollout의 현재 턴만 명시적으로 보여 주며, 두 출처 모두 없으면 기존 연결을 바꾸지 않는다.

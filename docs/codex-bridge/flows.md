@@ -1,15 +1,15 @@
 # Hermes Telegram ↔ Codex 브리지 실행·상태 흐름
 
-- 검증한 소스 커밋: `a9fa345032a6dfd9805fc6ddd0296f80d818c89c`
+- 검증한 소스 커밋: `e9e415be2464ef4907f863011e22bb788e8ee3c7`
 - 대상과 범위는 [구조 개요](overview.md)를 따른다. 관심 경로만 읽고 상세 변경 줄은 [장부](coverage.tsv)에서 찾는다.
 
 ## 실제 경로를 따라 읽은 결과
 
 ### 1. 바인딩과 명령
 
-`/codex_session`의 정식 이름은 `codex-session`이고 `/codex_model`은 `codex-model`의 별칭이다. `hermes_cli/commands.py`가 명령과 별칭을 등록하고 `gateway/run_busy.py`의 idle handler 목록이 mixin의 `_handle_codex_session_command`, `_handle_codex_model_command`, `_handle_ns_command`를 찾는다. 세 명령 모두 Telegram 개인 대화만 허용한다. `catalog.py`는 공식 app-server `thread/list`, `thread/turns/list`, `thread/items/list`를 페이지 단위로 읽고 중복 thread 행을 합친다. 가능한 경우 데스크톱 control socket을 먼저 사용한다. `/ns`는 최근 세션의 실제 `cwd` 중 존재하는 프로젝트를 보여 준다. 근거: [`hermes_cli/commands.py`](../../hermes_cli/commands.py), [`gateway/run_busy.py`](../../gateway/run_busy.py), [`gateway/codex_bridge/catalog.py`](../../gateway/codex_bridge/catalog.py), [`gateway/codex_bridge/mixin.py`](../../gateway/codex_bridge/mixin.py).
+`/codex_session`의 정식 이름은 `codex-session`이고 `/codex_model`은 `codex-model`의 별칭이다. `hermes_cli/commands.py`가 명령과 별칭을 등록하고 `gateway/run_busy.py`의 idle handler 목록이 mixin의 `_handle_codex_session_command`, `_handle_codex_model_command`, `_handle_ns_command`를 찾는다. 세 명령 모두 Telegram 개인 대화만 허용한다. `catalog.py`는 공식 app-server `thread/list`, `thread/turns/list`, `thread/items/list`를 페이지 단위로 읽고 중복 thread 행을 합친다. `thread/items/list`의 `{turnId, item}` 포장을 검증해 풀고 최근 10개 턴 및 정확한 handoff 선행 턴의 진행·최종 프레임을 읽는다. 완료된 턴의 페이지가 비면 `thread/read`와 교차 확인한다. 가능한 경우 데스크톱 control socket을 먼저 사용한다. `/ns`는 최근 세션의 실제 `cwd` 중 존재하는 프로젝트를 보여 준다. 근거: [`hermes_cli/commands.py`](../../hermes_cli/commands.py), [`gateway/run_busy.py`](../../gateway/run_busy.py), [`gateway/codex_bridge/catalog.py`](../../gateway/codex_bridge/catalog.py), [`gateway/codex_bridge/mixin.py`](../../gateway/codex_bridge/mixin.py).
 
-선택한 기존 세션은 `store.bind()`로 새 generation을 받고, 기존 연결을 다시 선택하면 generation은 유지하면서 `restart_mirror()`로 표시용 커서와 progress를 재시작한다. 연결 해제는 `unbind()`, `/ns`는 임시 thread ID로 `pending_new`를 기록하고 첫 `turn/start` 성공 후 `promote_pending()`으로 실제 thread ID로 바꾼다. `/codex_model`은 현재 binding에 model/effort를 한 쌍으로 CAS 갱신하며 다음 턴부터 적용한다. 선택 버튼은 Telegram 어댑터에서 `(chat_id, bot_message_id)`별로 관리하고 10분 후 만료되며, 중복 선택은 콜백 실행 전 상태를 제거해서 막는다. 근거: [`gateway/codex_bridge/store.py`](../../gateway/codex_bridge/store.py), [`plugins/platforms/telegram/adapter.py`](../../plugins/platforms/telegram/adapter.py).
+선택한 기존 세션은 `store.bind()`로 새 generation을 받고, 기존 연결을 다시 선택하면 generation은 유지하면서 `restart_mirror()`로 표시용 커서만 갱신한다. 미전송 진행·재생 행은 지우지 않는다. App Server 기록이 한 턴 늦으면 rollout의 정확한 활성·최신 턴을 합치고, 이전 턴의 최종 텍스트를 새 턴의 답변으로 오인하지 않는다. 같은 연결을 다시 선택할 때는 재생 항목을 SQLite에 저장한 뒤 커서를 파일 끝으로 옮기고, watcher가 `history` outbox를 통해 순서대로 별도 메시지로 보낸다. 전송 실패 시 앞 항목부터 재시도하고 한 조회 주기에 최대 네 항목을 처리한다. 저장 기록과 rollout을 모두 확인할 수 없으면 바인딩을 바꾸지 않는다. 연결 해제는 `unbind()`, `/ns`는 임시 thread ID로 `pending_new`를 기록하고 첫 `turn/start` 성공 후 `promote_pending()`으로 실제 thread ID로 바꾼다. `/codex_model`은 현재 binding에 model/effort를 한 쌍으로 CAS 갱신하며 다음 턴부터 적용한다. 선택 버튼은 Telegram 어댑터에서 `(chat_id, bot_message_id)`별로 관리하고 10분 후 만료되며, 중복 선택은 콜백 실행 전 상태를 제거해서 막는다. 근거: [`gateway/codex_bridge/store.py`](../../gateway/codex_bridge/store.py), [`gateway/codex_bridge/mixin.py`](../../gateway/codex_bridge/mixin.py), [`plugins/platforms/telegram/adapter.py`](../../plugins/platforms/telegram/adapter.py).
 
 ### 2. 일반 Telegram 입력
 
