@@ -20,6 +20,7 @@ _MODEL_SWITCH_NOTE_RE = re.compile(
     r"Adjust your self-identification accordingly\.\]\s*",
     re.IGNORECASE,
 )
+RECENT_REPLAY_TURNS = 10
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class CodexReplayFrame:
     event_id: str
     turn_id: str
     text: str
+    kind: str = "commentary"
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,8 @@ class CodexThreadReplay:
     commentary: tuple[CodexReplayFrame, ...]
     final_text: str = ""
     error_code: str = ""
+    frames: tuple[CodexReplayFrame, ...] = ()
+    recent_turn_ids: tuple[str, ...] = ()
 
 
 def _normalized_turn_status(value: object) -> str:
@@ -82,6 +86,28 @@ def _normalized_error_code(value: object) -> str:
     return snake.lower()
 
 
+def _replay_turn_ids(
+    history: list[dict], handoff_graph: Optional[CodexHandoffGraph],
+) -> set[str]:
+    """Include ten recent turns and any exact predecessors that own their commentary."""
+    required = {str(turn["id"]) for turn in history[-RECENT_REPLAY_TURNS:]}
+    if handoff_graph is None:
+        return required
+    predecessor_by_successor = {
+        str(successor): str(predecessor)
+        for predecessor, successor in handoff_graph.successors.items()
+        if predecessor and successor
+    }
+    for turn_id in tuple(required):
+        cursor = turn_id
+        while cursor in predecessor_by_successor:
+            cursor = predecessor_by_successor[cursor]
+            if cursor in required:
+                break
+            required.add(cursor)
+    return required
+
+
 def _thread_replay(
     value: object, *, handoff_graph: Optional[CodexHandoffGraph] = None,
 ) -> Optional[CodexThreadReplay]:
@@ -98,25 +124,16 @@ def _thread_replay(
 
     latest = history[-1]
     turn_id = str(latest.get("id") or "").strip()
-    chain_ids = {turn_id}
-    if handoff_graph is not None:
-        predecessor_by_successor = {
-            str(successor): str(predecessor)
-            for predecessor, successor in handoff_graph.successors.items()
-            if predecessor and successor
-        }
-        cursor = turn_id
-        while cursor in predecessor_by_successor:
-            cursor = predecessor_by_successor[cursor]
-            if cursor in chain_ids:
-                break
-            chain_ids.add(cursor)
+    selected_ids = _replay_turn_ids(history, handoff_graph)
+    latest_chain = _replay_turn_ids(history[-1:], handoff_graph)
+    recent_turn_ids = tuple(str(turn["id"]) for turn in history[-RECENT_REPLAY_TURNS:])
 
     commentary: list[CodexReplayFrame] = []
+    frames: list[CodexReplayFrame] = []
     final_text = ""
     for turn in history:
         current_turn_id = str(turn.get("id") or "").strip()
-        if current_turn_id not in chain_ids:
+        if current_turn_id not in selected_ids:
             continue
         items = turn.get("items")
         if not isinstance(items, list):
@@ -128,16 +145,20 @@ def _thread_replay(
             if not text:
                 continue
             phase = str(item.get("phase") or "").replace("_", "").lower()
-            if phase == "commentary":
+            if phase in {"commentary", "finalanswer"}:
                 item_id = str(item.get("id") or "").strip()
                 identity = item_id or hashlib.sha256(
                     f"{current_turn_id}\0{index}\0{text}".encode("utf-8")
                 ).hexdigest()
-                commentary.append(CodexReplayFrame(
+                frame = CodexReplayFrame(
                     event_id=identity, turn_id=current_turn_id, text=text,
-                ))
-            elif current_turn_id == turn_id and phase == "finalanswer":
-                final_text = text
+                    kind="final" if phase == "finalanswer" else "commentary",
+                )
+                frames.append(frame)
+                if phase == "commentary" and current_turn_id in latest_chain:
+                    commentary.append(frame)
+                elif phase == "finalanswer" and current_turn_id == turn_id:
+                    final_text = text
 
     return CodexThreadReplay(
         turn_id=turn_id,
@@ -145,6 +166,8 @@ def _thread_replay(
         commentary=tuple(commentary),
         final_text=final_text,
         error_code=_normalized_error_code(latest.get("error")),
+        frames=tuple(frames),
+        recent_turn_ids=recent_turn_ids,
     )
 
 
@@ -271,7 +294,7 @@ def _read_thread_turns(
     client: CodexAppServerClient, thread_id: str,
     handoff_graph: Optional[CodexHandoffGraph],
 ) -> list[object]:
-    """Hydrate the latest logical turn chain through official paging APIs."""
+    """Hydrate recent turns and exact handoff predecessors through paging APIs."""
     turns = _paged_data(
         client,
         "thread/turns/list",
@@ -285,25 +308,13 @@ def _read_thread_turns(
     turn_rows = [row for row in turns if isinstance(row, dict) and row.get("id")]
     if not turn_rows:
         return []
-    required = {str(turn_rows[-1]["id"])}
-    if handoff_graph is not None:
-        predecessor_by_successor = {
-            str(successor): str(predecessor)
-            for predecessor, successor in handoff_graph.successors.items()
-            if predecessor and successor
-        }
-        cursor = next(iter(required))
-        while cursor in predecessor_by_successor:
-            cursor = predecessor_by_successor[cursor]
-            if cursor in required:
-                break
-            required.add(cursor)
+    required = _replay_turn_ids(turn_rows, handoff_graph)
     for turn in turn_rows:
         turn_id = str(turn.get("id") or "")
         if turn_id not in required:
             turn["items"] = []
             continue
-        turn["items"] = _paged_data(
+        rows = _paged_data(
             client,
             "thread/items/list",
             {
@@ -313,6 +324,20 @@ def _read_thread_turns(
                 "sortDirection": "asc",
             },
         )
+        items: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("thread/items/list returned a non-object item")
+            if "item" in row:
+                if str(row.get("turnId") or "") != turn_id or not isinstance(row["item"], dict):
+                    raise ValueError("thread/items/list returned an invalid turn item envelope")
+                items.append(row["item"])
+            elif row.get("type"):
+                # Older pinned runtimes returned the item directly.
+                items.append(row)
+            else:
+                raise ValueError("thread/items/list returned an unrecognized item shape")
+        turn["items"] = items
         turn["itemsView"] = "full"
     return turn_rows
 
@@ -350,7 +375,7 @@ def read_thread_replay(
     handoff_graph: Optional[CodexHandoffGraph] = None,
     client_factory: Callable[..., CodexAppServerClient] = CodexAppServerClient,
 ) -> Optional[CodexThreadReplay]:
-    """Read the latest stored turn without resuming or subscribing to it."""
+    """Read ten recent stored turns without resuming or subscribing to them."""
     cleaned = str(thread_id or "").strip()
     if not cleaned:
         return None
@@ -372,8 +397,30 @@ def read_thread_replay(
                 if not turns:
                     return None
                 result = {"thread": {"turns": turns}}
-            except CodexAppServerError as exc:
-                if exc.code not in {-32601, -32602}:
+                replay = _thread_replay(result, handoff_graph=handoff_graph)
+                if any(
+                    _normalized_turn_status(turn.get("status")) == "completed"
+                    and not turn.get("items")
+                    for turn in turns[-RECENT_REPLAY_TURNS:]
+                ):
+                    # A successful empty page is not proof of an empty turn.
+                    # Check the full stored view before reporting missing output.
+                    try:
+                        full = client.request(
+                            "thread/read", {"threadId": cleaned, "includeTurns": True}, timeout=20,
+                        )
+                    except CodexAppServerError as exc:
+                        if exc.code not in {-32601, -32602}:
+                            raise
+                    else:
+                        full_replay = _thread_replay(full, handoff_graph=handoff_graph)
+                        if full_replay is not None and (
+                            replay is None or len(full_replay.frames) > len(replay.frames)
+                        ):
+                            replay = full_replay
+                return replay
+            except (CodexAppServerError, ValueError) as exc:
+                if isinstance(exc, CodexAppServerError) and exc.code not in {-32601, -32602}:
                     raise
                 # Compatibility only for older pinned runtimes. Raw rollout
                 # inspection remains a live diagnostic path, not replay's

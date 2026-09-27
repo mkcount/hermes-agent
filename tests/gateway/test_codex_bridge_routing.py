@@ -372,11 +372,17 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
         lambda *_args, **_kwargs: SimpleNamespace(
             path="/rollout.jsonl", device=1, inode=2, size=99,
             active_turn_id=None, active_start_offset=None,
+            latest_turn_id="turn-completed", latest_turn_status="completed",
+            latest_turn_error_code="", latest_turn_has_final=True,
             latest_final_text="repeat this final",
         ),
     )
     monkeypatch.setattr(
         "gateway.codex_bridge.mixin.read_thread_replay", lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.collect_latest_turn_commentary",
+        lambda *_args, **_kwargs: [],
     )
 
     answer = await bridge._codex_bridge_store_binding(
@@ -388,11 +394,13 @@ async def test_reselecting_current_thread_does_not_rotate_or_cancel_work(tmp_pat
     )
 
     assert "다시 연결됨" in answer
-    assert "repeat this final" in answer
+    assert "별도 메시지" in answer
     refreshed = store.get_binding(build_session_key(source))
     assert refreshed.generation == current.generation
     assert refreshed.cursor_offset == 99
-    assert store.list_progress(refreshed) == []
+    progress = store.list_progress(refreshed)
+    assert any(row.state == "delivered" and row.content.endswith("old location") for row in progress)
+    assert any(row.state == "pending" and "repeat this final" in row.content for row in progress)
     assert store.input_state(input_id) == "routed"
 
 
@@ -414,6 +422,12 @@ async def test_selecting_another_thread_interrupts_the_running_previous_lane(
     bridge._is_session_running = lambda key: key == previous_lane_key
     bridge._interrupt_and_clear_session = AsyncMock()
     monkeypatch.setattr("gateway.codex_bridge.mixin.inspect_rollout", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.read_thread_replay",
+        lambda *_args, **_kwargs: CodexThreadReplay(
+            turn_id="turn-new", status="completed", commentary=(), final_text="ready",
+        ),
+    )
 
     answer = await bridge._codex_bridge_store_binding(
         source,
@@ -483,13 +497,60 @@ async def test_selecting_active_thread_replays_all_commentary_as_fresh_rows(tmp_
     refreshed = store.get_binding(build_session_key(source))
     progress = store.list_progress(refreshed, pending_only=True)
     assert "중간보고 3개" in answer
-    assert "previous final" in answer
+    assert "previous final" not in answer
     assert refreshed.generation == current.generation
     assert refreshed.cursor_offset == snapshot.size
     assert len(progress) == 3
     assert [row.segments for row in progress].count(("same report",)) == 2
     assert [row.segments for row in progress].count(("later report",)) == 1
     assert all(row.message_id is None for row in progress)
+
+
+@pytest.mark.asyncio
+async def test_reselect_preserves_unsent_progress_and_merges_new_active_turn(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    current = store.bind(build_session_key(source), source, thread_id="thread-123")
+    store.upsert_progress(current, "unsent-live", ["keep me"])
+    bridge = _Bridge(store)
+    replay = CodexThreadReplay(
+        turn_id="old-turn", status="completed", commentary=(), final_text="old answer",
+        frames=(CodexReplayFrame("old-final", "old-turn", "old answer", "final"),),
+        recent_turn_ids=("old-turn",),
+    )
+    snapshot = SimpleNamespace(
+        path="/rollout.jsonl", device=1, inode=2, size=200,
+        active_turn_id="new-turn", active_start_offset=100,
+        latest_turn_id="old-turn", latest_turn_status="completed",
+        latest_turn_error_code="", latest_turn_has_final=True,
+        latest_final_text="old answer",
+    )
+    monkeypatch.setattr("gateway.codex_bridge.mixin.read_thread_replay", lambda *_a, **_k: replay)
+    monkeypatch.setattr("gateway.codex_bridge.mixin.inspect_rollout", lambda *_a, **_k: snapshot)
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.collect_active_commentary",
+        lambda *_a, **_k: [RolloutEvent(
+            event_id="new-report", turn_id="new-turn", kind="commentary",
+            text="new work", offset=180,
+        )],
+    )
+
+    answer = await bridge._codex_bridge_store_binding(
+        source, CodexThreadSummary(
+            thread_id="thread-123", title="Current", cwd="/project",
+            updated_at=1, status="active",
+        ),
+    )
+
+    refreshed = store.get_binding(build_session_key(source))
+    pending = store.list_progress(refreshed, pending_only=True)
+    assert "현재 진행 중" in answer
+    assert refreshed.cursor_offset == 200
+    assert [row.content for row in pending] == [
+        "💻 Codex 진행\n\nkeep me",
+        "🧾 Codex 답변\n\nold answer",
+        "💻 Codex 진행\n\nnew work",
+    ]
 
 
 @pytest.mark.asyncio
@@ -522,6 +583,10 @@ async def test_selecting_usage_stopped_thread_replays_reports_without_an_old_fin
     )
     monkeypatch.setattr(
         "gateway.codex_bridge.mixin.read_thread_replay", lambda *_args, **_kwargs: replay,
+    )
+    monkeypatch.setattr(
+        "gateway.codex_bridge.mixin.collect_latest_turn_commentary",
+        lambda *_args, **_kwargs: [],
     )
 
     answer = await bridge._codex_bridge_store_binding(
@@ -1084,3 +1149,38 @@ async def test_progress_is_durable_across_restart_and_each_report_gets_a_new_mes
     assert adapter.send.await_count == len(events) + 1
     assert "progress new" in adapter.send.await_args.args[1]
     adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_history_replay_keeps_order_and_resumes_after_delivery_failure(tmp_path, monkeypatch):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-123")
+    bridge = _Bridge(store)
+    events = [
+        RolloutEvent("report", "turn-1", "commentary", "working", 1),
+        RolloutEvent("answer", "turn-1", "final", "done", 2),
+    ]
+    bridge._codex_bridge_stage_replay(store, binding, events, "presentation")
+    failing = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=False, error="temporary")))
+
+    await bridge._codex_bridge_retry_progress(store, binding, failing)
+
+    assert failing.send.await_count == 1
+    pending = store.list_progress(binding, pending_only=True)
+    assert [row.content for row in pending] == [
+        "💻 Codex 진행\n\nworking", "🧾 Codex 답변\n\ndone",
+    ]
+    retry_at = pending[0].next_attempt_at + 1
+    monkeypatch.setattr("gateway.codex_bridge.store.time.time", lambda: retry_at)
+    monkeypatch.setattr("gateway.codex_bridge.mixin.time.time", lambda: retry_at)
+    restarted_store = CodexBridgeStore(tmp_path / "state.db")
+    restarted_bridge = _Bridge(restarted_store)
+    restarted_binding = restarted_store.get_binding("control")
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="900")))
+
+    await restarted_bridge._codex_bridge_retry_progress(restarted_store, restarted_binding, adapter)
+
+    assert [call.args[1] for call in adapter.send.await_args_list] == [
+        "💻 Codex 진행\n\nworking", "🧾 Codex 답변\n\ndone",
+    ]
+    assert all(row.state == "delivered" for row in restarted_store.list_progress(restarted_binding))

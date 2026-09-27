@@ -375,6 +375,7 @@ class CodexBridgeStore:
     def upsert_progress(
         self, binding: CodexBridgeBinding, logical_turn_id: str, segments: list[str],
         *, max_segments: int = 8, max_chars: int = 12_000,
+        label: str = "💻 Codex 진행",
     ) -> DurableCodexProgress:
         """Durably stage rolling commentary before its rollout cursor is acknowledged."""
         identity = str(logical_turn_id or "").strip()
@@ -436,7 +437,7 @@ class CodexBridgeStore:
                 if trimmed != accumulated[0]:
                     accumulated[0] = trimmed
                     changed = True
-            content = "💻 Codex 진행\n\n" + "\n\n".join(accumulated)
+            content = f"{label}\n\n" + "\n\n".join(accumulated)
             state = "pending" if previous is None or changed else str(previous[2])
             last_error = None if previous is None or changed else previous[3]
             attempt_count = 0 if previous is None or changed else int(previous[4] or 0)
@@ -486,7 +487,7 @@ class CodexBridgeStore:
                           next_attempt_at, updated_at
                    FROM codex_bridge_progress
                    WHERE control_session_key=? AND generation=?""" + state_filter + ready_filter +
-                " ORDER BY updated_at",
+                " ORDER BY created_at, logical_turn_id",
                 params,
             ).fetchall()
         return [self._progress_from_row(row) for row in rows]
@@ -576,7 +577,7 @@ class CodexBridgeStore:
         self, binding: CodexBridgeBinding, *, rollout_path: str,
         device: int, inode: int, offset: int,
     ) -> Optional[CodexBridgeBinding]:
-        """Start a fresh presentation without rotating execution authority."""
+        """Seek the live mirror without discarding unacknowledged deliveries."""
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE codex_bridge_bindings
@@ -588,12 +589,6 @@ class CodexBridgeStore:
                     binding.control_session_key, binding.generation, binding.thread_id,
                 ),
             )
-            if cur.rowcount:
-                conn.execute(
-                    """DELETE FROM codex_bridge_progress
-                       WHERE control_session_key=? AND generation=?""",
-                    (binding.control_session_key, binding.generation),
-                )
         return self.get_binding(binding.control_session_key) if cur.rowcount else None
 
     def bind(

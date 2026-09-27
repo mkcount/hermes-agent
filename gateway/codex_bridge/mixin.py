@@ -23,6 +23,7 @@ from gateway.codex_bridge.catalog import (
     CodexProjectSummary,
     CodexThreadReplay,
     CodexThreadSummary,
+    RECENT_REPLAY_TURNS,
     list_recent_projects,
     list_recent_threads,
     read_thread_replay,
@@ -79,7 +80,6 @@ _NEW_CODEX_REASONING = "xhigh"
 # Leave ample room for Telegram's Markdown escaping while keeping every replay
 # card below its 4,096 UTF-16-unit ceiling.
 _MIRROR_PROGRESS_MAX_CHARS = 1_800
-_REPLAYABLE_TERMINAL_STATES = frozenset({"failed", "interrupted"})
 
 
 def _split_progress_text(value: str, max_units: int) -> list[str]:
@@ -101,16 +101,24 @@ def _split_progress_text(value: str, max_units: int) -> list[str]:
 
 
 def _stored_replay_events(replay: CodexThreadReplay) -> list[RolloutEvent]:
-    return [
+    frames = replay.frames or replay.commentary
+    events = [
         RolloutEvent(
             event_id=f"app-server:{frame.event_id}",
             turn_id=frame.turn_id,
-            kind="commentary",
+            kind=frame.kind,
             text=frame.text,
             offset=index,
         )
-        for index, frame in enumerate(replay.commentary, 1)
+        for index, frame in enumerate(frames, 1)
     ]
+    if not replay.frames and replay.final_text:
+        events.append(RolloutEvent(
+            event_id=f"app-server:final:{replay.turn_id}",
+            turn_id=replay.turn_id, kind="final", text=replay.final_text,
+            offset=len(events) + 1,
+        ))
+    return events
 
 
 def _replay_state_message(status: str, error_code: str, count: int) -> str:
@@ -122,17 +130,17 @@ def _replay_state_message(status: str, error_code: str, count: int) -> str:
             "in_progress": "현재 진행 중인 Codex 턴",
             "interrupted": "중단된 마지막 Codex 턴",
             "failed": "오류로 멈춘 마지막 Codex 턴",
-            "completed": "최종답변 없이 끝난 마지막 Codex 턴",
+            "completed": "최종답변이 확인되지 않은 마지막 Codex 턴",
         }
         terminals = {
             "in_progress": "",
             "interrupted": "⛔ 이 턴은 완료 전에 중단된 상태입니다.",
             "failed": "⚠️ 이 턴은 오류로 완료되지 않은 상태입니다.",
-            "completed": "⚠️ 이 턴은 최종답변 없이 종료된 상태입니다.",
+            "completed": "⚠️ 기록에서 이 턴의 최종답변을 확인하지 못했습니다.",
         }
         description = descriptions.get(status, "마지막 Codex 턴")
         terminal = terminals.get(status, "")
-    message = f"\n{description}의 중간보고 {count}개를 아래에 처음부터 다시 전달합니다."
+    message = f"\n{description}의 중간보고 {count}개를 확인했습니다."
     return f"{message}\n{terminal}" if terminal else message
 
 
@@ -701,72 +709,81 @@ class GatewayCodexBridgeMixin:
                 )
                 if refreshed is not None:
                     snapshot = refreshed
-        replay_events = []
+        if summary is not None and stored_replay is None and snapshot is None:
+            return "Codex 기록을 확인하지 못해 세션을 연결하지 않았습니다. 잠시 뒤 다시 시도해 주세요."
+
+        replay_events: list[RolloutEvent] = []
         replay_status = ""
         replay_error_code = ""
-        replay_final_text = ""
+        replay_turn_id = ""
+        partial_history = stored_replay is None and summary is not None
         if stored_replay is not None:
+            replay_turn_id = stored_replay.turn_id
             replay_status = stored_replay.status
             replay_error_code = stored_replay.error_code
-            if (
-                replay_status in _REPLAYABLE_TERMINAL_STATES
-                or replay_status == "in_progress"
-                or (replay_status == "completed" and not stored_replay.final_text)
-            ):
-                replay_events = _stored_replay_events(stored_replay)
-            if replay_status == "completed":
-                replay_final_text = stored_replay.final_text
+            replay_events = _stored_replay_events(stored_replay)
 
-            # Persisted app-server history is replay's authority. Raw rollout
-            # parsing is limited to the live edge where an in-progress turn or
-            # just-written terminal frame may not have reached storage yet.
-            if snapshot is not None and replay_status == "in_progress":
-                replay_final_text = str(getattr(snapshot, "latest_final_text", "") or "")
-                snapshot_latest_id = getattr(snapshot, "latest_turn_id", None)
-                if snapshot_latest_id == stored_replay.turn_id:
-                    live_status = getattr(snapshot, "latest_turn_status", "")
-                    if live_status and live_status != "in_progress":
-                        replay_status = live_status
-                        replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
-                    live_events = await asyncio.to_thread(
-                        collect_latest_turn_commentary,
-                        summary.thread_id,
-                        snapshot,
-                        handoff_graph=handoff_graph,
-                    )
-                    seen = {(event.turn_id, event.text) for event in replay_events}
-                    replay_events.extend(
-                        event for event in live_events
-                        if (event.turn_id, event.text) not in seen
-                    )
-                    if bool(getattr(snapshot, "latest_turn_has_final", False)):
-                        replay_final_text = snapshot.latest_final_text
-        elif snapshot is not None:
-            if getattr(snapshot, "active_turn_id", None):
-                replay_status = "in_progress"
-                replay_final_text = str(getattr(snapshot, "latest_final_text", "") or "")
-                replay_events = await asyncio.to_thread(
-                    collect_active_commentary,
-                    summary.thread_id,
-                    snapshot,
-                    handoff_graph=handoff_graph,
+        # The official stored view can lag the live rollout by one turn. Merge
+        # only the exact current rollout turn, never an older final remembered
+        # in latest_final_text from a different turn.
+        if snapshot is not None and summary is not None:
+            active_turn_id = str(getattr(snapshot, "active_turn_id", "") or "")
+            latest_turn_id = str(getattr(snapshot, "latest_turn_id", "") or "")
+            raw_turn_id = active_turn_id or latest_turn_id
+            recent_ids = stored_replay.recent_turn_ids if stored_replay is not None else ()
+            if raw_turn_id and (not recent_ids or raw_turn_id == replay_turn_id or raw_turn_id not in recent_ids):
+                if raw_turn_id != replay_turn_id and len(recent_ids) >= RECENT_REPLAY_TURNS:
+                    replay_events = [event for event in replay_events if event.turn_id != recent_ids[0]]
+                raw_events = await asyncio.to_thread(
+                    collect_active_commentary if active_turn_id else collect_latest_turn_commentary,
+                    summary.thread_id, snapshot, handoff_graph=handoff_graph,
                 )
-            else:
-                replay_status = getattr(snapshot, "latest_turn_status", "")
-                replay_error_code = getattr(snapshot, "latest_turn_error_code", "")
-                has_final = bool(getattr(snapshot, "latest_turn_has_final", False))
-                if replay_status in _REPLAYABLE_TERMINAL_STATES or (
-                    replay_status == "completed" and not has_final
+                existing: dict[tuple[str, str, str], int] = {}
+                for event in replay_events:
+                    key = (event.turn_id, event.kind, event.text)
+                    existing[key] = existing.get(key, 0) + 1
+                for event in raw_events:
+                    key = (event.turn_id, event.kind, event.text)
+                    if existing.get(key, 0):
+                        existing[key] -= 1
+                    else:
+                        final_index = next((
+                            index for index, current in enumerate(replay_events)
+                            if current.turn_id == event.turn_id and current.kind == "final"
+                        ), len(replay_events))
+                        replay_events.insert(final_index, event)
+                if (
+                    not active_turn_id and bool(getattr(snapshot, "latest_turn_has_final", False))
+                    and not any(event.turn_id == raw_turn_id and event.kind == "final" for event in replay_events)
                 ):
-                    replay_events = await asyncio.to_thread(
-                        collect_latest_turn_commentary,
-                        summary.thread_id,
-                        snapshot,
-                        handoff_graph=handoff_graph,
-                    )
-                if not replay_status or has_final:
-                    replay_final_text = snapshot.latest_final_text
+                    final_text = str(getattr(snapshot, "latest_final_text", "") or "").strip()
+                    if final_text:
+                        replay_events.append(RolloutEvent(
+                            event_id=f"rollout-final:{raw_turn_id}", turn_id=raw_turn_id,
+                            kind="final", text=final_text, offset=snapshot.size,
+                        ))
+                replay_turn_id = raw_turn_id
+                if active_turn_id:
+                    replay_status, replay_error_code = "in_progress", ""
+                else:
+                    replay_status = str(getattr(snapshot, "latest_turn_status", "") or replay_status)
+                    replay_error_code = str(getattr(snapshot, "latest_turn_error_code", "") or "")
         previous_lane = None
+        replay_rows: list[DurableCodexProgress] = []
+
+        def stage_or_resume(binding: CodexBridgeBinding) -> list[DurableCodexProgress]:
+            pending = [
+                row for row in store.list_progress(binding, pending_only=True)
+                if row.logical_turn_id.startswith("replay:")
+            ]
+            if pending:
+                return pending
+            if not replay_events:
+                return []
+            return self._codex_bridge_stage_replay(
+                store, binding, replay_events, uuid.uuid4().hex,
+            )
+
         async with self._codex_bridge_binding_lock(control_key):
             previous = store.get_binding(control_key)
             if summary is None:
@@ -787,6 +804,7 @@ class GatewayCodexBridgeMixin:
             )
             rotated = bool(previous is not None and previous.active and not unchanged)
             if unchanged:
+                replay_rows = stage_or_resume(previous)
                 if snapshot is not None:
                     binding = store.restart_mirror(
                         previous,
@@ -818,8 +836,7 @@ class GatewayCodexBridgeMixin:
                     previous_lane = (
                         self._session_key_for_source(previous_lane_source), previous_lane_source,
                     )
-            if replay_events:
-                self._codex_bridge_stage_commentary(store, binding, replay_events)
+                replay_rows = stage_or_resume(binding)
         if previous_lane is not None:
             previous_lane_key, previous_lane_source = previous_lane
             if self._is_session_running(previous_lane_key):
@@ -840,13 +857,27 @@ class GatewayCodexBridgeMixin:
             "최종 답변은 별도 메시지로 전달됩니다. "
             "데스크톱 작업이 쓰기 권한을 사용 중이면 Telegram 입력은 그 작업이 끝날 때까지 순서대로 기다립니다."
         )
-        answer += (
-            _replay_state_message(replay_status, replay_error_code, len(replay_events))
-            if replay_status and (
-                replay_status != "completed" or not replay_final_text
+        if replay_rows:
+            answer += (
+                f"\n최근 최대 {RECENT_REPLAY_TURNS}개 턴의 답변·중간보고 "
+                f"{len(replay_rows)}개를 별도 메시지로 순서대로 전달합니다."
             )
-            else "\n현재 실행 중인 Codex 턴은 없습니다. 새 턴이 시작되기 전에는 추가 보고가 없습니다."
+        else:
+            answer += "\n재전송할 답변·중간보고가 없습니다."
+        if partial_history:
+            answer += "\n⚠️ App Server의 저장 기록을 읽지 못해 현재 rollout 턴만 확인했습니다."
+        latest_commentary_count = sum(
+            event.kind == "commentary" and event.turn_id == replay_turn_id
+            for event in replay_events
         )
+        if replay_status and replay_status != "completed":
+            answer += _replay_state_message(replay_status, replay_error_code, latest_commentary_count)
+        elif replay_status == "completed" and not any(
+            event.kind == "final" and event.turn_id == replay_turn_id for event in replay_events
+        ):
+            answer += "\n⚠️ 최신 턴의 최종답변을 기록에서 확인하지 못했습니다."
+        else:
+            answer += "\n현재 실행 중인 Codex 턴은 없습니다."
         answer += (
             "\n이 Telegram 토픽에는 한 세션만 연결되며, 다른 토픽은 별도로 연결할 수 있습니다."
             if source.thread_id
@@ -854,8 +885,6 @@ class GatewayCodexBridgeMixin:
         )
         if rotated:
             answer += "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
-        if replay_final_text:
-            answer += f"\n\n🧾 마지막 답변\n\n{replay_final_text}"
         logger.info("Bound Codex thread %s to %s generation=%s", summary.thread_id, control_key, binding.generation)
         return answer
 
@@ -1302,10 +1331,33 @@ class GatewayCodexBridgeMixin:
                 ))
         return progress_rows
 
+    @staticmethod
+    def _codex_bridge_stage_replay(
+        store: CodexBridgeStore, binding: CodexBridgeBinding,
+        events: list[RolloutEvent], presentation_id: str,
+    ) -> list[DurableCodexProgress]:
+        """Persist each history card before the live cursor skips old bytes."""
+        rows: list[DurableCodexProgress] = []
+        for event_index, event in enumerate(events, 1):
+            if event.kind not in {"commentary", "final"}:
+                continue
+            label = "🧾 Codex 답변" if event.kind == "final" else "💻 Codex 진행"
+            for part_index, part in enumerate(
+                _split_progress_text(event.text, _MIRROR_PROGRESS_MAX_CHARS), 1,
+            ):
+                rows.append(store.upsert_progress(
+                    binding,
+                    f"replay:{presentation_id}:{event_index}:{event.turn_id}:"
+                    f"{event.kind}:{event.event_id}:{part_index}",
+                    [part], max_segments=1, max_chars=_MIRROR_PROGRESS_MAX_CHARS,
+                    label=label,
+                ))
+        return rows
+
     async def _codex_bridge_deliver_progress(
         self, store: CodexBridgeStore, binding: CodexBridgeBinding,
         progress: DurableCodexProgress, adapter: Any,
-    ) -> None:
+    ) -> bool:
         """Deliver one immutable progress card through the global outbox."""
         from gateway.delivery_ledger import (
             compute_semantic_obligation_id,
@@ -1319,12 +1371,14 @@ class GatewayCodexBridgeMixin:
         metadata = dict(self._thread_metadata_for_source(binding.source) or {})
         metadata["_interim_send"] = True
         lane_key = self._codex_bridge_lane_key(binding.source, binding)
+        history = progress.logical_turn_id.startswith("replay:")
+        output_kind = "history" if history else "progress"
         logical_key = (
-            f"codex-progress:{binding.thread_id}:{binding.control_session_key}:"
+            f"codex-{output_kind}:{binding.thread_id}:{binding.control_session_key}:"
             f"{binding.generation}:{progress.logical_turn_id}:"
             f"{hashlib.sha256(progress.content.encode('utf-8')).hexdigest()[:16]}"
         )
-        obligation_id = compute_semantic_obligation_id(lane_key, logical_key, "progress")
+        obligation_id = compute_semantic_obligation_id(lane_key, logical_key, output_kind)
         await self._codex_bridge_ledger_call(
             binding.source,
             ensure_obligation,
@@ -1336,7 +1390,7 @@ class GatewayCodexBridgeMixin:
             content=progress.content,
             adapter_profile=getattr(adapter, "_owner_profile", None),
             logical_key=logical_key,
-            output_kind="progress",
+            output_kind=output_kind,
             delivery_sequence=1,
         )
         state = await self._codex_bridge_ledger_call(
@@ -1344,14 +1398,14 @@ class GatewayCodexBridgeMixin:
         )
         if state == "delivered":
             store.mark_progress_delivered(progress, progress.message_id)
-            return
+            return True
         if state not in {"pending", "failed"}:
-            return
+            return False
         claimed = await self._codex_bridge_ledger_call(
             binding.source, mark_attempting, obligation_id,
         )
         if not claimed:
-            return
+            return False
         try:
             result = await asyncio.wait_for(
                 adapter.send(
@@ -1378,19 +1432,34 @@ class GatewayCodexBridgeMixin:
         )
         if not store.mark_progress_delivered(progress, message_id):
             raise RuntimeError("Codex progress changed while delivery was in flight")
+        return True
 
     async def _codex_bridge_retry_progress(
         self, store: CodexBridgeStore, binding: CodexBridgeBinding, adapter: Any,
     ) -> None:
-        for progress in store.list_progress(binding, pending_only=True, ready_only=True):
+        history_sent = 0
+        for progress in store.list_progress(binding, pending_only=True):
+            history = progress.logical_turn_id.startswith("replay:")
+            if progress.next_attempt_at > time.time():
+                if history:
+                    break
+                continue
             try:
-                await self._codex_bridge_deliver_progress(store, binding, progress, adapter)
+                delivered = await self._codex_bridge_deliver_progress(store, binding, progress, adapter)
+                if history:
+                    if not delivered:
+                        break
+                    history_sent += 1
+                    if history_sent >= 4:
+                        break
             except Exception:
                 logger.warning(
                     "Codex progress retry failed for %s turn=%s",
                     binding.control_session_key, progress.logical_turn_id,
                     exc_info=True,
                 )
+                if history:
+                    break
 
     async def _codex_bridge_mirror_final(
         self, store: CodexBridgeStore, binding: CodexBridgeBinding,

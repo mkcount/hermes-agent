@@ -111,7 +111,7 @@ def test_stored_replay_follows_handoff_chain_and_preserves_failed_commentary(mon
                     "phase": "commentary", "text": "last report",
                 }],
             }
-            return {"data": reports[params["turnId"]], "nextCursor": None}
+            return {"data": reports.get(params["turnId"], []), "nextCursor": None}
 
     ReplayClient.instances.clear()
     monkeypatch.setattr(catalog, "find_codex_control_socket", lambda _home=None: "/control.sock")
@@ -142,8 +142,78 @@ def test_stored_replay_follows_handoff_chain_and_preserves_failed_commentary(mon
             "limit": 100, "sortDirection": "asc",
         }, 20),
         ("thread/items/list", {
+            "threadId": "thread-a", "turnId": "dying-server-turn",
+            "limit": 100, "sortDirection": "asc",
+        }, 20),
+        ("thread/items/list", {
             "threadId": "thread-a", "turnId": "turn-successor",
             "limit": 100, "sortDirection": "asc",
         }, 20),
     ]
     assert client.closed is True
+
+
+def test_paged_replay_unwraps_real_item_envelopes(monkeypatch):
+    class WrappedClient(_FakeClient):
+        def request(self, method, params, timeout):
+            self.requests.append((method, params, timeout))
+            if method == "thread/turns/list":
+                return {"data": [
+                    {"id": f"turn-{index}", "status": "completed", "items": []}
+                    for index in range(11)
+                ]}
+            if method == "thread/items/list":
+                turn_id = params["turnId"]
+                if turn_id != "turn-10":
+                    return {"data": [{"turnId": turn_id, "item": {
+                        "id": f"final-{turn_id}", "type": "agentMessage",
+                        "phase": "final_answer", "text": f"answer {turn_id}",
+                    }}]}
+                return {"data": [
+                    {"turnId": turn_id, "item": {
+                        "id": "progress-1", "type": "agentMessage",
+                        "phase": "commentary", "text": "working",
+                    }},
+                    {"turnId": turn_id, "item": {
+                        "id": "final-1", "type": "agentMessage",
+                        "phase": "final_answer", "text": "done",
+                    }},
+                ]}
+            raise AssertionError(method)
+
+    monkeypatch.setattr(catalog, "find_codex_control_socket", lambda _home=None: None)
+    replay = catalog.read_thread_replay("thread-a", client_factory=WrappedClient)
+
+    assert replay is not None
+    assert [frame.text for frame in replay.commentary] == ["working"]
+    assert replay.final_text == "done"
+    assert replay.recent_turn_ids == tuple(f"turn-{index}" for index in range(1, 11))
+    assert [frame.text for frame in replay.frames] == [
+        *(f"answer turn-{index}" for index in range(1, 10)), "working", "done",
+    ]
+    assert len([method for method, _, _ in WrappedClient.instances[-1].requests if method == "thread/items/list"]) == 10
+
+
+def test_invalid_paged_item_envelope_falls_back_to_full_thread_read(monkeypatch):
+    class InvalidPageClient(_FakeClient):
+        def request(self, method, params, timeout):
+            if method == "thread/turns/list":
+                return {"data": [{"id": "turn-1", "status": "completed"}]}
+            if method == "thread/items/list":
+                return {"data": [{"turnId": "wrong-turn", "item": {
+                    "type": "agentMessage", "phase": "final_answer", "text": "bad",
+                }}]}
+            if method == "thread/read":
+                return {"thread": {"turns": [{
+                    "id": "turn-1", "status": "completed", "items": [{
+                        "id": "final-1", "type": "agentMessage",
+                        "phase": "final_answer", "text": "good",
+                    }],
+                }]}}
+            raise AssertionError(method)
+
+    monkeypatch.setattr(catalog, "find_codex_control_socket", lambda _home=None: None)
+    replay = catalog.read_thread_replay("thread-a", client_factory=InvalidPageClient)
+
+    assert replay is not None
+    assert replay.final_text == "good"
