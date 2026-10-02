@@ -498,7 +498,8 @@ class CodexBridgeStore:
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """UPDATE codex_bridge_progress
-                   SET message_id=?, state='delivered', last_error=NULL,
+                   SET message_id=?, state=CASE WHEN state='finalized' THEN state ELSE 'delivered' END,
+                        last_error=NULL,
                        attempt_count=0, next_attempt_at=0, updated_at=?
                    WHERE control_session_key=? AND generation=? AND logical_turn_id=?
                      AND content=?""",
@@ -519,7 +520,7 @@ class CodexBridgeStore:
                    SET state='pending', last_error=?, attempt_count=?,
                        next_attempt_at=?, updated_at=?
                    WHERE control_session_key=? AND generation=? AND logical_turn_id=?
-                     AND content=?""",
+                     AND content=? AND state!='finalized'""",
                 (
                     str(error or "progress delivery failed")[:500], attempt_count,
                     next_attempt_at, time.time(),
@@ -537,7 +538,7 @@ class CodexBridgeStore:
                    SET message_id=NULL, state='pending', last_error=?, attempt_count=?,
                        next_attempt_at=?, updated_at=?
                    WHERE control_session_key=? AND generation=? AND logical_turn_id=?
-                     AND content=?""",
+                     AND content=? AND state!='finalized'""",
                 (
                     str(error or "progress message is no longer editable")[:500],
                     attempt_count, next_attempt_at, time.time(),
@@ -561,12 +562,16 @@ class CodexBridgeStore:
                 (time.time(), binding.control_session_key, binding.generation, logical_turn_id),
             )
 
+            # These are immutable commentary cards, not an editable preview.
+            # Their durable delivery obligation survives the final answer.
+            # Keep unacknowledged cards pending so the bridge retry loop can
+            # still publish them even when no gateway restart occurs.
             family = f"{logical_turn_id}:commentary:"
             conn.execute(
                 """UPDATE codex_bridge_progress
                    SET state='finalized', next_attempt_at=0, updated_at=?
                    WHERE control_session_key=? AND generation=?
-                     AND substr(logical_turn_id, 1, ?)=? AND state!='finalized'""",
+                     AND substr(logical_turn_id, 1, ?)=? AND state='delivered'""",
                 (
                     time.time(), binding.control_session_key, binding.generation,
                     len(family), family,

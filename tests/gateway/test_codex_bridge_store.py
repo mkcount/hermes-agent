@@ -313,3 +313,38 @@ def test_prune_preserves_old_durable_inbox_until_recovery(tmp_path):
     assert store.prune() == 0
     store.recover_after_restart()
     assert [row.input_id for row in store.recoverable_inputs()] == [input_id]
+
+
+def test_terminal_output_preserves_unsent_commentary_for_retry(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    progress = store.upsert_progress(binding, "logical-1:commentary:event-1:1:1", ["working"])
+    store.mark_progress_failed(progress, "connection unavailable")
+    store.complete_progress(binding, "logical-1")
+
+    reopened = CodexBridgeStore(tmp_path / "state.db")
+    pending = reopened.list_progress(binding, pending_only=True)
+    assert len(pending) == 1
+    assert pending[0].content == progress.content
+    assert pending[0].attempt_count == 1
+
+
+def test_late_delivery_ack_does_not_reopen_finalized_preview(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    progress = store.upsert_progress(binding, "logical-1", ["working"])
+    store.complete_progress(binding, "logical-1")
+    store.mark_progress_delivered(progress, "message-1")
+    late = store.upsert_progress(binding, "logical-1", ["late"])
+    assert late.state == "finalized"
+    assert "late" not in late.content
+
+
+def test_late_delivery_failure_does_not_reopen_finalized_preview(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    progress = store.upsert_progress(binding, "logical-1", ["working"])
+    store.complete_progress(binding, "logical-1")
+    store.mark_progress_failed(progress, "late network failure")
+    store.clear_progress_message(progress, "late edit failure")
+    assert store.list_progress(binding, pending_only=True) == []
