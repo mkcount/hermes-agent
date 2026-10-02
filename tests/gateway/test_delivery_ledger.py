@@ -127,6 +127,40 @@ class TestSchemaMigration:
 
 
 class TestStateMachine:
+    def test_sweep_cannot_steal_claim_after_reading_old_owner(self, monkeypatch):
+        _record("race-owner")
+        _orphan("race-owner")
+        real_owner_alive = dl._owner_alive
+        replaced = False
+
+        def race(pid, started):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                pid_now, started_now = dl._owner_stamp()
+                conn = sqlite3.connect(dl._db_path())
+                try:
+                    conn.execute("UPDATE delivery_obligations SET state='attempting', owner_pid=?, owner_started_at=? WHERE obligation_id='race-owner'", (pid_now, started_now))
+                    conn.commit()
+                finally:
+                    conn.close()
+                return False
+            return real_owner_alive(pid, started)
+
+        monkeypatch.setattr(dl, "_owner_alive", race)
+        assert dl.sweep_recoverable() == []
+        assert _row("race-owner")["state"] == "attempting"
+        assert _row("race-owner")["attempts"] == 0
+
+    def test_runtime_claim_restamps_owner_before_startup_sweep(self, monkeypatch):
+        _record("runtime-owner")
+        _orphan("runtime-owner")
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 123))
+        monkeypatch.setattr(dl, "_owner_alive", lambda pid, started: pid == os.getpid() and started == 123)
+        assert dl.mark_attempting("runtime-owner")
+        assert dl.sweep_recoverable() == []
+        assert _row("runtime-owner")["owner_pid"] == os.getpid()
+
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"

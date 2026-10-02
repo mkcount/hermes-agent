@@ -364,9 +364,14 @@ def ensure_obligation(*, obligation_id: str, session_key: str, platform: str, ch
 
 
 def mark_attempting(obligation_id: str, *, db_path: Optional[Path | str] = None) -> bool:
-    return _update_state(
-        obligation_id, "attempting", from_states=("pending", "failed"), db_path=db_path,
-    )
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction(db_path) as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting', updated_at=?, owner_pid=?, owner_started_at=?
+               WHERE obligation_id=? AND state IN ('pending', 'failed')""",
+            (time.time(), pid, started, obligation_id))
+    return bool(cursor.rowcount)
 
 
 def mark_delivered(obligation_id: str, *, db_path: Optional[Path | str] = None) -> bool:
@@ -496,8 +501,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                     """UPDATE delivery_obligations
                        SET owner_pid=?, owner_started_at=?,
                            adapter_profile=COALESCE(adapter_profile, 'default')
-                       WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                    (pid, started, oid, owner_pid, owner_pid))
+                       WHERE obligation_id=? AND owner_pid IS ? AND owner_started_at IS ? AND state=?""",
+                    (pid, started, oid, owner_pid, owner_started_at, state))
                 if cursor.rowcount:
                     claimed.append({
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
@@ -512,8 +517,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1, updated_at=?,
                        adapter_profile=COALESCE(adapter_profile, 'default'),
                        state='attempting', last_error=NULL
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, owner_pid, owner_pid))
+                   WHERE obligation_id=? AND owner_pid IS ? AND owner_started_at IS ? AND state=?""",
+                (pid, started, now, oid, owner_pid, owner_started_at, state))
             if cursor.rowcount:
                 # pending = never started, redeliver plainly; anything else (crashed mid-await, other
                 # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries
