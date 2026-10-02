@@ -217,3 +217,15 @@ def test_invalid_paged_item_envelope_falls_back_to_full_thread_read(monkeypatch)
 
     assert replay is not None
     assert replay.final_text == "good"
+
+
+def test_picker_includes_threads_created_by_app_server(monkeypatch):
+    class FilteredClient(_FakeClient):
+        def request(self, method, params, timeout):
+            if "appServer" not in params.get("sourceKinds", []):
+                return {"data": []}
+            return {"data": [{"id": "telegram-thread", "source": "appServer", "updatedAt": 1}]}
+
+    monkeypatch.setattr(catalog, "find_codex_control_socket", lambda _home=None: None)
+    rows = catalog.list_recent_threads(client_factory=FilteredClient)
+    assert [row.thread_id for row in rows] == ["telegram-thread"]

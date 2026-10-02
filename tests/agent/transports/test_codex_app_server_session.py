@@ -1448,3 +1448,33 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
+
+
+def test_terminal_event_drained_before_server_request_completes_same_turn():
+    client = FakeClient()
+    client.queue_server_request("unsupported/request")
+    client.queue_notification("item/completed", threadId="t", turnId="tu1",
+                              item={"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "done"})
+    client.queue_notification("turn/completed", threadId="t", turn={"id": "tu1", "status": "completed"})
+    session = CodexAppServerSession(client_factory=lambda **_kwargs: client)
+    result = session.run_turn("hello", turn_timeout=0.02, notification_poll_timeout=0.001)
+    assert result.turn_status == "completed"
+    assert result.turn_status_confirmed is True
+    assert result.error is None
+    assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+
+@pytest.mark.parametrize("policy,granted", [("never", {"network": {"enabled": True}}), ("on-request", {})])
+def test_permission_approval_returns_granted_permissions(policy, granted):
+    client = FakeClient()
+    session = make_session(client, approval_policy=policy)
+    session._client = client
+    session._thread_id = "thread-fake-001"
+    session._active_turn_id = "turn-fake-001"
+    session._handle_server_request({
+        "id": "permissions-1", "method": "item/permissions/requestApproval",
+        "params": {"threadId": "thread-fake-001", "turnId": "turn-fake-001",
+                   "itemId": "permissions-item", "cwd": "/tmp",
+                   "permissions": {"network": {"enabled": True}}},
+    })
+    assert client.responses == [("permissions-1", {"permissions": granted, "scope": "turn"})]

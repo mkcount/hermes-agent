@@ -390,3 +390,91 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
+
+
+def test_write_exception_after_frame_delivery_does_not_authorize_turn_replay():
+    from types import SimpleNamespace
+    from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+
+    client = TestCodexAppServerModule._bare_client()
+    client._send_lock = threading.Lock()
+    delivered = []
+
+    def send(payload):
+        delivered.append(payload)
+        raise OSError("connection failed after delivery")
+
+    client._proc = SimpleNamespace(stdin=io.BytesIO())
+    client._websocket = SimpleNamespace(send=send)
+    client._fatal_reader_failure = lambda _message: None
+    client.stderr_tail = lambda _count: []
+    session = CodexAppServerSession()
+    session._client = client
+    result = TurnResult()
+    assert session._request_for(result, "turn/start", {"threadId": "thread", "input": []}, "turn/start") is None
+    assert len(delivered) == 1
+    assert result.should_retire is True
+    assert result.submission_not_admitted is False
+    assert client._pending == {}
+
+
+def test_partial_stdio_write_preserves_complete_jsonl_frame():
+    import json
+    from types import SimpleNamespace
+
+    class PartialPipe(io.BytesIO):
+        def write(self, data):
+            return super().write(data[:7])
+
+    sink = PartialPipe()
+    client = TestCodexAppServerModule._bare_client()
+    client._send_lock = threading.Lock()
+    client._websocket = None
+    client._proc = SimpleNamespace(stdin=sink)
+    message = {"id": 1, "method": "turn/start", "params": {"text": "x" * 100}}
+    client._send(message)
+    assert sink.getvalue() == (json.dumps(message) + "\n").encode("utf-8")
+
+
+def test_websocket_peer_receipt_before_send_failure_is_not_replayable(monkeypatch):
+    from types import SimpleNamespace
+    from websockets.sync.client import connect
+    from websockets.sync.server import serve
+    from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+
+    received = threading.Event()
+    delivered = []
+
+    def handler(connection):
+        delivered.append(connection.recv())
+        received.set()
+        connection.wait_closed()
+
+    with serve(handler, "127.0.0.1", 0) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with connect(f"ws://127.0.0.1:{server.socket.getsockname()[1]}", proxy=None,
+                         close_timeout=0.1) as websocket:
+                original_send_data = websocket.send_data
+                def fail_after_receipt():
+                    original_send_data()
+                    assert received.wait(2.0)
+                    raise OSError("failure after peer received the frame")
+                monkeypatch.setattr(websocket, "send_data", fail_after_receipt)
+                client = TestCodexAppServerModule._bare_client()
+                client._send_lock = threading.Lock()
+                client._proc = SimpleNamespace(stdin=io.BytesIO())
+                client._websocket = websocket
+                client._fatal_reader_failure = lambda _message: None
+                client.stderr_tail = lambda _count: []
+                session = CodexAppServerSession()
+                session._client = client
+                result = TurnResult()
+                assert session._request_for(result, "turn/start", {"threadId": "thread"}, "turn/start") is None
+                assert received.is_set() and len(delivered) == 1
+                assert result.should_retire and not result.submission_not_admitted
+                assert client._pending == {}
+        finally:
+            server.shutdown()
+            worker.join(timeout=2.0)

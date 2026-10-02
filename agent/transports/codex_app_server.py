@@ -298,9 +298,9 @@ class CodexAppServerClient:
 
     def _send(self, obj: dict) -> None:
         if self._closed:
-            raise RuntimeError("codex app-server client is closed")
+            raise CodexAppServerWriteError("codex app-server client is closed")
         if self._proc.stdin is None:
-            raise RuntimeError("codex app-server stdin not available")
+            raise CodexAppServerWriteError("codex app-server stdin not available")
         payload = json.dumps(obj)
         try:
             # request(), notify(), interrupt and approval replies may originate
@@ -310,11 +310,17 @@ class CodexAppServerClient:
                 if self._websocket is not None:
                     self._websocket.send(payload)
                 else:
-                    self._proc.stdin.write((payload + "\n").encode("utf-8"))
+                    remaining = memoryview((payload + "\n").encode("utf-8"))
+                    while remaining:
+                        written = self._proc.stdin.write(remaining)
+                        if not written:
+                            raise OSError("codex app-server stdin made no write progress")
+                        remaining = remaining[written:]
                     self._proc.stdin.flush()
         except Exception as exc:
-            error_type = CodexAppServerWriteError if self._websocket is not None else RuntimeError
-            error = error_type(f"codex app-server stdin closed unexpectedly: {exc}")
+            # send() may fail after bytes reached the peer. Only pre-write checks
+            # prove non-admission; transport exceptions require reconciliation.
+            error = RuntimeError(f"codex app-server transport write outcome is uncertain: {exc}")
             self._fatal_reader_failure(str(error))
             raise error from exc
 

@@ -864,8 +864,9 @@ class CodexAppServerSession:
                 if not _notification_belongs_to_turn(pending, thread_id=self._thread_id, turn_id=result.turn_id):
                     logger.debug("ignoring foreign codex notification while draining server request: method=%s", pending.get("method"))
                     continue
-                _, aborted = self._absorb_notification(result, projector, pending)
-                turn_complete = turn_complete or aborted
+                turn_complete = on_note(pending, str(pending.get("method") or ""))
+                if turn_complete:
+                    break
             self._handle_server_request(sreq)
             return turn_complete
 
@@ -1012,8 +1013,8 @@ class CodexAppServerSession:
     def _handle_server_request(self, req: dict) -> None:
         """Answer a codex server request (approval / elicitation) via Hermes' approval flow.
 
-        Permission escalations are always declined (the user chose their profile in
-        ~/.codex/config.toml); unknown methods get a JSON-RPC error so codex doesn't hang.
+        Permission grants follow the configured approval policy and apply only to
+        this turn; unknown methods get a JSON-RPC error so codex does not hang.
         """
         if self._client is None:
             return
@@ -1056,7 +1057,8 @@ class CodexAppServerSession:
         "item/commandExecution/requestApproval": lambda self, p: {"decision": self._decide_exec_approval(p)},
         "item/fileChange/requestApproval": lambda self, p: {"decision": self._decide_apply_patch_approval(p)},
         "item/permissions/requestApproval": lambda self, p: {
-            "decision": "accept" if self._approval_policy == "never" else "decline"
+            "permissions": (p.get("permissions") or {}) if self._approval_policy == "never" else {},
+            "scope": "turn",
         },
         "mcpServer/elicitation/request": _respond_elicitation,
     }

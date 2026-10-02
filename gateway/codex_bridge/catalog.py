@@ -250,6 +250,7 @@ def _list_thread_rows(client: CodexAppServerClient, *, limit: int) -> list[objec
     params = {
         "limit": requested,
         "archived": False,
+        "sourceKinds": ["cli", "vscode", "appServer"],
         "sortKey": "updated_at",
         "sortDirection": "desc",
         # The state database has one current row per logical thread.  The
