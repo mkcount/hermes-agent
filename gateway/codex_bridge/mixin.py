@@ -1216,7 +1216,7 @@ class GatewayCodexBridgeMixin:
     async def _codex_bridge_recover_input(self, store: CodexBridgeStore, item: DurableCodexInput) -> None:
         binding = store.get_binding(item.control_session_key)
         if binding is None or binding.generation != item.generation or binding.thread_id != item.thread_id:
-            store.cancel_lane(item.lane_session_key)
+            store.cancel_active_input(item.input_id, "binding changed before input recovery")
             return
         adapter = self._adapter_for_source(binding.source)
         if adapter is None:

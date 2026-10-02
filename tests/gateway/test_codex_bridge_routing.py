@@ -1184,3 +1184,26 @@ async def test_history_replay_keeps_order_and_resumes_after_delivery_failure(tmp
         "💻 Codex 진행\n\nworking", "🧾 Codex 답변\n\ndone",
     ]
     assert all(row.state == "delivered" for row in restarted_store.list_progress(restarted_binding))
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_cancels_only_its_input_not_new_binding_work(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    source = _source()
+    control = build_session_key(source)
+    old = store.bind(control, source, thread_id="thread-123")
+    old_id, _, _ = store.enqueue_input(
+        old, "shared-canonical-lane", MessageEvent(text="old", source=source, message_id="old"),
+    )
+    store.recover_after_restart()
+    stale_item = store.recoverable_inputs()[0]
+    current = store.bind(control, source, thread_id="thread-123")
+    new_id, _, _ = store.enqueue_input(
+        current, "shared-canonical-lane", MessageEvent(text="new", source=source, message_id="new"),
+    )
+    assert current.generation != old.generation
+
+    await _Bridge(store)._codex_bridge_recover_input(store, stale_item)
+
+    assert store.input_state(old_id) == "cancelled"
+    assert store.input_state(new_id) == "routed"
