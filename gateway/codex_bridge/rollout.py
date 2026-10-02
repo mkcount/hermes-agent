@@ -101,7 +101,7 @@ def resolve_rollout_path(
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         payload = record.get("payload") if isinstance(record, dict) else None
-        if record.get("type") != "session_meta" or not isinstance(payload, dict):
+        if not isinstance(payload, dict) or record.get("type") != "session_meta":
             return None
         return resolved if str(payload.get("id") or "") == cleaned else None
 

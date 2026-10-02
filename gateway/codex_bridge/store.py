@@ -1468,7 +1468,7 @@ class CodexBridgeStore:
         with self._lock, self._transaction() as conn:
             cur = conn.execute(
                 """DELETE FROM codex_bridge_inputs
-                   WHERE state IN ('routed','completed','cancelled') AND updated_at < ?""",
+                   WHERE state IN ('completed','cancelled') AND updated_at < ?""",
                 (cutoff,),
             )
             progress_cur = conn.execute(

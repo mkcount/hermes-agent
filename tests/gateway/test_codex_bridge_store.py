@@ -302,3 +302,14 @@ def test_prune_never_removes_uncertain_or_continuation_work(tmp_path, monkeypatc
 
     assert store.input_state(uncertain_id) == "uncertain"
     assert store.input_state(continuation_id) == "continuation_pending"
+
+
+def test_prune_preserves_old_durable_inbox_until_recovery(tmp_path):
+    store = CodexBridgeStore(tmp_path / "state.db")
+    binding = store.bind("control", _source(), thread_id="thread-a")
+    input_id, _, _ = store.enqueue_input(binding, "lane-a", _event(binding.source))
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE codex_bridge_inputs SET updated_at=0 WHERE input_id=?", (input_id,))
+    assert store.prune() == 0
+    store.recover_after_restart()
+    assert [row.input_id for row in store.recoverable_inputs()] == [input_id]

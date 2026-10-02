@@ -431,3 +431,11 @@ def test_initial_inspection_streams_beyond_bootstrap_window(tmp_path, monkeypatc
     assert [event.text for event in collect_active_commentary(THREAD, snapshot)] == [
         f"progress {index}" for index in range(20)
     ]
+
+
+def test_invalid_session_meta_shape_does_not_prevent_valid_path_discovery(tmp_path):
+    path = tmp_path / "sessions" / f"rollout-{THREAD}.jsonl"
+    bad = tmp_path / "sessions" / f"bad-{THREAD}.jsonl"
+    _write(path, [_meta(THREAD)])
+    bad.write_text("[]\n")
+    assert resolve_rollout_path(THREAD, hinted_path=str(bad), codex_home=str(tmp_path)) == path.resolve()
