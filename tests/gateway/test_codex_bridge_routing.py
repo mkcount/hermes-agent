@@ -1207,3 +1207,31 @@ async def test_stale_recovery_cancels_only_its_input_not_new_binding_work(tmp_pa
 
     assert store.input_state(old_id) == "cancelled"
     assert store.input_state(new_id) == "routed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [False, True])
+async def test_bound_codex_lane_uses_local_runner_when_generic_proxy_is_configured(monkeypatch, bound):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    proxy = AsyncMock(return_value={"final_response": "proxy reply"})
+    monkeypatch.setattr(runner, "_get_proxy_url", lambda: "http://proxy.test")
+    monkeypatch.setattr(runner, "_run_agent_via_proxy", proxy)
+    monkeypatch.setattr(runner, "_run_agent_display_settings", lambda _source: None)
+
+    def local_owner(*_args, **kwargs):
+        assert kwargs["codex_bridge_control_key"] == "control"
+        assert kwargs["codex_bridge_thread_id"] == "Thread_A"
+        raise RuntimeError("entered bound local runner")
+
+    monkeypatch.setattr(runner, "_run_agent_build_turn_context", local_owner)
+    kwargs = {"codex_bridge_control_key": "control", "codex_bridge_thread_id": "Thread_A"} if bound else {}
+    if bound:
+        with pytest.raises(RuntimeError, match="entered bound local runner"):
+            await runner._run_agent_inner("continue", "", [], _source(), "session", **kwargs)
+        proxy.assert_not_awaited()
+    else:
+        result = await runner._run_agent_inner("continue", "", [], _source(), "session", **kwargs)
+        assert result["final_response"] == "proxy reply"
+        proxy.assert_awaited_once()

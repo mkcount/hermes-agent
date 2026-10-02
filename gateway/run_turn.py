@@ -3840,7 +3840,9 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
-        if self._get_proxy_url():
+        # A bound Telegram lane names a local Codex writer. The generic
+        # Hermes proxy does not carry that binding or its submission journal.
+        if not codex_bridge_control_key and self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,

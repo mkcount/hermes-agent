@@ -123,11 +123,6 @@ behavior on the next access.
                          │ No                     Clear flag on next successful turn
                          ▼
               ┌──────────────────────┐
-              │   Policy says reset? │──── Yes ──► Auto-reset: new session_id
-              └──────────┬───────────┘           (reason="idle"/"daily")
-                         │ No
-                         ▼
-              ┌──────────────────────┐
               │  Return existing     │
               │  entry, bump         │
               │  updated_at          │
