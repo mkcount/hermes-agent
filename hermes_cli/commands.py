@@ -159,7 +159,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef(
         "codex-model", "Codex 모델과 리즈닝 설정", "Configuration",
         aliases=("codex_model",),
-        args_hint="[5.6s|5.6t|5.6l|6.0a] [medium|high|xhigh]",
+        args_hint="[6.1s|6.0a] [medium|high|xhigh]",
         gateway_only=True,
     ),
 

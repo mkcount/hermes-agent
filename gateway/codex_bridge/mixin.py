@@ -60,9 +60,7 @@ _LANE_KEY = "codex_bridge_lane_key"
 _SESSION_EXECUTION_OWNER_KEY = "codex_bridge_execution_owner"
 _SELECTION_COMMANDS = frozenset({"codex-session", "codex-model", "ns"})
 _CODEX_MODEL_CHOICES = (
-    ("gpt-5.6-sol", "5.6 S", "Sol", "5.6s"),
-    ("gpt-5.6-terra", "5.6 T", "Terra", "5.6t"),
-    ("gpt-5.6-luna", "5.6 L", "Luna", "5.6l"),
+    ("gpt-6.1-sol", "6.1 S", "Sol", "6.1s"),
     ("gpt-6-astra", "6.0 A", "Astra", "6.0a"),
 )
 _CODEX_MODEL_ALIASES = {
@@ -75,7 +73,7 @@ _CODEX_REASONING_ALIASES = {
     "high": "high", "하이": "high",
     "xhigh": "xhigh", "exhigh": "xhigh", "엑스하이": "xhigh",
 }
-_NEW_CODEX_MODEL = "gpt-5.6-sol"
+_NEW_CODEX_MODEL = "gpt-6.1-sol"
 _NEW_CODEX_REASONING = "xhigh"
 # Leave ample room for Telegram's Markdown escaping while keeping every replay
 # card below its 4,096 UTF-16-unit ceiling.
@@ -1033,11 +1031,11 @@ class GatewayCodexBridgeMixin:
         if raw:
             tokens = raw.replace(",", " ").split()
             if len(tokens) != 2:
-                return "사용법: /codex_model 5.6s xhigh (모델: 5.6s/5.6t/5.6l/6.0a)"
+                return "사용법: /codex_model 6.1s xhigh (모델: 6.1s/6.0a)"
             model = _CODEX_MODEL_ALIASES.get(tokens[0])
             effort = _CODEX_REASONING_ALIASES.get(tokens[1])
             if model is None or effort is None:
-                return "사용법: /codex_model 5.6s xhigh (리즈닝: medium/high/xhigh)"
+                return "사용법: /codex_model 6.1s xhigh (모델: 6.1s/6.0a, 리즈닝: medium/high/xhigh)"
             return await _apply(model, effort)
 
         async def _selected_model(_chat_id: str, model: str) -> str:
@@ -1080,7 +1078,7 @@ class GatewayCodexBridgeMixin:
             (
                 "🤖 *Codex 모델 선택*\n\n"
                 f"현재 설정: *{current_label}*\n"
-                "S=Sol · T=Terra · L=Luna · A=Astra"
+                "S=Sol · A=Astra"
             ),
             [
                 {"value": model, "label": short_label, "is_current": current_model == model}
@@ -1090,7 +1088,7 @@ class GatewayCodexBridgeMixin:
         )
         if sent:
             return None
-        return "모델 선택기를 보내지 못했습니다. /codex_model 5.6s xhigh처럼 입력해 주세요."
+        return "모델 선택기를 보내지 못했습니다. /codex_model 6.1s xhigh처럼 입력해 주세요."
 
     async def _handle_codex_session_command(self, event: MessageEvent) -> Optional[str]:
         if event.source.platform != Platform.TELEGRAM or event.source.chat_type != "dm":
@@ -1181,7 +1179,7 @@ class GatewayCodexBridgeMixin:
                     self._evict_cached_agent(self._codex_bridge_lane_key(source, old))
             return (
                 f"✅ 새 Codex 세션 준비됨: {project.name}\n"
-                "기본 설정: 5.6 S · Sol / XHigh\n"
+                "기본 설정: 6.1 S · Sol / XHigh\n"
                 "다음 일반 메시지가 새 세션의 첫 지시가 됩니다. 그 턴도 승인 없이 전체 액세스로 실행됩니다."
                 + (
                     "\n\n⚠️ 이전 연결에서 아직 실행·전송되지 않은 Telegram 작업은 취소됐습니다."
